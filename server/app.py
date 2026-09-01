@@ -9,11 +9,14 @@ Run:
     uvicorn app:app --host 0.0.0.0 --port 8000
 """
 import os
+import time
 
+import pyotp
 import requests
 from dotenv import load_dotenv
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 load_dotenv()  # reads .env from the CWD if present; real env vars win
@@ -22,6 +25,10 @@ BRIDGE_TOKEN = os.environ["BRIDGE_TOKEN"]
 TRELLO_KEY = os.environ["TRELLO_KEY"]
 TRELLO_TOKEN = os.environ["TRELLO_TOKEN"]
 PAGES_ORIGIN = os.environ.get("PAGES_ORIGIN", "https://glassontin.github.io")
+COMMAND_URL = os.environ.get("COMMAND_URL", "https://bridge.upperpeas.com/command")
+# Provision-page second factor. The same secret must be enrolled in Haven
+# (create_totp_secret) so codes come from the phone. Empty disables /provision.
+TOTP_SECRET = os.environ.get("TOTP_SECRET", "")
 
 TRELLO_API = "https://api.trello.com/1"
 
@@ -174,3 +181,97 @@ def card(card_in: CardIn, authorization: str = Header(default="")) -> dict:
     except KeyError as e:
         raise HTTPException(status_code=404, detail=str(e))
     return {"id": created["id"], "name": created["name"], "url": created["url"]}
+
+
+# --- provisioning page: TOTP-gated reveal of the shortcut recipe + token ---
+
+class TotpIn(BaseModel):
+    code: str
+
+
+_attempts: dict[str, list[float]] = {}  # ip -> timestamps; in-memory, single process
+
+
+def rate_limited(ip: str, max_per_min: int = 6) -> bool:
+    now = time.time()
+    hits = [t for t in _attempts.get(ip, []) if now - t < 60]
+    hits.append(now)
+    _attempts[ip] = hits
+    return len(hits) > max_per_min
+
+
+@app.get("/provision", response_class=HTMLResponse)
+def provision_page() -> str:
+    if not TOTP_SECRET:
+        raise HTTPException(status_code=404, detail="provisioning disabled")
+    return PROVISION_HTML
+
+
+@app.post("/provision/verify")
+def provision_verify(req: Request, body: TotpIn) -> dict:
+    if not TOTP_SECRET:
+        raise HTTPException(status_code=404, detail="provisioning disabled")
+    if rate_limited(req.client.host):
+        raise HTTPException(status_code=429, detail="too many attempts")
+    ok = pyotp.TOTP(TOTP_SECRET).verify(body.code.strip().replace(" ", ""), valid_window=1)
+    if not ok:
+        raise HTTPException(status_code=401, detail="bad code")
+    return {"command_url": COMMAND_URL, "token": BRIDGE_TOKEN}
+
+PROVISION_HTML = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Watch Bridge — provisioning</title>
+<style>
+ :root{--bg:#0d1117;--panel:#161b22;--border:#2d333b;--text:#e6edf3;--muted:#8b949e;--accent:#4fb3ff;--green:#3fb950;--code:#0a0d12;--mono:ui-monospace,Menlo,monospace}
+ *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,"Segoe UI",Roboto,sans-serif;line-height:1.6}
+ main{max-width:640px;margin:0 auto;padding:48px 20px 80px}
+ h1{font-size:1.4rem;margin:0 0 4px}.sub{color:var(--muted)}
+ .card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:18px;margin:16px 0}
+ input{width:100%;background:var(--code);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:10px 12px;font-family:var(--mono);font-size:1.1rem;text-align:center;letter-spacing:0.3em}
+ button{background:var(--accent);color:#04121f;border:none;border-radius:6px;padding:10px 22px;font-weight:600;cursor:pointer;margin-top:10px}
+ button.sec{background:transparent;border:1px solid var(--border);color:var(--muted);font-family:var(--mono);font-size:.75rem;padding:3px 10px;font-weight:400}
+ pre{background:var(--code);border:1px solid var(--border);border-radius:6px;padding:10px 12px;font-family:var(--mono);font-size:.82rem;overflow-x:auto}
+ .row{display:flex;justify-content:space-between;align-items:center;gap:8px}
+ .ok{color:var(--green)}#err{color:#f85149;font-family:var(--mono);font-size:.85rem}
+ .token{font-family:var(--mono);font-size:.8rem;word-break:break-all;background:var(--code);border:1px solid var(--border);border-radius:6px;padding:8px 10px}
+ ol{padding-left:20px}li{margin-bottom:8px}
+ .head{display:flex;justify-content:space-between;align-items:center;margin:20px 0 6px}
+ .head b{font-size:.95rem}
+</style></head><body><main>
+<h1>Watch Bridge provisioning</h1>
+<p class="sub">Enter the 6-digit code from Haven on your phone. The page then shows the shortcut recipe and the bearer token.</p>
+<div class="card">
+ <input id="code" inputmode="numeric" pattern="[0-9 ]*" maxlength="7" placeholder="000000" autocomplete="one-time-code">
+ <button onclick="go()">Unlock</button>
+ <span id="err"></span>
+</div>
+<div id="out"></div>
+<script>
+function copy(btn, text){navigator.clipboard.writeText(text).then(()=>{const o=btn.textContent;btn.textContent='Copied';setTimeout(()=>btn.textContent=o,1400)})}
+async function go(){
+ const code=document.getElementById('code').value;
+ const err=document.getElementById('err'); err.textContent='';
+ const r=await fetch('/provision/verify',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code})});
+ if(!r.ok){err.textContent=(r.status===429?'slow down — too many attempts':'bad code');return}
+ const d=await r.json();
+ const headers='Content-Type: application/json\\nAuthorization: Bearer '+d.token;
+ const bodyJson='{"text": "<Dictated Text>"}';
+ document.getElementById('out').innerHTML=`
+ <div class="head"><b>1 · The shortcut</b><button class="sec" onclick="copy(this,'Dictate Text → Get Contents of URL → Get Dictionary Value (reply) → Speak Text')">Copy step list</button></div>
+ <ol>
+  <li><b>Dictate Text</b></li>
+  <li><b>Get Contents of URL</b> — URL below, Method <b>POST</b>, Headers as below, Request Body → JSON with a field <code>text</code> = the <i>Dictated Text</i> magic variable</li>
+  <li><b>Get Dictionary Value</b> — key <code>reply</code></li>
+  <li><b>Speak Text</b></li>
+ </ol>
+ <div class="head"><b>2 · Endpoint URL</b><button class="sec" onclick="copy(this,'${d.command_url}')">Copy</button></div>
+ <pre>${d.command_url}</pre>
+ <div class="head"><b>3 · Headers</b><button class="sec" onclick="copy(this,headers)">Copy</button></div>
+ <pre>${headers.replace(/Bearer (.+)/,'Bearer <span class="ok">$1</span>')}</pre>
+ <div class="head"><b>4 · Request body (JSON)</b><button class="sec" onclick="copy(this,bodyJson)">Copy</button></div>
+ <pre>${bodyJson}</pre>
+ <p class="sub">Then enable <b>Show on Apple Watch</b>; on an Ultra you can assign it to the Action button. Keep this token private — it can create and read cards on your boards.</p>`;
+}
+document.getElementById('code').addEventListener('keydown',e=>{if(e.key==='Enter')go()});
+</script></main></body></html>"""
