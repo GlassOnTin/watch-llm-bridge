@@ -733,6 +733,18 @@ STYLE = """<!doctype html>
  .kv .k{flex:0 0 auto;min-width:118px;color:var(--accent2);font-size:.8rem;letter-spacing:.04em}
  .kv .v{flex:1 1 auto;font-family:var(--mono);font-size:.8rem;word-break:break-all}
  .kv button{margin:0;white-space:nowrap}
+ details.dcard{background:rgba(31,19,53,.85);border:1px solid var(--border);border-radius:14px;margin:16px 0;
+  box-shadow:0 6px 24px rgba(0,0,0,.35)}
+ details.dcard>summary{cursor:pointer;padding:14px 18px;color:var(--accent2);font-weight:700;letter-spacing:.03em;
+  list-style:none;display:flex;align-items:center;gap:8px}
+ details.dcard>summary::-webkit-details-marker{display:none}
+ details.dcard>summary::after{content:'✦';margin-left:auto;color:var(--muted);transition:transform .2s}
+ details.dcard[open]>summary::after{transform:rotate(90deg)}
+ details.dcard[open]>summary{border-bottom:1px solid var(--border)}
+ details.dcard .inner{padding:2px 18px 18px}
+ details.dcard details{margin-top:10px}
+ .gear{background:transparent;border:none;color:var(--muted);font-size:1.05rem;cursor:pointer;padding:0 2px;margin:0;vertical-align:baseline}
+ .gear:hover{color:var(--accent);text-shadow:0 0 10px rgba(201,160,255,.6)}
  code{color:var(--accent2)}
  .orn{color:var(--accent);letter-spacing:.4em;text-align:center;margin:20px 0 0;font-size:.8rem}
 </style></head><body><main>
@@ -791,16 +803,19 @@ async function go(){
 document.querySelectorAll('input').forEach(i=>i.addEventListener('keydown',e=>{if(e.key==='Enter')go()}));
 </script></main></body></html>"""
 
-DASHBOARD_HTML = STYLE + """<div class="top"><h1>Watch Bridge</h1><span><span id="who" class="sub"></span> · <a href="/logout">log out</a></span></div>
-<div id="trello"></div>
-<div id="watch" class="card"></div>
-<div id="invite"></div>
-<div class="card">
- <div class="row"><b>Change password</b></div>
- <input id="pwcur" type="password" placeholder="Current password" autocomplete="current-password">
- <input id="pwnew" type="password" placeholder="New password (8+ characters)" autocomplete="new-password">
- <button onclick="pw()">Update</button> <span id="pwerr"></span>
-</div>
+DASHBOARD_HTML = STYLE + """<div class="top"><h1>Watch Bridge</h1><span><span id="who" class="sub"></span> · <button class="gear" id="gearbtn" title="Settings">⚙</button> · <a href="/logout">log out</a></span></div>
+<details id="trello" class="dcard"><summary id="trellos"></summary><div class="inner" id="trellobody"></div></details>
+<details id="watchd" class="dcard"><summary>⌚ Your watch shortcut</summary><div class="inner" id="watch"></div></details>
+<details id="invited" class="dcard"><summary>✉ Invite someone</summary><div class="inner" id="invite"></div></details>
+<details id="settings" class="dcard"><summary>⚙ Settings</summary><div class="inner">
+ <div class="card">
+  <div class="row"><b>Change password</b></div>
+  <input id="pwcur" type="password" placeholder="Current password" autocomplete="current-password">
+  <input id="pwnew" type="password" placeholder="New password (8+ characters)" autocomplete="new-password">
+  <button onclick="pw()">Update</button> <span id="pwerr"></span>
+ </div>
+ <p class="sub">More integrations (Calendar and friends) will appear here as their own sections.</p>
+</div></details>
 <p class="orn">✦ ☾ ✦</p>
 <script>
 function copy(btn, text){navigator.clipboard.writeText(text).then(()=>{const o=btn.textContent;btn.textContent='Copied';setTimeout(()=>btn.textContent=o,1400)})}
@@ -829,7 +844,6 @@ function recipe(d){
   <div class="kv"><span class="k">${esc(p.k)}</span><span class="v">${esc(p.v)}</span>
   <button class="sec" data-v="${escA(p.v)}">Copy</button></div>`).join('');
  return `
- <div class="row"><b>Your watch shortcut</b></div>
  <ol>
   <li><b>Dictate Text</b></li>
   <li><b>Get Contents of URL</b> — fill each field below, one box per field:</li>
@@ -842,23 +856,20 @@ function recipe(d){
 function trelloCard(d){
  if(d.connected){
   const boards=Object.entries(d.boards).map(([b,lists])=>`<li><b>${esc(b)}</b>: ${lists.map(esc).join(' · ')||'<i>no lists</i>'}</li>`).join('');
-  return `<div class="card">
-   <div class="row"><b>Trello</b><span class="ok">connected — ${Object.keys(d.boards).length} boards</span></div>
+  return `<p class="sub"><span class="ok">connected</span></p>
    <ul>${boards}</ul>
    <details><summary>Connect a different Trello account</summary>
     <p class="sub">Open the authorize link, copy the token, paste it below.</p>
     <p><a class="btn" href="${d.authorize_url}" target="_blank" rel="noopener">Authorize on Trello</a></p>
     <input id="tok" placeholder="Paste your Trello token">
     <button onclick="connect()">Connect</button> <span id="terr"></span>
-   </details></div>`;
+   </details>`;
  }
- return `<div class="card">
-  <div class="row"><b>Step 1 · Connect your Trello</b></div>
-  <ol><li>Open the <a href="${d.authorize_url}" target="_blank" rel="noopener" style="color:var(--accent)">Trello authorize page</a> and click <b>Allow</b>.</li>
-  <li>Trello shows a long token — copy it (give it a few seconds to appear).</li>
-  <li>Paste it below.</li></ol>
-  <input id="tok" placeholder="Paste your Trello token" autocomplete="off">
-  <button onclick="connect()">Connect</button> <span id="terr"></span></div>`;
+ return `<ol><li>Open the <a href="${d.authorize_url}" target="_blank" rel="noopener" style="color:var(--accent)">Trello authorize page</a> and click <b>Allow</b>.</li>
+ <li>Trello shows a long token — copy it (give it a few seconds to appear).</li>
+ <li>Paste it below.</li></ol>
+ <input id="tok" placeholder="Paste your Trello token" autocomplete="off">
+ <button onclick="connect()">Connect</button> <span id="terr"></span>`;
 }
 async function connect(){
  const err=document.getElementById('terr'); err.textContent='';
@@ -869,23 +880,26 @@ async function connect(){
 }
 function inviteCard(d){
  if(!d.invite_code)return '';
- return `<div class="card">
-  <div class="row"><b>Invite someone</b><button class="sec" id="invbtn">Copy</button></div>
-  <p class="sub">Send them this code with the <a href="/signup" target="_blank" rel="noopener">signup page</a>. They connect their own Trello and get their own token.</p>
-  <div class="token">${esc(d.invite_code)}</div>
- </div>`;
+ return `<p class="sub">Send them this code with the <a href="/signup" target="_blank" rel="noopener">signup page</a>. They connect their own Trello and get their own token.</p>
+ <div class="row"><span class="token" style="flex:1">${esc(d.invite_code)}</span><button class="sec" id="invbtn">Copy</button></div>`;
 }
 function render(d){
  document.getElementById('who').textContent=d.username;
- document.getElementById('trello').innerHTML=trelloCard(d);
+ document.getElementById('trellos').textContent=d.connected
+  ?`🔮 Trello — ${Object.keys(d.boards).length} boards`:'🔮 Trello — connect your account';
+ document.getElementById('trellobody').innerHTML=trelloCard(d);
+ document.getElementById('trello').open=!d.connected;
  document.getElementById('watch').innerHTML=recipe(d);
  document.getElementById('invite').innerHTML=inviteCard(d);
+ document.getElementById('invited').style.display=d.invite_code?'':'none';
  const ib=document.getElementById('invbtn');
  if(ib)ib.onclick=e=>copy(e.target,d.invite_code);
 }
 (async()=>{render(await (await fetch('/app/state')).json())})();
 document.getElementById('watch').addEventListener('click',e=>{
  const b=e.target.closest('button.sec'); if(b&&b.dataset.v!==undefined)copy(b,b.dataset.v)});
+document.getElementById('gearbtn').onclick=()=>{
+ const s=document.getElementById('settings'); s.open=true; s.scrollIntoView({behavior:'smooth'})};
 document.addEventListener('keydown',e=>{if(e.key==='Enter'&&e.target.id==='pwcur')pw()});
 </script></main></body></html>"""
 
