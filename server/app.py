@@ -765,8 +765,8 @@ DASHBOARD_HTML = STYLE + """<div class="top"><h1>Watch Bridge</h1><span><span id
 <div id="watch" class="card"></div>
 <div class="card">
  <div class="row"><b>Change password</b></div>
- <input id="cur" type="password" placeholder="Current password" autocomplete="current-password">
- <input id="new" type="password" placeholder="New password (8+ characters)" autocomplete="new-password">
+ <input id="pwcur" type="password" placeholder="Current password" autocomplete="current-password">
+ <input id="pwnew" type="password" placeholder="New password (8+ characters)" autocomplete="new-password">
  <button onclick="pw()">Update</button> <span id="pwerr"></span>
 </div>
 <script>
@@ -775,8 +775,8 @@ function esc(s){const d=document.createElement('div');d.textContent=s;return d.i
 async function pw(){
  const err=document.getElementById('pwerr'); err.textContent='';
  const r=await fetch('/app/password',{method:'POST',headers:{'Content-Type':'application/json'},
-  body:JSON.stringify({current:cur.value,new:new.value})});
- if(r.ok){err.className='ok';err.textContent='updated';cur.value=new.value='';return}
+  body:JSON.stringify({current:pwcur.value,new:pwnew.value})});
+ if(r.ok){err.className='ok';err.textContent='updated';pwcur.value=pwnew.value='';return}
  const d=await r.json().catch(()=>({detail:'error '+r.status})); err.className=''; err.textContent=d.detail||'error '+r.status;
 }
 function recipe(d){
@@ -832,7 +832,7 @@ function render(d){
  document.getElementById('watch').innerHTML=recipe(d);
 }
 (async()=>{render(await (await fetch('/app/state')).json())})();
-document.addEventListener('keydown',e=>{if(e.key==='Enter'&&e.target.id==='cur')pw()});
+document.addEventListener('keydown',e=>{if(e.key==='Enter'&&e.target.id==='pwcur')pw()});
 </script></main></body></html>"""
 
 
