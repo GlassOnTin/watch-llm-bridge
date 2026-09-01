@@ -1,0 +1,472 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Watch → LLM Bridge · self-hosted voice hub for Trello &amp; Google Calendar</title>
+<meta name="description" content="Build a self-hosted bridge: an Apple Watch shortcut routes dictated voice commands to your own endpoint, an LLM routes them into Trello and Google Calendar. No Zapier.">
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --panel-2: #1c2129;
+    --border: #2d333b;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --accent: #4fb3ff;
+    --accent-dim: #1f6feb33;
+    --green: #3fb950;
+    --amber: #d29922;
+    --red: #f85149;
+    --code-bg: #0a0d12;
+    --mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+    --sans: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: var(--sans); font-size: 16px; line-height: 1.6;
+  }
+  main { max-width: 860px; margin: 0 auto; padding: 0 20px 80px; }
+  header.hero { padding: 56px 0 8px; }
+  h1 { font-size: 2rem; margin: 0 0 6px; letter-spacing: -0.02em; }
+  h1 .arrow { color: var(--accent); }
+  .tagline { color: var(--muted); font-size: 1.05rem; max-width: 640px; }
+  h2 {
+    font-size: 1.3rem; margin: 48px 0 12px; padding-top: 24px;
+    border-top: 1px solid var(--border); letter-spacing: -0.01em;
+  }
+  h2 .stepno { color: var(--accent); font-family: var(--mono); font-size: 0.9rem; margin-right: 8px; }
+  h3 { font-size: 1.02rem; margin: 24px 0 8px; }
+  p, li { color: var(--text); }
+  .muted { color: var(--muted); }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code { font-family: var(--mono); font-size: 0.88em; background: var(--panel-2); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; }
+  pre { margin: 0; }
+  pre code { display: block; background: var(--code-bg); border: none; border-radius: 0; padding: 14px 16px; overflow-x: auto; line-height: 1.5; font-size: 0.85rem; }
+
+  .diagram { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 20px; margin: 24px 0; overflow-x: auto; }
+  .diagram svg { display: block; margin: 0 auto; max-width: 100%; height: auto; }
+
+  /* checklist */
+  .checklist-panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 18px 20px; margin: 24px 0; }
+  .progress-wrap { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; }
+  .progress-track { flex: 1; height: 8px; background: var(--panel-2); border-radius: 4px; overflow: hidden; }
+  .progress-fill { height: 100%; width: 0%; background: var(--green); border-radius: 4px; transition: width 0.25s; }
+  .progress-label { font-family: var(--mono); font-size: 0.8rem; color: var(--muted); white-space: nowrap; }
+  .checklist { list-style: none; margin: 0; padding: 0; }
+  .checklist li { display: flex; align-items: flex-start; gap: 10px; padding: 7px 0; border-top: 1px solid var(--border); }
+  .checklist li:first-child { border-top: none; }
+  .checklist input[type="checkbox"] { margin-top: 5px; accent-color: var(--green); width: 16px; height: 16px; flex: none; cursor: pointer; }
+  .checklist label { cursor: pointer; }
+  .checklist input:checked + label { color: var(--muted); text-decoration: line-through; }
+  .checklist .ref { color: var(--muted); font-family: var(--mono); font-size: 0.8rem; margin-left: 6px; }
+  .checklist .ref:hover { color: var(--accent); text-decoration: none; }
+
+  /* code block with copy button */
+  .codeblock { position: relative; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; margin: 14px 0; background: var(--code-bg); }
+  .codeblock .cb-head {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 7px 14px; background: var(--panel-2); border-bottom: 1px solid var(--border);
+    font-family: var(--mono); font-size: 0.78rem; color: var(--muted);
+  }
+  .copy-btn {
+    background: transparent; border: 1px solid var(--border); color: var(--muted);
+    font-family: var(--mono); font-size: 0.75rem; border-radius: 5px;
+    padding: 2px 10px; cursor: pointer; transition: all 0.15s;
+  }
+  .copy-btn:hover { color: var(--text); border-color: var(--accent); }
+  .copy-btn.copied { color: var(--green); border-color: var(--green); }
+
+  /* endpoint tester */
+  .tester { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 18px 20px; margin: 16px 0; }
+  .tester .row { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 10px; }
+  .tester label { display: block; font-family: var(--mono); font-size: 0.75rem; color: var(--muted); margin-bottom: 3px; }
+  .tester input, .tester textarea {
+    width: 100%; background: var(--code-bg); border: 1px solid var(--border); color: var(--text);
+    border-radius: 6px; padding: 8px 10px; font-family: var(--mono); font-size: 0.85rem;
+  }
+  .tester .col { flex: 1 1 260px; }
+  .tester button.go {
+    background: var(--accent); color: #04121f; border: none; border-radius: 6px;
+    padding: 9px 22px; font-weight: 600; font-size: 0.9rem; cursor: pointer;
+  }
+  .tester button.go:disabled { opacity: 0.5; cursor: wait; }
+  .tester .result { font-family: var(--mono); font-size: 0.82rem; white-space: pre-wrap; word-break: break-word;
+    background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px;
+    padding: 10px 12px; min-height: 20px; margin-top: 6px; }
+  .tester .result.ok { border-color: var(--green); }
+  .tester .result.err { border-color: var(--red); }
+
+  /* callouts */
+  .callout { border-left: 3px solid; border-radius: 6px; padding: 12px 16px; margin: 16px 0; font-size: 0.95rem; }
+  .callout.warn { border-color: var(--amber); background: #d2992214; }
+  .callout.info { border-color: var(--accent); background: #4fb3ff12; }
+  .callout b { color: inherit; }
+
+  table { border-collapse: collapse; width: 100%; margin: 14px 0; font-size: 0.92rem; }
+  th, td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; vertical-align: top; }
+  th { background: var(--panel-2); font-weight: 600; }
+  td code { white-space: nowrap; }
+
+  details { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; margin: 14px 0; }
+  details > summary { cursor: pointer; padding: 12px 18px; font-weight: 600; list-style: none; }
+  details > summary::before { content: "▸ "; color: var(--accent); }
+  details[open] > summary::before { content: "▾ "; }
+  details > .inner { padding: 4px 18px 16px; border-top: 1px solid var(--border); }
+
+  ol.steps { padding-left: 22px; }
+  ol.steps li { margin-bottom: 10px; }
+  footer { border-top: 1px solid var(--border); margin-top: 56px; padding-top: 20px; color: var(--muted); font-size: 0.85rem; }
+  @media (max-width: 640px) { h1 { font-size: 1.5rem; } }
+</style>
+</head>
+<body>
+<main>
+
+<header class="hero">
+  <h1>Watch <span class="arrow">→</span> LLM Bridge</h1>
+  <p class="tagline">A self-hosted voice hub: an Apple Watch shortcut dictates a command and POSTs it to <em>your</em> endpoint. An LLM with tool-calling routes it into Trello and Google Calendar. No Zapier, no subscription glue.</p>
+  <p class="muted">The watch side never changes: <strong>Dictate Text → Get Contents of URL (POST) → Speak Text</strong>. All intelligence lives on the server, so you iterate there without touching the shortcut.</p>
+</header>
+
+<div class="diagram">
+<svg viewBox="0 0 760 190" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, Menlo, monospace" font-size="13">
+  <defs>
+    <marker id="ah" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto">
+      <path d="M0,0 L9,4.5 L0,9 z" fill="#4fb3ff"/>
+    </marker>
+  </defs>
+  <g>
+    <rect x="10" y="60" width="170" height="70" rx="10" fill="#161b22" stroke="#2d333b"/>
+    <text x="95" y="88" text-anchor="middle" fill="#e6edf3">Apple Watch</text>
+    <text x="95" y="108" text-anchor="middle" fill="#8b949e">shortcut · dictate</text>
+  </g>
+  <g>
+    <rect x="290" y="60" width="200" height="70" rx="10" fill="#1f6feb22" stroke="#4fb3ff"/>
+    <text x="390" y="88" text-anchor="middle" fill="#e6edf3">Your HTTPS endpoint</text>
+    <text x="390" y="108" text-anchor="middle" fill="#8b949e">auth + LLM tool-calling</text>
+  </g>
+  <g>
+    <rect x="580" y="15" width="170" height="54" rx="10" fill="#161b22" stroke="#2d333b"/>
+    <text x="665" y="38" text-anchor="middle" fill="#e6edf3">Trello REST</text>
+    <text x="665" y="56" text-anchor="middle" fill="#8b949e">key + token</text>
+  </g>
+  <g>
+    <rect x="580" y="120" width="170" height="54" rx="10" fill="#161b22" stroke="#2d333b"/>
+    <text x="665" y="143" text-anchor="middle" fill="#e6edf3">Google Calendar</text>
+    <text x="665" y="161" text-anchor="middle" fill="#8b949e">OAuth refresh token</text>
+  </g>
+  <line x1="180" y1="95" x2="288" y2="95" stroke="#4fb3ff" stroke-width="1.6" marker-end="url(#ah)"/>
+  <text x="234" y="86" text-anchor="middle" fill="#8b949e" font-size="11">POST /command</text>
+  <line x1="490" y1="82" x2="578" y2="46" stroke="#4fb3ff" stroke-width="1.6" marker-end="url(#ah)"/>
+  <line x1="490" y1="108" x2="578" y2="144" stroke="#4fb3ff" stroke-width="1.6" marker-end="url(#ah)"/>
+</svg>
+</div>
+
+<section class="checklist-panel">
+  <div class="progress-wrap">
+    <div class="progress-track"><div class="progress-fill" id="pfill"></div></div>
+    <span class="progress-label" id="plabel">0 / 10</span>
+  </div>
+  <ul class="checklist" id="checklist">
+    <li><input type="checkbox" id="c1"><label for="c1">Watch shortcut built: Dictate Text → POST → Speak Text <a class="ref" href="#watch">#watch</a></label></li>
+    <li><input type="checkbox" id="c2"><label for="c2">Endpoint deployed with HTTPS and <code>/health</code> returns 200 <a class="ref" href="#server">#server</a></label></li>
+    <li><input type="checkbox" id="c3"><label for="c3">Auth token verified — tester below gets a reply, not a 401 <a class="ref" href="#tester">#tester</a></label></li>
+    <li><input type="checkbox" id="c4"><label for="c4">Trello Power-Up created; API key + non-expiring token in hand <a class="ref" href="#trello">#trello</a></label></li>
+    <li><input type="checkbox" id="c5"><label for="c5">Board ID and list IDs fetched and cached server-side <a class="ref" href="#trello">#trello</a></label></li>
+    <li><input type="checkbox" id="c6"><label for="c6">First card created by voice, in the intended list <a class="ref" href="#trello">#trello</a></label></li>
+    <li><input type="checkbox" id="c7"><label for="c7">Google Cloud project with Calendar API enabled <a class="ref" href="#gcal">#gcal</a></label></li>
+    <li><input type="checkbox" id="c8"><label for="c8">OAuth app published to production; refresh token stored <a class="ref" href="#gcal">#gcal</a></label></li>
+    <li><input type="checkbox" id="c9"><label for="c9">Calendar events read out by voice <a class="ref" href="#gcal">#gcal</a></label></li>
+    <li><input type="checkbox" id="c10"><label for="c10">Echo replaced by LLM tool-calling (list routing works) <a class="ref" href="#llm">#llm</a></label></li>
+  </ul>
+  <p class="muted" style="font-size:0.82rem; margin: 10px 0 0;">Progress is saved in this browser (localStorage). Nothing is sent anywhere.</p>
+</section>
+
+<!-- ============================ WATCH ============================ -->
+<h2 id="watch"><span class="stepno">01</span>The watch shortcut</h2>
+<p>Build this in the Shortcuts app on iPhone, then enable <strong>Show on Apple Watch</strong>. Pin it as a watch complication, or assign it to the Ultra's <strong>Action button</strong> for a literal hardware button.</p>
+<ol class="steps">
+  <li><strong>Dictate Text</strong> — language set to your preference. This is the only practical STT on watchOS; it runs through Apple's servers.</li>
+  <li><strong>Get Contents of URL</strong> — URL <code>https://your-endpoint.example/command</code>, Method <code>POST</code>, Headers:
+    <ul>
+      <li><code>Content-Type: application/json</code></li>
+      <li><code>Authorization: Bearer &lt;your token&gt;</code></li>
+    </ul>
+    Request Body → JSON: a field <code>text</code> with the <em>Dictated Text</em> magic variable.</li>
+  <li><strong>Get Dictionary Value</strong> for key <code>reply</code> (from the response).</li>
+  <li><strong>Speak Text</strong> on that value.</li>
+</ol>
+<p class="muted">Tip: for slow jobs (LLM latency, long calendar reads), have the server reply fast and deliver results later via a push notification — Shortcuts blocks on the HTTP response.</p>
+
+<!-- ============================ SERVER ============================ -->
+<h2 id="server"><span class="stepno">02</span>The endpoint</h2>
+<p>One small FastAPI service. Phase 1 is transport + auth + echo, so you can verify the whole round trip before any LLM code exists. Anything not built yet raises <code>NotImplementedError</code> on purpose — a stub that returned fake data would silently corrupt your assumptions.</p>
+
+<div class="codeblock">
+  <div class="cb-head"><span>server.py — Phase 1</span><button class="copy-btn">Copy</button></div>
+<pre><code># pip install fastapi "uvicorn[standard]"
+# BRIDGE_TOKEN=$(openssl rand -hex 24) uvicorn server:app --host 0.0.0.0 --port 8000
+import os
+from fastapi import FastAPI, Header, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+TOKEN = os.environ["BRIDGE_TOKEN"]
+
+app = FastAPI()
+# CORS is only needed for the endpoint tester on this page. Lock the origin
+# to this page's URL once you know it; omit entirely if you never use the tester.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://glasontin.github.io"],
+    allow_methods=["POST", "GET"],
+    allow_headers=["Authorization", "Content-Type"],
+)
+
+class Command(BaseModel):
+    text: str
+
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+@app.post("/command")
+def command(cmd: Command, authorization: str = Header(default="")):
+    if authorization != f"Bearer {TOKEN}":
+        raise HTTPException(status_code=401, detail="bad token")
+    return {"reply": route(cmd.text)}
+
+def route(text: str) -> str:
+    """Phase 1: echo, so the watch round-trip is verifiable end to end.
+    Phase 2 replaces this body with an LLM that selects tools (see #llm)."""
+    return f"echo: {text}"
+</code></pre>
+</div>
+
+<p><strong>Exposing it:</strong> a Hetzner cpx instance with Caddy/Nginx for TLS, or your home server behind a Cloudflare Tunnel — both work. The only hard requirement is HTTPS, because Shortcuts sends the bearer token on every request.</p>
+
+<h3 id="tester">Endpoint tester</h3>
+<p>Once your endpoint is live, test it from this page. Your browser must be allowed by the server's CORS config for this to work; the skeleton above allows it.</p>
+
+<div class="tester">
+  <div class="row">
+    <div class="col" style="flex-basis: 100%;">
+      <label for="t-url">Endpoint URL</label>
+      <input id="t-url" type="url" placeholder="https://your-endpoint.example/command" spellcheck="false">
+    </div>
+  </div>
+  <div class="row">
+    <div class="col">
+      <label for="t-token">Bearer token</label>
+      <input id="t-token" type="password" placeholder="paste BRIDGE_TOKEN" spellcheck="false" autocomplete="off">
+    </div>
+    <div class="col">
+      <label for="t-text">Text (as if dictated)</label>
+      <input id="t-text" type="text" placeholder="add a task to plan the week" spellcheck="false">
+    </div>
+  </div>
+  <div class="row">
+    <button class="go" id="t-go">POST /command</button>
+    <button class="go" id="t-health" style="background: var(--panel-2); color: var(--text); border: 1px solid var(--border);">GET /health</button>
+  </div>
+  <div class="result" id="t-out">ready — response appears here</div>
+</div>
+
+<!-- ============================ TRELLO ============================ -->
+<h2 id="trello"><span class="stepno">03</span>Trello</h2>
+<p>Key/token auth, confirmed working as of 2026. The flow changed in one way: API keys are now generated through a Power-Up.</p>
+<ol class="steps">
+  <li>Create a Power-Up at <a href="https://trello.com/apps/admin" target="_blank" rel="noopener">trello.com/apps/admin</a> (a stub Power-Up with no features is fine — you only want its <em>API key</em> tab).</li>
+  <li>Authorize a token with the longest expiry, in a browser:
+<div class="codeblock">
+  <div class="cb-head"><span>authorize URL</span><button class="copy-btn">Copy</button></div>
+<pre><code>https://trello.com/1/authorize?expiration=never&amp;name=WatchBridge&amp;scope=read,write&amp;response_type=token&amp;key=YOUR_API_KEY
+</code></pre>
+</div>
+    <span class="muted">Use <code>expiration=30days</code> if you prefer a rotation story, but <code>1day</code> will break the service silently.</span></li>
+  <li>Verify credentials and fetch your board's list IDs (cache these at server startup; they don't change often):
+<div class="codeblock">
+  <div class="cb-head"><span>shell</span><button class="copy-btn">Copy</button></div>
+<pre><code># sanity check
+curl -s "https://api.trello.com/1/members/me?key=$TRELLO_KEY&amp;token=$TRELLO_TOKEN" | jq .username
+
+# boards
+curl -s "https://api.trello.com/1/members/me/boards?key=$TRELLO_KEY&amp;token=$TRELLO_TOKEN" | jq '.[] | {name, id}'
+
+# lists on a board  →  this is what the LLM routes cards into
+curl -s "https://api.trello.com/1/boards/$BOARD_ID/lists?key=$TRELLO_KEY&amp;token=$TRELLO_TOKEN" | jq '.[] | {name, id}'
+</code></pre>
+</div></li>
+  <li>Create a card:
+<div class="codeblock">
+  <div class="cb-head"><span>shell</span><button class="copy-btn">Copy</button></div>
+<pre><code>curl -s -X POST \
+  "https://api.trello.com/1/cards?idList=$LIST_ID&amp;name=Test%20card&amp;key=$TRELLO_KEY&amp;token=$TRELLO_TOKEN" \
+  | jq '{name, id, url}'
+</code></pre>
+</div></li>
+</ol>
+<div class="callout info"><b>Rate limits:</b> 100 requests / 10 s per token — irrelevant at human command pace, but worth knowing if you ever batch.</div>
+
+<!-- ============================ GCAL ============================ -->
+<h2 id="gcal"><span class="stepno">04</span>Google Calendar</h2>
+<ol class="steps">
+  <li>Google Cloud project → enable the <strong>Calendar API</strong>.</li>
+  <li>OAuth consent screen: <em>External</em>, add scope <code>calendar.events</code>, add yourself as a test user.</li>
+  <li><strong>Publish the app to production</strong> (Audience → Publish app). This does not require completing verification. See the warning below for why this matters.</li>
+  <li>Run a desktop OAuth flow <em>once</em> on any machine, store the resulting <strong>refresh token</strong> on the server. The server mints short-lived access tokens from it automatically.</li>
+</ol>
+<div class="callout warn"><b>The 7-day trap.</b> With the consent screen in <em>Testing</em> status, Google expires your refresh token after exactly 7 days (<code>invalid_grant</code>). Publishing to <em>In production</em> without completing verification removes the expiry — you'll just see a "Google hasn't verified this app" warning once during the consent flow. The change is not retroactive: re-run the OAuth flow after publishing, and check for an absent <code>refresh_token_expires_in</code> field to confirm.</div>
+<p class="muted">Other things that kill a refresh token: six months of disuse (only a token exchange counts), revoking access, changing scopes, or password changes on Gmail-scoped apps.</p>
+
+<!-- ============================ LLM ============================ -->
+<h2 id="llm"><span class="stepno">05</span>The LLM layer</h2>
+<p>Replace <code>route()</code> with an LLM call that exposes a small, fixed tool set. The tools map 1:1 onto the real APIs; the model never invents endpoints.</p>
+<table>
+  <tr><th>Tool</th><th>Maps to</th><th>Used for</th></tr>
+  <tr><td><code>trello_create_card(board, list, name, desc?)</code></td><td><code>POST /1/cards</code></td><td>"add a task to plan the week"</td></tr>
+  <tr><td><code>trello_list_cards(board, list)</code></td><td><code>GET /1/lists/{id}/cards</code></td><td>"read out my to-do list"</td></tr>
+  <tr><td><code>trello_move_card(card, to_list)</code></td><td><code>PUT /1/cards/{id}</code></td><td>"move that to Done"</td></tr>
+  <tr><td><code>gcal_list_events(day)</code></td><td><code>events.list</code></td><td>"what's on tomorrow"</td></tr>
+  <tr><td><code>gcal_create_event(summary, start, end)</code></td><td><code>events.insert</code></td><td>"book the dentist Tuesday 2pm"</td></tr>
+</table>
+<p>System prompt carries your board's <em>list names</em>, so "put this in the right list" resolves from a known set rather than guessing. Ambiguity ("which board?") should come back as a spoken question, not a guess.</p>
+<p class="muted">Model choice: any tool-calling endpoint works. A local ollama model is adequate for routing among a handful of well-described tools; hosted APIs are lower-latency. The tool interface is identical either way.</p>
+
+<!-- ============================ TROUBLESHOOTING ============================ -->
+<h2 id="ts"><span class="stepno">06</span>Troubleshooting</h2>
+<table>
+  <tr><th>Symptom</th><th>Likely cause</th></tr>
+  <tr><td>Shortcut hangs, then "couldn't connect"</td><td>Not HTTPS, or the server didn't reply fast enough. Add a <code>/health</code> test from this page first.</td></tr>
+  <tr><td><code>401</code></td><td>Header is <code>Authorization: Bearer &lt;token&gt;</code> — watch for a stray space or the token env var not reaching the process.</td></tr>
+  <tr><td>Tester shows a CORS error, curl works</td><td>Server's <code>allow_origins</code> doesn't match this page's origin. curl bypasses CORS; browsers don't.</td></tr>
+  <tr><td><code>invalid_grant</code> after ~7 days</td><td>OAuth app still in Testing status. Publish to production, re-run the consent flow.</td></tr>
+  <tr><td>Trello <code>401 invalid token</code></td><td>Token expired (check the <code>expiration</code> param used at authorize) or was revoked.</td></tr>
+  <tr><td>Card lands in the wrong list</td><td>List names in the system prompt don't match the board. Cache IDs by name and fail loudly on a mismatch rather than defaulting.</td></tr>
+</table>
+
+<footer>
+  <p>Self-hosted by design: one bearer token on the wire, credentials stay on your server, no third-party automation platform in the path.</p>
+  <p>References: <a href="https://developer.atlassian.com/cloud/trello/rest/api-group-cards/" target="_blank" rel="noopener">Trello REST — cards</a> ·
+  <a href="https://developer.atlassian.com/cloud/trello/guides/rest-api/authorization/" target="_blank" rel="noopener">Trello authorization</a> ·
+  <a href="https://developers.google.com/calendar/api/guides/overview" target="_blank" rel="noopener">Google Calendar API</a> ·
+  <a href="https://stackoverflow.com/questions/71451250/google-calendar-api-token-expires-in-7-days" target="_blank" rel="noopener">refresh-token 7-day expiry</a> ·
+  <a href="https://sosumi.ai/documentation/speech/sfspeechrecognizer" target="_blank" rel="noopener">why SFSpeechRecognizer isn't on watchOS</a></p>
+</footer>
+
+</main>
+
+<script>
+// ---- checklist persistence ----
+(function () {
+  const boxes = document.querySelectorAll('#checklist input[type="checkbox"]');
+  const fill = document.getElementById('pfill');
+  const label = document.getElementById('plabel');
+  const key = 'wlb-checklist-v1';
+  let state = {};
+  try { state = JSON.parse(localStorage.getItem(key) || '{}'); } catch (e) { state = {}; }
+  function render() {
+    let done = 0;
+    boxes.forEach(b => {
+      b.checked = !!state[b.id];
+      if (b.checked) done++;
+    });
+    const pct = Math.round(done / boxes.length * 100);
+    fill.style.width = pct + '%';
+    label.textContent = done + ' / ' + boxes.length;
+  }
+  boxes.forEach(b => b.addEventListener('change', () => {
+    state[b.id] = b.checked;
+    localStorage.setItem(key, JSON.stringify(state));
+    render();
+  }));
+  render();
+})();
+
+// ---- copy buttons ----
+document.querySelectorAll('.copy-btn').forEach(btn => {
+  btn.addEventListener('click', async () => {
+    const code = btn.closest('.codeblock').querySelector('code').innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+      btn.textContent = 'Copied';
+      btn.classList.add('copied');
+      setTimeout(() => { btn.textContent = 'Copy'; btn.classList.remove('copied'); }, 1600);
+    } catch (e) {
+      btn.textContent = 'Ctrl+C';
+    }
+  });
+});
+
+// ---- endpoint tester ----
+(function () {
+  const urlIn = document.getElementById('t-url');
+  const tokIn = document.getElementById('t-token');
+  const txtIn = document.getElementById('t-text');
+  const go = document.getElementById('t-go');
+  const health = document.getElementById('t-health');
+  const out = document.getElementById('t-out');
+  const savedKey = 'wlb-tester-v1';
+
+  try {
+    const s = JSON.parse(localStorage.getItem(savedKey) || '{}');
+    if (s.url) urlIn.value = s.url;
+    if (s.tok) tokIn.value = s.tok;
+  } catch (e) {}
+
+  function persist() {
+    try { localStorage.setItem(savedKey, JSON.stringify({ url: urlIn.value, tok: tokIn.value })); } catch (e) {}
+  }
+
+  function show(text, ok) {
+    out.textContent = text;
+    out.className = 'result ' + (ok ? 'ok' : 'err');
+  }
+
+  async function call(method, path, body) {
+    const base = urlIn.value.replace(/\/+$/, '').replace(/\/command$/, '');
+    if (!base) { show('enter an endpoint URL first', false); return; }
+    persist();
+    const url = base + path;
+    const opts = { method, headers: {} };
+    if (tokIn.value) opts.headers['Authorization'] = 'Bearer ' + tokIn.value;
+    if (body) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body); }
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 20000);
+    const t0 = performance.now();
+    try {
+      const res = await fetch(url, { ...opts, signal: ctrl.signal });
+      const ms = Math.round(performance.now() - t0);
+      const text = await res.text();
+      let pretty = text;
+      try { pretty = JSON.stringify(JSON.parse(text), null, 2); } catch (e) {}
+      show('HTTP ' + res.status + ' · ' + ms + ' ms\n\n' + pretty, res.ok);
+    } catch (err) {
+      const ms = Math.round(performance.now() - t0);
+      const aborted = err.name === 'AbortError';
+      show((aborted ? 'timeout after 20 s' : 'network error: ' + err.message) +
+        ' · ' + ms + ' ms\n\nIf curl to the same URL works, this is almost always CORS — check the server allow_origins.', false);
+    } finally {
+      clearTimeout(timer);
+      go.disabled = health.disabled = false;
+      go.textContent = 'POST /command';
+    }
+  }
+
+  go.addEventListener('click', () => {
+    go.disabled = health.disabled = true;
+    go.textContent = 'sending…';
+    call('POST', '/command', { text: txtIn.value || 'ping from the page tester' });
+  });
+  health.addEventListener('click', () => {
+    go.disabled = health.disabled = true;
+    go.textContent = 'sending…';
+    call('GET', '/health', null);
+  });
+})();
+</script>
+</body>
+</html>
