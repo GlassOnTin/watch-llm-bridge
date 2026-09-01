@@ -1,15 +1,20 @@
 """Watch→LLM Bridge server.
 
-Phase 1 (this file): HTTPS transport, bearer auth, echo routing, and the
-Trello tools fully wired against the live API.
-Phase 2: `route()` is replaced by an LLM that selects among the tools.
+Phase 1: HTTPS transport, bearer auth, provisioning, and the Trello tools
+fully wired against the live API.
+Phase 2 (this file): `route()` sends the spoken sentence to a Groq LLM that
+picks among the same tools the direct endpoints use; the server stays the
+fail-loud authority on where cards land (resolve_target).
 
 Run:
     set -a; source ../.env; set +a     # or export the vars directly
     uvicorn app:app --host 0.0.0.0 --port 8000
 """
+import json
+import logging
 import os
 import time
+from datetime import datetime, timezone
 
 import pyotp
 import requests
@@ -148,6 +153,196 @@ def route(text: str) -> str:
       trello_create_card / trello_list_cards / gcal_list_events / gcal_create_event
     """
     return f"echo: {text}"
+
+
+# --- LLM routing (Phase 2): Groq tool-calling over the same tools ---
+
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+
+# Spoken aliases for board names dictation cannot produce verbatim.
+# Extend or override with VOICE_ALIASES=<json object> in .env.
+DEFAULT_ALIASES = {
+    "move board": "Move To A Nicer Spot",
+    "nicer spot": "Move To A Nicer Spot",
+    "best of": "The Best of (Ian...Jenni)",
+    "flower adventure": "The Flower Tattoo Adventure",
+}
+
+
+def spoken_aliases() -> dict[str, str]:
+    raw = os.environ.get("VOICE_ALIASES", "")
+    if raw:
+        try:
+            extra = json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"VOICE_ALIASES is not valid JSON: {e}") from e
+        return {**DEFAULT_ALIASES, **extra}
+    return dict(DEFAULT_ALIASES)
+
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "trello_create_card",
+            "description": "Create a card in a named list on a named board.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "board": {"type": "string"},
+                    "list": {"type": "string"},
+                    "name": {"type": "string"},
+                    "desc": {"type": "string"},
+                },
+                "required": ["board", "list", "name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "trello_list_cards",
+            "description": "Read the cards in a list.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "board": {"type": "string"},
+                    "list": {"type": "string"},
+                },
+                "required": ["board", "list"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "trello_list_boards",
+            "description": "Enumerate every board and its lists.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+]
+
+
+def build_system_prompt() -> str:
+    inventory = "\n".join(
+        f"- board '{board}': " + " | ".join(n for n, _ in trello.lists_by_board.get(bid, []))
+        for board, bid in trello.boards.items()
+    )
+    aliases = ", ".join(f'"{k}" means board "{v}"' for k, v in spoken_aliases().items())
+    today = datetime.now(timezone.utc).strftime("%A %d %B %Y")
+    return f"""You are the brain of a voice assistant driven from an Apple Watch. Each
+user message is one spoken sentence. Your reply is read aloud, so keep it to
+one or two short sentences of plain words; never mention IDs, JSON, or URLs.
+
+Today is {today} (UTC).
+
+Tools:
+- trello_create_card(board, list, name, desc) — add a card to a list
+- trello_list_cards(board, list) — read the cards in a list
+- trello_list_boards() — enumerate boards and their lists
+
+Exact inventory of boards and lists:
+
+{inventory}
+
+Rules:
+1. Match the spoken words to this inventory case-insensitively and fuzzily.
+   Ignore emoji and punctuation in list names, and treat near-misses ("huge"
+   for "Hugge") as matches. NEVER invent a board or list name that is not in
+   the inventory, and never guess between two candidates: ask instead.
+2. If the list name alone is unique across all boards, omit the board. If it
+   exists on several boards, use the board the user named; if they named
+   none, ask in one short question that models the retry, e.g. "Food is on
+   Home and Plans — say: add it to Food on plans".
+3. Spoken aliases map phrases to real board names: {aliases}. Apply them
+   before matching.
+4. Fill tool arguments only from what the user said. Do not add a note
+   (desc) unless asked.
+5. After a successful tool call, confirm in one short sentence what was
+   done, or read the items out as a compact spoken list.
+6. Google Calendar is not connected yet. Any calendar or events request gets
+   a brief "calendar isn't set up yet" reply.
+7. If the request matches no tool, answer helpfully in a sentence or two."""
+
+
+def execute_tool(name: str, args: dict) -> dict:
+    """Dispatch one tool call. KeyError from resolve_target = mismatch/ambiguity."""
+    if name == "trello_create_card":
+        card = trello.create_card(args["board"], args["list"], args["name"], args.get("desc", ""))
+        return {"ok": True, "created": card["name"], "list": args["list"], "board": args["board"]}
+    if name == "trello_list_cards":
+        cards = trello.cards(args["board"], args["list"])
+        return {"ok": True, "list": args["list"], "board": args["board"], "cards": [c["name"] for c in cards]}
+    if name == "trello_list_boards":
+        return {
+            board: [n for n, _ in trello.lists_by_board.get(bid, [])]
+            for board, bid in trello.boards.items()
+        }
+    raise NotImplementedError(f"unknown tool '{name}'")
+
+
+def spoken_error(message: str, max_candidates: int = 5) -> str:
+    """Turn a resolve_target KeyError into a short spoken retry hint."""
+    base, _, known = message.partition("(known:")
+    candidates = [c.strip(" '\"") for c in known.rstrip(") ").split(",")]
+    candidates = [c for c in candidates if c]
+    hint = ""
+    if candidates:
+        shown = ", ".join(candidates[:max_candidates])
+        more = " and more" if len(candidates) > max_candidates else ""
+        hint = f" Options include: {shown}{more}."
+    return f"I couldn't match that. {base.strip()}.{hint} Say it again and name the board."
+
+
+def route(text: str) -> str:
+    """Send the sentence to the LLM; the LLM picks tools, the server keeps
+    resolve_target as the fail-loud authority on where cards go. Echoes only
+    while no Groq key is configured (Phase 1 fallback)."""
+    if not GROQ_API_KEY:
+        return f"echo: {text}"
+    messages = [
+        {"role": "system", "content": build_system_prompt()},
+        {"role": "user", "content": text},
+    ]
+    for _ in range(3):
+        try:
+            r = requests.post(
+                GROQ_URL,
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                json={
+                    "model": GROQ_MODEL,
+                    "messages": messages,
+                    "tools": TOOLS,
+                    "tool_choice": "auto",
+                    "temperature": 0.1,
+                    "max_tokens": 300,
+                },
+                timeout=25,
+            )
+            r.raise_for_status()
+            msg = r.json()["choices"][0]["message"]
+        except requests.RequestException as e:
+            logging.getLogger("uvicorn.error").warning("groq call failed: %s", e)
+            return "The assistant brain is unreachable right now."
+        calls = msg.get("tool_calls")
+        if not calls:
+            return msg.get("content") or "Done."
+        messages.append(msg)
+        for call in calls:
+            args = json.loads(call["function"]["arguments"] or "{}")
+            try:
+                result = execute_tool(call["function"]["name"], args)
+            except KeyError as e:
+                return spoken_error(e.args[0])
+            messages.append({
+                "role": "tool",
+                "tool_call_id": call["id"],
+                "content": json.dumps(result),
+            })
+    return "Done."
 
 
 # --- direct tool endpoints: the same functions the LLM will call in Phase 2 ---
