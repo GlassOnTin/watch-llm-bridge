@@ -2,9 +2,10 @@
 import pytest
 
 import store
-from store import (count_users, create_user, get_user, get_user_by_name,
-                   get_user_by_token, hash_password, new_api_token, set_password,
-                   set_trello_token, verify_password)
+from store import (accounts_for, add_account, count_users, create_user,
+                   delete_account, get_account, get_user, get_user_by_name,
+                   get_user_by_token, hash_password, migrate_accounts,
+                   new_api_token, set_password, set_trello_token, verify_password)
 
 
 @pytest.fixture(autouse=True)
@@ -56,3 +57,33 @@ def test_set_trello_token_and_password():
     assert not verify_password("hunter2hunter", get_user(u["id"])["password_hash"])
     assert verify_password("new-password-9", get_user(u["id"])["password_hash"])
     assert count_users() == 1
+
+
+def test_accounts_crud_and_label_uniqueness():
+    u = create_user("ian", "hunter2hunter")
+    assert accounts_for(u["id"]) == []
+    add_account(u["id"], "trello", "ATTAa")
+    add_account(u["id"], "work", "ATTAb")
+    labels = [a["label"] for a in accounts_for(u["id"])]
+    assert labels == ["trello", "work"]  # add order preserved
+    assert get_account(u["id"], "work")["token"] == "ATTAb"
+    assert get_account(u["id"], "nope") is None
+    with pytest.raises(Exception, match="UNIQUE"):
+        add_account(u["id"], "work", "ATTAc")  # labels are unique per user
+    assert delete_account(u["id"], "work") is True
+    assert delete_account(u["id"], "work") is False
+    assert [a["label"] for a in accounts_for(u["id"])] == ["trello"]
+
+
+def test_migrate_accounts_copies_legacy_tokens_once():
+    u = create_user("ian", "hunter2hunter", trello_token="ATTAlegacy")
+    migrate_accounts()
+    acc = get_account(u["id"], "trello")
+    assert acc is not None and acc["token"] == "ATTAlegacy"
+    migrate_accounts()  # idempotent
+    assert len(accounts_for(u["id"])) == 1
+    # a user who already has account rows is never re-seeded from the legacy column
+    add_account(u["id"], "work", "ATTAw")
+    set_trello_token(u["id"], "ATTAother")
+    migrate_accounts()
+    assert [a["label"] for a in accounts_for(u["id"])] == ["trello", "work"]

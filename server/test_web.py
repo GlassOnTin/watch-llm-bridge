@@ -116,18 +116,18 @@ def test_boards_isolated_per_user(client):
     signup(client, "beta")
     ua = store.get_user_by_name("alpha")
     ub = store.get_user_by_name("beta")
-    # a cached client only serves a user who has connected a Trello token
-    store.set_trello_token(ua["id"], "ATTAa")
-    store.set_trello_token(ub["id"], "ATTAb")
+    # a cached client only serves a user who has connected a Trello account
+    store.add_account(ua["id"], "trello", "ATTAa")
+    store.add_account(ub["id"], "trello", "ATTAb")
 
-    def client_with(boards, lists):
-        t = app.Trello("k", "t")
+    def client_with(boards, lists, token):
+        t = app.Trello("k", token)  # token must match the stored account row
         t.boards = boards
         t.lists_by_board = lists
         return t
 
-    app._clients[ua["id"]] = client_with({"HomeA": "b1"}, {"b1": [("ListA", "l1")]})
-    app._clients[ub["id"]] = client_with({"HomeB": "b2"}, {"b2": [("ListB", "l2")]})
+    app._clients[ua["id"]] = {"trello": client_with({"HomeA": "b1"}, {"b1": [("ListA", "l1")]}, "ATTAa")}
+    app._clients[ub["id"]] = {"trello": client_with({"HomeB": "b2"}, {"b2": [("ListB", "l2")]}, "ATTAb")}
     ha = client.get("/boards", headers={"Authorization": f"Bearer {ua['api_token']}"}).json()
     hb = client.get("/boards", headers={"Authorization": f"Bearer {ub['api_token']}"}).json()
     assert list(ha) == ["HomeA"] and list(hb) == ["HomeB"]
@@ -147,7 +147,8 @@ def test_connect_trello_verifies_and_stores(client, monkeypatch):
     assert r.status_code == 200
     assert seen["params"]["token"] == "ATTAxyz"
     assert seen["params"]["key"] == app.TRELLO_KEY
-    assert store.get_user(user["id"])["trello_token"] == "ATTAxyz"
+    acc = store.get_account(user["id"], "trello")
+    assert acc is not None and acc["token"] == "ATTAxyz"
     assert user["id"] in app._clients  # boards were refreshed into the cache
 
 
@@ -161,7 +162,7 @@ def test_connect_trello_rejects_bad_token_without_storing(client, monkeypatch):
     monkeypatch.setattr(app.requests, "get", bad_get)
     r = client.post("/app/trello", json={"token": "ATTAbad"})
     assert r.status_code == 401
-    assert store.get_user(user["id"])["trello_token"] is None
+    assert store.get_account(user["id"], "trello") is None
     assert user["id"] not in app._clients
 
 
@@ -183,7 +184,7 @@ def test_system_prompt_is_per_user(client, monkeypatch):
     t = app.Trello("k", "t")
     t.boards = {"Mine": "b9"}
     t.lists_by_board = {"b9": [("Chores", "l9")]}
-    app._clients[ua["id"]] = t
+    app._clients[ua["id"]] = {"trello": t}
     prompt = app.build_system_prompt(t)
     assert "board 'Mine': Chores" in prompt
     assert "Shopping List" not in prompt  # the owner's inventory doesn't leak in
@@ -199,3 +200,140 @@ def test_invite_code_shown_to_owner_only(client):
     s = client.get("/app/state")  # signup replaced the session cookie with beta's
     assert s.json()["invite_code"] == ""
     assert s.json()["username"] == "beta"
+
+
+# --- multiple Trello accounts per user ---
+
+def mkclient(boards, lists):
+    t = app.Trello("k", "t")
+    t.boards = boards
+    t.lists_by_board = lists
+    return t
+
+
+def connect_as(client, monkeypatch, token, label=""):
+    monkeypatch.setattr(app.requests, "get",
+                        lambda url, params=None, timeout=None: FakeResp({"id": "me"}))
+    return client.post("/app/trello", json={"token": token, "label": label})
+
+
+def test_second_account_adds_and_routes_by_label(client, monkeypatch):
+    signup(client)
+    assert connect_as(client, monkeypatch, "ATTAone", "").status_code == 200
+    r = connect_as(client, monkeypatch, "ATTAtwo", "Work")
+    assert r.status_code == 200
+    state = r.json()
+    assert [a["label"] for a in state["accounts"]] == ["trello", "work"]
+    # both accounts resolve through clients_for, in add order
+    user = store.get_user_by_name("tester")
+    clients = app.clients_for(user)
+    assert [label for label, _ in clients] == ["trello", "work"]
+    assert clients[0][1].token == "ATTAone" and clients[1][1].token == "ATTAtwo"
+
+
+def test_duplicate_account_label_conflicts(client, monkeypatch):
+    signup(client)
+    assert connect_as(client, monkeypatch, "ATTAone", "work").status_code == 200
+    r = connect_as(client, monkeypatch, "ATTAtwo", "WORK")
+    assert r.status_code == 409
+    assert "work" in r.json()["detail"]
+
+
+def test_second_account_requires_a_name(client, monkeypatch):
+    signup(client)
+    assert connect_as(client, monkeypatch, "ATTAone", "").status_code == 200
+    r = connect_as(client, monkeypatch, "ATTAtwo", "")
+    assert r.status_code == 409  # empty label resolves to the existing "trello"
+
+
+def test_invalid_account_label_rejected(client, monkeypatch):
+    signup(client)
+    r = connect_as(client, monkeypatch, "ATTAone", "Bad Name!")
+    assert r.status_code == 400
+
+
+def test_delete_account(client, monkeypatch):
+    signup(client)
+    connect_as(client, monkeypatch, "ATTAone", "")
+    connect_as(client, monkeypatch, "ATTAtwo", "work")
+    r = client.request("DELETE", "/app/trello", params={"label": "work"})
+    assert r.status_code == 200
+    assert [a["label"] for a in r.json()["accounts"]] == ["trello"]
+    r = client.request("DELETE", "/app/trello", params={"label": "ghost"})
+    assert r.status_code == 404
+
+
+def test_multi_account_prompt_and_resolution(client):
+    signup(client, "alpha")
+    ua = store.get_user_by_name("alpha")
+    home = mkclient({"Home": "b1"}, {"b1": [("Shopping", "l1")]})
+    work = mkclient({"Home": "b2"}, {"b2": [("Shopping", "l3"), ("Done", "l4")]})
+    clients = [("trello", home), ("work", work)]
+    app._clients[ua["id"]] = {"trello": home, "work": work}
+
+    prompt = app.build_system_prompt(clients=clients)
+    assert "- account 'trello', board 'Home': Shopping" in prompt
+    assert "- account 'work', board 'Home': Shopping | Done" in prompt
+    assert "several Trello accounts" in prompt
+
+    # unique across both accounts: the pair is chosen
+    picked = app.resolve_board({}, "done", clients=clients)
+    assert picked == {"ok": True, "board": "Home", "account": "work"}
+    # same list name on both accounts: ambiguity carries account/board pairs
+    picked = app.resolve_board({}, "shopping", clients=clients)
+    assert picked["ok"] is False
+    assert picked["pairs"] == ["trello / Home", "work / Home"]
+    # a named account narrows the search
+    picked = app.resolve_board({"account": "Work"}, "shopping", clients=clients)
+    assert picked == {"ok": True, "board": "Home", "account": "work"}
+    # an account nobody has is refused, never guessed
+    assert app.resolve_board({"account": "ghost"}, "shopping",
+                             clients=clients)["error"] == "unknown_account"
+
+    out = app.execute_tool("trello_list_boards", {}, clients=clients)
+    assert out == {"trello": {"Home": ["Shopping"]}, "work": {"Home": ["Shopping", "Done"]}}
+
+
+def test_multi_account_create_tags_the_account(client):
+    signup(client, "alpha")
+    ua = store.get_user_by_name("alpha")
+    home = mkclient({"Home": "b1"}, {"b1": [("Shopping", "l1")]})
+    work = mkclient({"Work": "b2"}, {"b2": [("Chores", "l9")]})
+    clients = [("trello", home), ("work", work)]
+    seen = {}
+
+    def fake_create(board, list_name, name, desc=""):
+        seen.update(board=board, list_name=list_name, name=name)
+        return {"name": name}
+
+    home.create_card = fake_create
+    work.create_card = fake_create
+    app._clients[ua["id"]] = {"trello": home, "work": work}
+    out = app.execute_tool("trello_create_card",
+                           {"list": "chores", "name": "Bin day", "account": "work"},
+                           clients=clients)
+    assert out == {"ok": True, "created": "Bin day", "list": "chores",
+                   "board": "Work", "account": "work"}
+    assert seen == {"board": "Work", "list_name": "chores", "name": "Bin day"}
+
+
+def test_single_account_tools_keep_the_old_shape(client):
+    signup(client, "alpha")
+    ua = store.get_user_by_name("alpha")
+    home = mkclient({"Home": "b1", "Plans": "b2"},
+                    {"b1": [("Done", "l2")], "b2": [("Done", "l4")]})
+    app._clients[ua["id"]] = {"trello": home}
+    picked = app.resolve_board({}, "done", t=home)
+    assert picked == {"ok": False, "error": "ambiguous_board", "list": "done",
+                      "boards": ["Home", "Plans"]}
+    assert "pairs" not in picked  # single account: the pre-multi-account shape
+
+
+def test_legacy_trello_token_migrates_on_first_use(client, monkeypatch):
+    signup(client, "alpha")
+    ua = store.get_user_by_name("alpha")
+    store.set_trello_token(ua["id"], "ATTAlegacy")
+    app._clients.pop(ua["id"], None)
+    t = app.clients_for(store.get_user(ua["id"]))  # fresh row: has trello_token
+    assert [label for label, _ in t] == ["trello"]
+    assert store.get_account(ua["id"], "trello")["token"] == "ATTAlegacy"

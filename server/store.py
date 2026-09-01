@@ -22,6 +22,15 @@ CREATE TABLE IF NOT EXISTS users (
   api_token TEXT UNIQUE NOT NULL,
   trello_token TEXT,
   created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS trello_accounts (
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER NOT NULL,
+  label TEXT NOT NULL,
+  token TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(user_id, label)
 )
 """
 
@@ -101,6 +110,66 @@ def count_users() -> int:
 def set_trello_token(user_id: int, trello_token: str) -> None:
     with connect() as db:
         db.execute("UPDATE users SET trello_token = ? WHERE id = ?", (trello_token, user_id))
+
+
+# --- multiple Trello accounts per user -------------------------------------
+# Each account is a (label, token) pair; `label` is what the user says to pick
+# between them ("on my work trello"). The legacy single users.trello_token
+# column is migrated into one account labelled "trello".
+
+def add_account(user_id: int, label: str, token: str) -> dict:
+    """Insert an account; raises sqlite3.IntegrityError on a duplicate label."""
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with connect() as db:
+        db.execute(
+            "INSERT INTO trello_accounts (user_id, label, token, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (user_id, label, token, now),
+        )
+    return get_account(user_id, label)
+
+
+def accounts_for(user_id: int) -> list[dict]:
+    rows = connect().execute(
+        "SELECT * FROM trello_accounts WHERE user_id = ? ORDER BY id", (user_id,)
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_account(user_id: int, label: str) -> dict | None:
+    row = connect().execute(
+        "SELECT * FROM trello_accounts WHERE user_id = ? AND label = ?",
+        (user_id, label),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def delete_account(user_id: int, label: str) -> bool:
+    with connect() as db:
+        cur = db.execute(
+            "DELETE FROM trello_accounts WHERE user_id = ? AND label = ?",
+            (user_id, label),
+        )
+    return cur.rowcount > 0
+
+
+def migrate_accounts() -> None:
+    """Copy each legacy users.trello_token into an account row labelled
+    'trello'. Idempotent: users that already have account rows are skipped."""
+    db = connect()
+    legacy = db.execute(
+        "SELECT id, trello_token FROM users "
+        "WHERE trello_token IS NOT NULL AND trello_token != '' "
+        "AND id NOT IN (SELECT DISTINCT user_id FROM trello_accounts)"
+    ).fetchall()
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with db:
+        for row in legacy:
+            db.execute(
+                "INSERT INTO trello_accounts (user_id, label, token, created_at) "
+                "VALUES (?, 'trello', ?, ?)",
+                (row["id"], row["trello_token"], now),
+            )
 
 
 def set_password(user_id: int, password: str) -> None:

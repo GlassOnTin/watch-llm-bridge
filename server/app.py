@@ -90,6 +90,7 @@ class Trello:
 
     def __init__(self, key: str, token: str):
         self.auth = {"key": key, "token": token}
+        self.token = token
         self.boards: dict[str, str] = {}                     # name -> board id
         self.lists_by_board: dict[str, list[tuple[str, str]]] = {}  # board id -> [(name, id)]
 
@@ -126,24 +127,39 @@ class Trello:
 
 trello = Trello(TRELLO_KEY, TRELLO_TOKEN)
 
-# Per-user Trello clients. The owner's client is the `trello` singleton above,
-# seeded into this cache at startup — tests and the existing endpoints patch the
-# singleton's attributes, so its object identity must not change.
-_clients: dict[int, Trello] = {}
+# Per-user Trello clients, one per connected account: user id -> label -> client.
+# The owner's first account is the `trello` singleton above, seeded into this
+# cache at startup — tests and the existing endpoints patch the singleton's
+# attributes, so its object identity must not change.
+_clients: dict[int, dict[str, Trello]] = {}
+
+
+def clients_for(user: dict) -> list[tuple[str, Trello]]:
+    """The user's connected accounts as (label, client) pairs, in the order
+    they were added. First use after a restart refreshes boards/lists from
+    the API; a stale cache entry (token replaced) is rebuilt."""
+    accounts = store.accounts_for(user["id"])
+    if not accounts and user.get("trello_token"):
+        store.migrate_accounts()  # legacy single-token row, not yet migrated
+        accounts = store.accounts_for(user["id"])
+    if not accounts:
+        return []
+    cached = _clients.setdefault(user["id"], {})
+    out = []
+    for acc in accounts:
+        client = cached.get(acc["label"])
+        if client is None or client.token != acc["token"]:
+            client = Trello(TRELLO_KEY, acc["token"])
+            client.refresh()
+            cached[acc["label"]] = client
+        out.append((acc["label"], client))
+    return out
 
 
 def trello_for(user: dict) -> Trello | None:
-    """The user's cached Trello client, or None while they haven't connected.
-    First use after a restart refreshes boards/lists from the API."""
-    token = user.get("trello_token")
-    if not token:
-        return None
-    client = _clients.get(user["id"])
-    if client is None:
-        client = Trello(TRELLO_KEY, token)
-        client.refresh()
-        _clients[user["id"]] = client
-    return client
+    """The user's first Trello client, or None while they haven't connected."""
+    clients = clients_for(user)
+    return clients[0][1] if clients else None
 
 
 def require_user(authorization: str) -> dict:
@@ -192,7 +208,8 @@ def seed_owner() -> None:
     password = OWNER_PASSWORD or secrets.token_urlsafe(12)
     owner = store.create_user(OWNER_USERNAME, password,
                               api_token=BRIDGE_TOKEN, trello_token=TRELLO_TOKEN)
-    _clients[owner["id"]] = trello
+    store.add_account(owner["id"], "trello", TRELLO_TOKEN)
+    _clients[owner["id"]] = {"trello": trello}
     if not OWNER_PASSWORD:
         logging.getLogger("uvicorn.error").warning(
             "Seeded owner '%s' with a random dashboard password (shown once): %s",
@@ -213,6 +230,7 @@ app.add_middleware(
 def cache_trello() -> None:
     store.connect()
     seed_owner()
+    store.migrate_accounts()
     try:
         trello.refresh()
     except requests.RequestException as e:
@@ -237,7 +255,7 @@ def command(cmd: Command, authorization: str = Header(default="")) -> dict:
         return {"reply": "Trello is unreachable right now."}
     if t is None:
         return {"reply": "Your Trello isn't connected yet. Open the bridge dashboard to connect it."}
-    return {"reply": route(cmd.text, t)}
+    return {"reply": route(cmd.text, clients=clients_for(user))}
 
 
 def route(text: str) -> str:
@@ -290,6 +308,8 @@ TOOLS = [
                     "list": {"type": "string"},
                     "name": {"type": "string"},
                     "desc": {"type": "string"},
+                    "account": {"type": "string",
+                                "description": "Trello account label, when the user named one"},
                 },
                 "required": ["list", "name"],
             },
@@ -306,6 +326,8 @@ TOOLS = [
                 "properties": {
                     "board": {"type": "string"},
                     "list": {"type": "string"},
+                    "account": {"type": "string",
+                                "description": "Trello account label, when the user named one"},
                 },
                 "required": ["list"],
             },
@@ -322,14 +344,25 @@ TOOLS = [
 ]
 
 
-def build_system_prompt(t: Trello | None = None) -> str:
-    t = t or trello
-    inventory = "\n".join(
-        f"- board '{board}': " + " | ".join(n for n, _ in t.lists_by_board.get(bid, []))
-        for board, bid in t.boards.items()
-    )
+def build_system_prompt(t: Trello | None = None,
+                        clients: list[tuple[str, Trello]] | None = None) -> str:
+    clients = clients if clients is not None else [(None, t or trello)]
+    multi = len(clients) > 1
+    lines = []
+    for label, c in clients:
+        for board, bid in c.boards.items():
+            names = " | ".join(n for n, _ in c.lists_by_board.get(bid, []))
+            lines.append(f"- account '{label}', board '{board}': {names}"
+                         if multi else f"- board '{board}': {names}")
+    inventory = "\n".join(lines)
     aliases = ", ".join(f'"{k}" means board "{v}"' for k, v in spoken_aliases().items())
     today = datetime.now(timezone.utc).strftime("%A %d %B %Y")
+    account_rules = ""
+    if multi:
+        account_rules = """8. The user has several Trello accounts. When they name one ("on my work
+   trello"), pass its label as the account argument; when the tool result has
+   pairs, ask which account and board, e.g. "that Food list is on work / Home
+   and personal / Plans — which one?". Never guess an account."""
     return f"""You are the brain of a voice assistant driven from an Apple Watch. Each
 user message is one spoken sentence. Your reply is read aloud, so keep it to
 one or two short sentences of plain words; never mention IDs, JSON, or URLs.
@@ -364,7 +397,8 @@ Rules:
    done, or read the items out as a compact spoken list.
 6. Google Calendar is not connected yet. Any calendar or events request gets
    a brief "calendar isn't set up yet" reply.
-7. If the request matches no tool, answer helpfully in a sentence or two."""
+7. If the request matches no tool, answer helpfully in a sentence or two.
+{account_rules}"""
 
 
 def find_boards_with_list(list_name: str, t: Trello | None = None) -> list[str]:
@@ -378,40 +412,83 @@ def find_boards_with_list(list_name: str, t: Trello | None = None) -> list[str]:
     ]
 
 
-def resolve_board(args: dict, list_name: str, t: Trello | None = None) -> dict:
-    """Pick the board server-side. A board the LLM named is honoured; an
-    omitted board resolves only if the list name is unique. Ambiguity comes
-    back as an ask-the-user result, never a guess."""
+def resolve_board(args: dict, list_name: str, t: Trello | None = None,
+                  clients: list[tuple[str, Trello]] | None = None) -> dict:
+    """Pick the board (and, with several accounts, the account) server-side.
+    A board or account the LLM named is honoured; an omitted board resolves
+    only if the list name is unique. Ambiguity comes back as an ask-the-user
+    result, never a guess."""
+    clients = clients if clients is not None else [(None, t or trello)]
+    multi = len(clients) > 1
     board = args.get("board") or ""
+    label = (args.get("account") or "").strip().lower()
+    if label:
+        clients = [(l, c) for l, c in clients if l and l.lower() == label]
+        if not clients:
+            return {"ok": False, "error": "unknown_account", "account": args.get("account")}
     if board:
-        return {"ok": True, "board": board}
-    hits = find_boards_with_list(list_name, t)
+        picked = {"ok": True, "board": board}
+        if multi:
+            picked["account"] = clients[0][0]
+        return picked
+    hits = [(l, b) for l, c in clients for b in find_boards_with_list(list_name, c)]
     if len(hits) == 1:
-        return {"ok": True, "board": hits[0]}
-    return {"ok": False, "error": "ambiguous_board", "list": list_name, "boards": hits}
+        picked = {"ok": True, "board": hits[0][1]}
+        if multi:
+            picked["account"] = hits[0][0]
+        return picked
+    out = {"ok": False, "error": "ambiguous_board", "list": list_name,
+           "boards": [b for _, b in hits]}
+    if multi:
+        out["pairs"] = [f"{l} / {b}" for l, b in hits]
+    return out
 
 
-def execute_tool(name: str, args: dict, t: Trello | None = None) -> dict:
+def execute_tool(name: str, args: dict, t: Trello | None = None,
+                 clients: list[tuple[str, Trello]] | None = None) -> dict:
     """Dispatch one tool call. KeyError from resolve_target = mismatch."""
-    t = t or trello
+    clients = clients if clients is not None else [(None, t or trello)]
+    multi = len(clients) > 1
+
+    def client_for(picked: dict) -> Trello:
+        if not multi:
+            return clients[0][1]
+        label = (picked.get("account") or "").lower()
+        return next(c for l, c in clients if l.lower() == label)
+
+    def tagged(picked: dict, out: dict) -> dict:
+        if multi:
+            out["account"] = picked.get("account")
+        return out
+
     if name == "trello_create_card":
-        picked = resolve_board(args, args["list"], t)
+        picked = resolve_board(args, args["list"], clients=clients)
         if not picked["ok"]:
             return picked
         board = picked["board"]
-        card = t.create_card(board, args["list"], args["name"], args.get("desc", ""))
-        return {"ok": True, "created": card["name"], "list": args["list"], "board": board}
+        card = client_for(picked).create_card(
+            board, args["list"], args["name"], args.get("desc", ""))
+        return tagged(picked, {"ok": True, "created": card["name"],
+                               "list": args["list"], "board": board})
     if name == "trello_list_cards":
-        picked = resolve_board(args, args["list"], t)
+        picked = resolve_board(args, args["list"], clients=clients)
         if not picked["ok"]:
             return picked
         board = picked["board"]
-        cards = t.cards(board, args["list"])
-        return {"ok": True, "list": args["list"], "board": board, "cards": [c["name"] for c in cards]}
+        cards = client_for(picked).cards(board, args["list"])
+        return tagged(picked, {"ok": True, "list": args["list"], "board": board,
+                               "cards": [c["name"] for c in cards]})
     if name == "trello_list_boards":
+        if not multi:
+            c = clients[0][1]
+            return {
+                board: [n for n, _ in c.lists_by_board.get(bid, [])]
+                for board, bid in c.boards.items()
+            }
         return {
-            board: [n for n, _ in t.lists_by_board.get(bid, [])]
-            for board, bid in t.boards.items()
+            label: {board: [n for n, _ in c.lists_by_board.get(bid, [])]
+                    for board, bid in c.boards.items()}
+            for label, c in clients
         }
     raise NotImplementedError(f"unknown tool '{name}'")
 
@@ -429,15 +506,16 @@ def spoken_error(message: str, max_candidates: int = 5) -> str:
     return f"I couldn't match that. {base.strip()}.{hint} Say it again and name the board."
 
 
-def route(text: str, t: Trello | None = None) -> str:
+def route(text: str, t: Trello | None = None,
+          clients: list[tuple[str, Trello]] | None = None) -> str:
     """Send the sentence to the LLM; the LLM picks tools, the server keeps
     resolve_target as the fail-loud authority on where cards go. Echoes only
     while no LLM backend is configured (Phase 1 fallback)."""
-    t = t or trello
+    clients = clients if clients is not None else [(None, t or trello)]
     if not (LLM_BASE_URL and LLM_API_KEY and LLM_MODEL):
         return f"echo: {text}"
     messages = [
-        {"role": "system", "content": build_system_prompt(t)},
+        {"role": "system", "content": build_system_prompt(clients=clients)},
         {"role": "user", "content": text},
     ]
     for _ in range(3):
@@ -467,7 +545,7 @@ def route(text: str, t: Trello | None = None) -> str:
         for call in calls:
             args = json.loads(call["function"]["arguments"] or "{}")
             try:
-                result = execute_tool(call["function"]["name"], args, t)
+                result = execute_tool(call["function"]["name"], args, clients=clients)
             except KeyError as e:
                 return spoken_error(e.args[0])
             messages.append({
@@ -544,6 +622,10 @@ class LoginIn(BaseModel):
 
 class TrelloTokenIn(BaseModel):
     token: str
+    label: str = ""  # account name; empty means the user's first account
+
+
+ACCOUNT_LABEL_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 
 
 class PasswordIn(BaseModel):
@@ -561,16 +643,25 @@ def require_session(request: Request) -> dict:
 def app_state(user: dict) -> dict:
     """Everything the dashboard renders, in one fetch."""
     try:
-        t = trello_for(user)
+        clients = clients_for(user)
     except requests.RequestException:
-        t = None
+        clients = []
+    accounts = [
+        {
+            "label": label,
+            "boards": {
+                name: [n for n, _ in c.lists_by_board.get(bid, [])]
+                for name, bid in c.boards.items()
+            },
+        }
+        for label, c in clients
+    ]
     return {
         "username": user["username"],
-        "connected": t is not None and bool(t.boards),
-        "boards": {} if t is None else {
-            name: [n for n, _ in t.lists_by_board.get(bid, [])]
-            for name, bid in t.boards.items()
-        },
+        "connected": bool(accounts) and bool(accounts[0]["boards"]),
+        "accounts": accounts,
+        # first-account shape, kept for anything still reading "boards"
+        "boards": accounts[0]["boards"] if accounts else {},
         "command_url": COMMAND_URL,
         "token": user["api_token"],
         "invite_code": INVITE_CODE if user["username"] == OWNER_USERNAME else "",
@@ -654,11 +745,19 @@ def dashboard_state(request: Request) -> dict:
 
 @app.post("/app/trello")
 def connect_trello(request: Request, body: TrelloTokenIn) -> dict:
-    """Verify the pasted token against Trello, store it, refresh boards."""
+    """Verify the pasted token against Trello, store it as an account,
+    refresh boards. An empty label names the user's first account."""
     user = require_session(request)
     token = body.token.strip()
     if not token:
         raise HTTPException(status_code=400, detail="paste the token from Trello first")
+    label = body.label.strip().lower()
+    if not label:
+        existing = store.accounts_for(user["id"])
+        label = existing[0]["label"] if len(existing) == 1 else "trello"
+    if not ACCOUNT_LABEL_RE.match(label):
+        raise HTTPException(status_code=400,
+                            detail="account name is 1-32 characters: a-z, 0-9, '-' or '_'")
     try:
         probe = requests.get(f"{TRELLO_API}/members/me",
                              params={"key": TRELLO_KEY, "token": token}, timeout=15)
@@ -666,7 +765,19 @@ def connect_trello(request: Request, body: TrelloTokenIn) -> dict:
     except requests.RequestException:
         raise HTTPException(status_code=401,
                             detail="Trello rejected that token — copy it again from the authorize page")
-    store.set_trello_token(user["id"], token)
+    if store.get_account(user["id"], label):
+        raise HTTPException(status_code=409,
+                            detail=f"you already have an account named '{label}' — pick another name")
+    store.add_account(user["id"], label, token)
+    _clients.pop(user["id"], None)
+    return app_state(store.get_user(user["id"]))
+
+
+@app.delete("/app/trello")
+def disconnect_account(request: Request, label: str) -> dict:
+    user = require_session(request)
+    if not store.delete_account(user["id"], label.strip().lower()):
+        raise HTTPException(status_code=404, detail="no account with that name")
     _clients.pop(user["id"], None)
     return app_state(store.get_user(user["id"]))
 
@@ -709,6 +820,7 @@ STYLE = """<!doctype html>
  h1{font-size:1.5rem;margin:0 0 4px;letter-spacing:.06em;color:var(--accent2);text-shadow:0 0 18px rgba(255,217,160,.35)}
  h1::before{content:'☾ ';color:var(--accent)}
  .sub{color:var(--muted);font-size:.92rem}
+ hr{border:none;border-top:1px solid var(--border);margin:14px 0}
  .card{background:rgba(31,19,53,.85);border:1px solid var(--border);border-radius:14px;padding:18px;margin:16px 0;
   box-shadow:0 0 0 1px rgba(201,160,255,.06),0 6px 24px rgba(0,0,0,.35)}
  .card b{color:var(--accent2)}
@@ -853,30 +965,43 @@ function recipe(d){
  ${boxes}
  <p class="sub">This token is yours alone — it can create and read cards on your boards. Enable <b>Show on Apple Watch</b>; on an Ultra assign it to the Action button.</p>`;
 }
+function accountBlock(a,idx,d){
+ const boards=Object.entries(a.boards).map(([b,lists])=>`<li><b>${esc(b)}</b>: ${lists.map(esc).join(' · ')||'<i>no lists</i>'}</li>`).join('');
+ const label=(idx===0&&d.accounts.length===1)?'':'<span class="sub">account “'+esc(a.label)+'”</span> ';
+ return `${label}<p class="sub"><span class="ok">connected</span></p>
+  <ul>${boards}</ul>
+  <button class="sec" data-acc="${escA(a.label)}">Remove</button>`;
+}
 function trelloCard(d){
- if(d.connected){
-  const boards=Object.entries(d.boards).map(([b,lists])=>`<li><b>${esc(b)}</b>: ${lists.map(esc).join(' · ')||'<i>no lists</i>'}</li>`).join('');
-  return `<p class="sub"><span class="ok">connected</span></p>
-   <ul>${boards}</ul>
-   <details><summary>Connect a different Trello account</summary>
-    <p class="sub">Open the authorize link, copy the token, paste it below.</p>
-    <p><a class="btn" href="${d.authorize_url}" target="_blank" rel="noopener">Authorize on Trello</a></p>
-    <input id="tok" placeholder="Paste your Trello token">
-    <button onclick="connect()">Connect</button> <span id="terr"></span>
-   </details>`;
+ if(!d.accounts.length){
+  return `<ol><li>Open the <a href="${d.authorize_url}" target="_blank" rel="noopener" style="color:var(--accent)">Trello authorize page</a> and click <b>Allow</b>.</li>
+  <li>Trello shows a long token — copy it (give it a few seconds to appear).</li>
+  <li>Paste it below.</li></ol>
+  <input id="tok" placeholder="Paste your Trello token" autocomplete="off">
+  <button onclick="connect()">Connect</button> <span id="terr"></span>`;
  }
- return `<ol><li>Open the <a href="${d.authorize_url}" target="_blank" rel="noopener" style="color:var(--accent)">Trello authorize page</a> and click <b>Allow</b>.</li>
- <li>Trello shows a long token — copy it (give it a few seconds to appear).</li>
- <li>Paste it below.</li></ol>
- <input id="tok" placeholder="Paste your Trello token" autocomplete="off">
- <button onclick="connect()">Connect</button> <span id="terr"></span>`;
+ const blocks=d.accounts.map((a,i)=>accountBlock(a,i,d)).join('<hr>');
+ const addForm=`<details><summary>Add another Trello account</summary>
+  <p class="sub">Open the authorize link, copy the token, paste it below. Name it so you can say “on my work trello”.</p>
+  <p><a class="btn" href="${d.authorize_url}" target="_blank" rel="noopener">Authorize on Trello</a></p>
+  <input id="lbl" placeholder="Account name, e.g. work" autocomplete="off">
+  <input id="tok" placeholder="Paste your Trello token" autocomplete="off">
+  <button onclick="connect()">Connect</button> <span id="terr"></span>
+ </details>`;
+ return blocks+addForm;
 }
 async function connect(){
  const err=document.getElementById('terr'); err.textContent='';
+ const lbl=document.getElementById('lbl');
  const r=await fetch('/app/trello',{method:'POST',headers:{'Content-Type':'application/json'},
-  body:JSON.stringify({token:tok.value})});
+  body:JSON.stringify({token:tok.value,label:lbl?lbl.value:''})});
  if(!r.ok){const d=await r.json().catch(()=>({detail:'error '+r.status}));err.textContent=d.detail||'error '+r.status;return}
  render(await r.json());
+}
+async function removeAccount(label){
+ if(!confirm('Remove the Trello account "'+label+'"?'))return;
+ const r=await fetch('/app/trello?label='+encodeURIComponent(label),{method:'DELETE'});
+ if(r.ok)render(await r.json());
 }
 function inviteCard(d){
  if(!d.invite_code)return '';
@@ -885,8 +1010,10 @@ function inviteCard(d){
 }
 function render(d){
  document.getElementById('who').textContent=d.username;
- document.getElementById('trellos').textContent=d.connected
-  ?`🔮 Trello — ${Object.keys(d.boards).length} boards`:'🔮 Trello — connect your account';
+ document.getElementById('trellos').textContent=!d.accounts.length
+  ?'🔮 Trello — connect your account'
+  :d.accounts.length===1?`🔮 Trello — ${Object.keys(d.boards).length} boards`
+  :`🔮 Trello — ${d.accounts.length} accounts`;
  document.getElementById('trellobody').innerHTML=trelloCard(d);
  document.getElementById('trello').open=!d.connected;
  document.getElementById('watch').innerHTML=recipe(d);
@@ -898,6 +1025,8 @@ function render(d){
 (async()=>{render(await (await fetch('/app/state')).json())})();
 document.getElementById('watch').addEventListener('click',e=>{
  const b=e.target.closest('button.sec'); if(b&&b.dataset.v!==undefined)copy(b,b.dataset.v)});
+document.getElementById('trellobody').addEventListener('click',e=>{
+ const b=e.target.closest('button.sec'); if(b&&b.dataset.acc!==undefined)removeAccount(b.dataset.acc)});
 document.getElementById('gearbtn').onclick=()=>{
  const s=document.getElementById('settings'); s.open=true; s.scrollIntoView({behavior:'smooth'})};
 document.addEventListener('keydown',e=>{if(e.key==='Enter'&&e.target.id==='pwcur')pw()});
