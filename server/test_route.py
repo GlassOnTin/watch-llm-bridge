@@ -147,3 +147,34 @@ def test_spoken_error_without_candidates():
     reply = app.spoken_error("board 'Work' matches nothing")
     assert reply.startswith("I couldn't match that.")
     assert "Options include" not in reply
+
+def test_create_card_without_board_resolves_unique_board(monkeypatch, stocked_trello):
+    seen = {}
+
+    def fake_create(board, list_name, name, desc=""):
+        seen.update(board=board, list_name=list_name)
+        return {"name": name}
+
+    monkeypatch.setattr(app.trello, "create_card", fake_create)
+    out = app.execute_tool(
+        "trello_create_card", {"list": "Shopping List", "name": "Milk"}
+    )
+    assert out == {"ok": True, "created": "Milk", "list": "Shopping List", "board": "Home"}
+    assert seen["board"] == "Home"
+
+
+def test_create_card_without_board_and_ambiguous_list_asks(monkeypatch, stocked_trello):
+    monkeypatch.setattr(
+        app.trello, "lists_by_board",
+        {"b1": [("Done", "l2"), ("Done", "l3")], "b2": [("Done", "l4")]})
+    called = False
+
+    def fake_create(*a, **kw):
+        nonlocal called
+        called = True
+        return {"name": "x"}
+
+    monkeypatch.setattr(app.trello, "create_card", fake_create)
+    out = app.execute_tool("trello_create_card", {"list": "Done", "name": "x"})
+    assert out == {"ok": False, "error": "ambiguous_board", "list": "Done", "boards": ["Home", "Plans"]}
+    assert not called  # nothing was written before the ask

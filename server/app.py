@@ -61,14 +61,14 @@ def resolve_target(boards: dict, lists_by_board: dict, board: str, list_name: st
     if len(board_hits) != 1:
         raise KeyError(
             f"board '{board}' matches {board_hits or 'nothing'} "
-            f"(known: {sorted(boards)})"
+            f"(known: {', '.join(sorted(boards))})"
         )
     board_id = boards[board_hits[0]]
     pairs = lists_by_board.get(board_id, [])
     list_hits = [lid for n, lid in pairs if n.lower() == list_name.lower()]
     if len(list_hits) != 1:
         detail = f"{len(list_hits)} lists named '{list_name}'" if list_hits else "matches nothing"
-        known = sorted({n for n, _ in pairs})
+        known = ", ".join(sorted({n for n, _ in pairs}))
         raise KeyError(f"list '{list_name}' {detail} on '{board_hits[0]}' (known: {known})")
     return board_id, list_hits[0]
 
@@ -188,7 +188,8 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "trello_create_card",
-            "description": "Create a card in a named list on a named board.",
+            "description": "Create a card in a named list. Omit board when unsure: "
+                           "the server finds the board if the list name is unique.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -197,7 +198,7 @@ TOOLS = [
                     "name": {"type": "string"},
                     "desc": {"type": "string"},
                 },
-                "required": ["board", "list", "name"],
+                "required": ["list", "name"],
             },
         },
     },
@@ -205,14 +206,15 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "trello_list_cards",
-            "description": "Read the cards in a list.",
+            "description": "Read the cards in a list. Omit board when unsure: "
+                           "the server finds the board if the list name is unique.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "board": {"type": "string"},
                     "list": {"type": "string"},
                 },
-                "required": ["board", "list"],
+                "required": ["list"],
             },
         },
     },
@@ -254,10 +256,12 @@ Rules:
    Ignore emoji and punctuation in list names, and treat near-misses ("huge"
    for "Hugge") as matches. NEVER invent a board or list name that is not in
    the inventory, and never guess between two candidates: ask instead.
-2. If the list name alone is unique across all boards, omit the board. If it
-   exists on several boards, use the board the user named; if they named
-   none, ask in one short question that models the retry, e.g. "Food is on
-   Home and Plans — say: add it to Food on plans".
+2. Pass the board only when the user named one. If you are unsure, omit it:
+   the server finds the board when the list name is unique, and answers
+   ambiguous_board when several boards have that list. On ambiguous_board,
+   ask which board in one short question that models the retry, e.g. "Food
+   is on Home and Plans — say: add it to Food on plans". Never invent a
+   board name.
 3. Spoken aliases map phrases to real board names: {aliases}. Apply them
    before matching.
 4. Fill tool arguments only from what the user said. Do not add a note
@@ -269,14 +273,45 @@ Rules:
 7. If the request matches no tool, answer helpfully in a sentence or two."""
 
 
+def find_boards_with_list(list_name: str) -> list[str]:
+    """Board names containing a list with this name (case-insensitive)."""
+    want = list_name.lower()
+    return [
+        board
+        for board, bid in trello.boards.items()
+        if any(n.lower() == want for n, _ in trello.lists_by_board.get(bid, []))
+    ]
+
+
+def resolve_board(args: dict, list_name: str) -> dict:
+    """Pick the board server-side. A board the LLM named is honoured; an
+    omitted board resolves only if the list name is unique. Ambiguity comes
+    back as an ask-the-user result, never a guess."""
+    board = args.get("board") or ""
+    if board:
+        return {"ok": True, "board": board}
+    hits = find_boards_with_list(list_name)
+    if len(hits) == 1:
+        return {"ok": True, "board": hits[0]}
+    return {"ok": False, "error": "ambiguous_board", "list": list_name, "boards": hits}
+
+
 def execute_tool(name: str, args: dict) -> dict:
-    """Dispatch one tool call. KeyError from resolve_target = mismatch/ambiguity."""
+    """Dispatch one tool call. KeyError from resolve_target = mismatch."""
     if name == "trello_create_card":
-        card = trello.create_card(args["board"], args["list"], args["name"], args.get("desc", ""))
-        return {"ok": True, "created": card["name"], "list": args["list"], "board": args["board"]}
+        picked = resolve_board(args, args["list"])
+        if not picked["ok"]:
+            return picked
+        board = picked["board"]
+        card = trello.create_card(board, args["list"], args["name"], args.get("desc", ""))
+        return {"ok": True, "created": card["name"], "list": args["list"], "board": board}
     if name == "trello_list_cards":
-        cards = trello.cards(args["board"], args["list"])
-        return {"ok": True, "list": args["list"], "board": args["board"], "cards": [c["name"] for c in cards]}
+        picked = resolve_board(args, args["list"])
+        if not picked["ok"]:
+            return picked
+        board = picked["board"]
+        cards = trello.cards(board, args["list"])
+        return {"ok": True, "list": args["list"], "board": board, "cards": [c["name"] for c in cards]}
     if name == "trello_list_boards":
         return {
             board: [n for n, _ in trello.lists_by_board.get(bid, [])]
