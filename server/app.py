@@ -10,19 +10,25 @@ Run:
     set -a; source ../.env; set +a     # or export the vars directly
     uvicorn app:app --host 0.0.0.0 --port 8000
 """
+import hashlib
+import hmac
 import json
 import logging
 import os
+import re
+import secrets
 import time
 from datetime import datetime, timezone
 
 import pyotp
 import requests
 from dotenv import load_dotenv
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel
+
+import store
 
 load_dotenv()  # reads .env from the CWD if present; real env vars win
 
@@ -34,6 +40,12 @@ COMMAND_URL = os.environ.get("COMMAND_URL", "https://bridge.upperpeas.com/comman
 # Provision-page second factor. The same secret must be enrolled in Haven
 # (create_totp_secret) so codes come from the phone. Empty disables /provision.
 TOTP_SECRET = os.environ.get("TOTP_SECRET", "")
+# Multi-user: INVITE_CODE gates /signup (empty = signup disabled). SESSION_SECRET
+# signs dashboard cookies — an ephemeral random value means sessions die on restart.
+INVITE_CODE = os.environ.get("INVITE_CODE", "")
+SESSION_SECRET = os.environ.get("SESSION_SECRET", "") or secrets.token_hex(32)
+OWNER_USERNAME = os.environ.get("OWNER_USERNAME", "ian")
+OWNER_PASSWORD = os.environ.get("OWNER_PASSWORD", "")
 
 TRELLO_API = "https://api.trello.com/1"
 
@@ -114,6 +126,78 @@ class Trello:
 
 trello = Trello(TRELLO_KEY, TRELLO_TOKEN)
 
+# Per-user Trello clients. The owner's client is the `trello` singleton above,
+# seeded into this cache at startup — tests and the existing endpoints patch the
+# singleton's attributes, so its object identity must not change.
+_clients: dict[int, Trello] = {}
+
+
+def trello_for(user: dict) -> Trello | None:
+    """The user's cached Trello client, or None while they haven't connected.
+    First use after a restart refreshes boards/lists from the API."""
+    token = user.get("trello_token")
+    if not token:
+        return None
+    client = _clients.get(user["id"])
+    if client is None:
+        client = Trello(TRELLO_KEY, token)
+        client.refresh()
+        _clients[user["id"]] = client
+    return client
+
+
+def require_user(authorization: str) -> dict:
+    """Resolve the Authorization header to a user row; 401 on anything else."""
+    token = authorization.removeprefix("Bearer ").strip()
+    user = store.get_user_by_token(token) if token else None
+    if not user:
+        raise HTTPException(status_code=401, detail="bad token")
+    return user
+
+
+# --- dashboard sessions: HMAC-signed cookie, stdlib only ---
+
+SESSION_COOKIE = "bridge_session"
+SESSION_TTL = 30 * 24 * 3600
+
+
+def _sign(payload: str) -> str:
+    return hmac.new(SESSION_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
+
+
+def make_session(user_id: int) -> str:
+    payload = f"{user_id}.{int(time.time()) + SESSION_TTL}"
+    return f"{payload}.{_sign(payload)}"
+
+
+def session_user(request: Request) -> dict | None:
+    raw = request.cookies.get(SESSION_COOKIE, "")
+    payload, _, sig = raw.rpartition(".")
+    if not payload or not hmac.compare_digest(sig, _sign(payload)):
+        return None
+    user_id, _, exp = payload.partition(".")
+    try:
+        if int(exp) < time.time():
+            return None
+        return store.get_user(int(user_id))
+    except ValueError:
+        return None
+
+
+def seed_owner() -> None:
+    """First boot: turn the single-tenant .env credentials into the owner's
+    account so the existing BRIDGE_TOKEN watch shortcut keeps working."""
+    if store.count_users():
+        return
+    password = OWNER_PASSWORD or secrets.token_urlsafe(12)
+    owner = store.create_user(OWNER_USERNAME, password,
+                              api_token=BRIDGE_TOKEN, trello_token=TRELLO_TOKEN)
+    _clients[owner["id"]] = trello
+    if not OWNER_PASSWORD:
+        logging.getLogger("uvicorn.error").warning(
+            "Seeded owner '%s' with a random dashboard password (shown once): %s",
+            OWNER_USERNAME, password)
+
 app = FastAPI(title="watch-llm-bridge")
 # CORS is only needed for the endpoint tester on the Pages guide. Lock the
 # origin; omit the middleware entirely if you never use the tester.
@@ -125,14 +209,15 @@ app.add_middleware(
 )
 
 
-def require_token(authorization: str) -> None:
-    if authorization != f"Bearer {BRIDGE_TOKEN}":
-        raise HTTPException(status_code=401, detail="bad token")
-
-
 @app.on_event("startup")
 def cache_trello() -> None:
-    trello.refresh()
+    store.connect()
+    seed_owner()
+    try:
+        trello.refresh()
+    except requests.RequestException as e:
+        # A Trello outage at boot shouldn't take the whole bridge down.
+        logging.getLogger("uvicorn.error").warning("Trello refresh at boot failed: %s", e)
 
 
 @app.get("/health")
@@ -143,8 +228,16 @@ def health() -> dict:
 @app.post("/command")
 def command(cmd: Command, authorization: str = Header(default="")) -> dict:
     """The watch shortcut's single entry point."""
-    require_token(authorization)
-    return {"reply": route(cmd.text)}
+    user = require_user(authorization)
+    try:
+        t = trello_for(user)
+    except requests.RequestException as e:
+        logging.getLogger("uvicorn.error").warning("Trello refresh for %s failed: %s",
+                                                   user["username"], e)
+        return {"reply": "Trello is unreachable right now."}
+    if t is None:
+        return {"reply": "Your Trello isn't connected yet. Open the bridge dashboard to connect it."}
+    return {"reply": route(cmd.text, t)}
 
 
 def route(text: str) -> str:
@@ -229,10 +322,11 @@ TOOLS = [
 ]
 
 
-def build_system_prompt() -> str:
+def build_system_prompt(t: Trello | None = None) -> str:
+    t = t or trello
     inventory = "\n".join(
-        f"- board '{board}': " + " | ".join(n for n, _ in trello.lists_by_board.get(bid, []))
-        for board, bid in trello.boards.items()
+        f"- board '{board}': " + " | ".join(n for n, _ in t.lists_by_board.get(bid, []))
+        for board, bid in t.boards.items()
     )
     aliases = ", ".join(f'"{k}" means board "{v}"' for k, v in spoken_aliases().items())
     today = datetime.now(timezone.utc).strftime("%A %d %B %Y")
@@ -273,49 +367,51 @@ Rules:
 7. If the request matches no tool, answer helpfully in a sentence or two."""
 
 
-def find_boards_with_list(list_name: str) -> list[str]:
+def find_boards_with_list(list_name: str, t: Trello | None = None) -> list[str]:
     """Board names containing a list with this name (case-insensitive)."""
+    t = t or trello
     want = list_name.lower()
     return [
         board
-        for board, bid in trello.boards.items()
-        if any(n.lower() == want for n, _ in trello.lists_by_board.get(bid, []))
+        for board, bid in t.boards.items()
+        if any(n.lower() == want for n, _ in t.lists_by_board.get(bid, []))
     ]
 
 
-def resolve_board(args: dict, list_name: str) -> dict:
+def resolve_board(args: dict, list_name: str, t: Trello | None = None) -> dict:
     """Pick the board server-side. A board the LLM named is honoured; an
     omitted board resolves only if the list name is unique. Ambiguity comes
     back as an ask-the-user result, never a guess."""
     board = args.get("board") or ""
     if board:
         return {"ok": True, "board": board}
-    hits = find_boards_with_list(list_name)
+    hits = find_boards_with_list(list_name, t)
     if len(hits) == 1:
         return {"ok": True, "board": hits[0]}
     return {"ok": False, "error": "ambiguous_board", "list": list_name, "boards": hits}
 
 
-def execute_tool(name: str, args: dict) -> dict:
+def execute_tool(name: str, args: dict, t: Trello | None = None) -> dict:
     """Dispatch one tool call. KeyError from resolve_target = mismatch."""
+    t = t or trello
     if name == "trello_create_card":
-        picked = resolve_board(args, args["list"])
+        picked = resolve_board(args, args["list"], t)
         if not picked["ok"]:
             return picked
         board = picked["board"]
-        card = trello.create_card(board, args["list"], args["name"], args.get("desc", ""))
+        card = t.create_card(board, args["list"], args["name"], args.get("desc", ""))
         return {"ok": True, "created": card["name"], "list": args["list"], "board": board}
     if name == "trello_list_cards":
-        picked = resolve_board(args, args["list"])
+        picked = resolve_board(args, args["list"], t)
         if not picked["ok"]:
             return picked
         board = picked["board"]
-        cards = trello.cards(board, args["list"])
+        cards = t.cards(board, args["list"])
         return {"ok": True, "list": args["list"], "board": board, "cards": [c["name"] for c in cards]}
     if name == "trello_list_boards":
         return {
-            board: [n for n, _ in trello.lists_by_board.get(bid, [])]
-            for board, bid in trello.boards.items()
+            board: [n for n, _ in t.lists_by_board.get(bid, [])]
+            for board, bid in t.boards.items()
         }
     raise NotImplementedError(f"unknown tool '{name}'")
 
@@ -333,14 +429,15 @@ def spoken_error(message: str, max_candidates: int = 5) -> str:
     return f"I couldn't match that. {base.strip()}.{hint} Say it again and name the board."
 
 
-def route(text: str) -> str:
+def route(text: str, t: Trello | None = None) -> str:
     """Send the sentence to the LLM; the LLM picks tools, the server keeps
     resolve_target as the fail-loud authority on where cards go. Echoes only
     while no LLM backend is configured (Phase 1 fallback)."""
+    t = t or trello
     if not (LLM_BASE_URL and LLM_API_KEY and LLM_MODEL):
         return f"echo: {text}"
     messages = [
-        {"role": "system", "content": build_system_prompt()},
+        {"role": "system", "content": build_system_prompt(t)},
         {"role": "user", "content": text},
     ]
     for _ in range(3):
@@ -370,7 +467,7 @@ def route(text: str) -> str:
         for call in calls:
             args = json.loads(call["function"]["arguments"] or "{}")
             try:
-                result = execute_tool(call["function"]["name"], args)
+                result = execute_tool(call["function"]["name"], args, t)
             except KeyError as e:
                 return spoken_error(e.args[0])
             messages.append({
@@ -383,35 +480,360 @@ def route(text: str) -> str:
 
 # --- direct tool endpoints: the same functions the LLM will call in Phase 2 ---
 
+def _client_or_409(authorization: str) -> tuple[dict, Trello]:
+    user = require_user(authorization)
+    try:
+        t = trello_for(user)
+    except requests.RequestException as e:
+        logging.getLogger("uvicorn.error").warning("Trello refresh for %s failed: %s",
+                                                   user["username"], e)
+        raise HTTPException(status_code=502, detail="trello unreachable")
+    if t is None:
+        raise HTTPException(status_code=409, detail="trello not connected for this user")
+    return user, t
+
+
 @app.get("/boards")
 def boards(authorization: str = Header(default="")) -> dict:
-    require_token(authorization)
+    _, t = _client_or_409(authorization)
     return {
         name: {
             "id": bid,
-            "lists": [{"name": n, "id": lid} for n, lid in trello.lists_by_board.get(bid, [])],
+            "lists": [{"name": n, "id": lid} for n, lid in t.lists_by_board.get(bid, [])],
         }
-        for name, bid in trello.boards.items()
+        for name, bid in t.boards.items()
     }
 
 
 @app.get("/cards")
 def cards(board: str, list: str, authorization: str = Header(default="")) -> list[dict]:
-    require_token(authorization)
+    _, t = _client_or_409(authorization)
     try:
-        return trello.cards(board, list)
+        return t.cards(board, list)
     except KeyError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
 
 @app.post("/card")
 def card(card_in: CardIn, authorization: str = Header(default="")) -> dict:
-    require_token(authorization)
+    _, t = _client_or_409(authorization)
     try:
-        created = trello.create_card(card_in.board, card_in.list, card_in.name, card_in.desc)
+        created = t.create_card(card_in.board, card_in.list, card_in.name, card_in.desc)
     except KeyError as e:
         raise HTTPException(status_code=404, detail=str(e))
     return {"id": created["id"], "name": created["name"], "url": created["url"]}
+
+
+# --- multi-user web front end: signup, login, dashboard, Trello onboarding ---
+
+import sqlite3
+
+USERNAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{1,31}$")
+
+
+class SignupIn(BaseModel):
+    username: str
+    password: str
+    invite: str = ""
+
+
+class LoginIn(BaseModel):
+    username: str
+    password: str
+
+
+class TrelloTokenIn(BaseModel):
+    token: str
+
+
+class PasswordIn(BaseModel):
+    current: str
+    new: str
+
+
+def require_session(request: Request) -> dict:
+    user = session_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="not signed in")
+    return user
+
+
+def app_state(user: dict) -> dict:
+    """Everything the dashboard renders, in one fetch."""
+    try:
+        t = trello_for(user)
+    except requests.RequestException:
+        t = None
+    return {
+        "username": user["username"],
+        "connected": t is not None and bool(t.boards),
+        "boards": {} if t is None else {
+            name: [n for n, _ in t.lists_by_board.get(bid, [])]
+            for name, bid in t.boards.items()
+        },
+        "command_url": COMMAND_URL,
+        "token": user["api_token"],
+        "authorize_url": (
+            "https://trello.com/1/authorize?expiration=30days&name=Watch+Bridge"
+            f"&scope=read,write&response_type=token&key={TRELLO_KEY}"
+        ),
+    }
+
+
+@app.get("/")
+def landing(request: Request):
+    if session_user(request):
+        return RedirectResponse("/app", status_code=303)
+    return RedirectResponse("/login", status_code=303)
+
+
+@app.get("/login", response_class=HTMLResponse)
+def login_page() -> str:
+    return LOGIN_HTML
+
+
+@app.get("/signup", response_class=HTMLResponse)
+def signup_page() -> str:
+    return SIGNUP_HTML
+
+
+@app.post("/auth/signup")
+def auth_signup(request: Request, body: SignupIn, response: Response) -> dict:
+    if not INVITE_CODE:
+        raise HTTPException(status_code=403, detail="signup is disabled on this server")
+    if rate_limited(request.client.host):
+        raise HTTPException(status_code=429, detail="too many attempts")
+    if not hmac.compare_digest(body.invite.strip(), INVITE_CODE):
+        raise HTTPException(status_code=403, detail="bad invite code")
+    username = body.username.strip().lower()
+    if not USERNAME_RE.match(username):
+        raise HTTPException(status_code=400,
+                            detail="username is 2-32 characters: a-z, 0-9, '-' or '_'")
+    if len(body.password) < 8:
+        raise HTTPException(status_code=400, detail="password must be at least 8 characters")
+    try:
+        user = store.create_user(username, body.password)
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=409, detail="that username is taken")
+    response.set_cookie(SESSION_COOKIE, make_session(user["id"]),
+                        httponly=True, samesite="lax", max_age=SESSION_TTL)
+    return {"ok": True}
+
+
+@app.post("/auth/login")
+def auth_login(request: Request, body: LoginIn, response: Response) -> dict:
+    if rate_limited(request.client.host):
+        raise HTTPException(status_code=429, detail="too many attempts")
+    user = store.get_user_by_name(body.username.strip().lower())
+    if not user or not store.verify_password(body.password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="wrong username or password")
+    response.set_cookie(SESSION_COOKIE, make_session(user["id"]),
+                        httponly=True, samesite="lax", max_age=SESSION_TTL)
+    return {"ok": True}
+
+
+@app.get("/logout")
+def logout():
+    resp = RedirectResponse("/login", status_code=303)
+    resp.delete_cookie(SESSION_COOKIE)
+    return resp
+
+
+@app.get("/app", response_class=HTMLResponse)
+def dashboard_page(request: Request):
+    if not session_user(request):
+        return RedirectResponse("/login", status_code=303)
+    return DASHBOARD_HTML
+
+
+@app.get("/app/state")
+def dashboard_state(request: Request) -> dict:
+    return app_state(require_session(request))
+
+
+@app.post("/app/trello")
+def connect_trello(request: Request, body: TrelloTokenIn) -> dict:
+    """Verify the pasted token against Trello, store it, refresh boards."""
+    user = require_session(request)
+    token = body.token.strip()
+    if not token:
+        raise HTTPException(status_code=400, detail="paste the token from Trello first")
+    try:
+        probe = requests.get(f"{TRELLO_API}/members/me",
+                             params={"key": TRELLO_KEY, "token": token}, timeout=15)
+        probe.raise_for_status()
+    except requests.RequestException:
+        raise HTTPException(status_code=401,
+                            detail="Trello rejected that token — copy it again from the authorize page")
+    store.set_trello_token(user["id"], token)
+    _clients.pop(user["id"], None)
+    return app_state(store.get_user(user["id"]))
+
+
+@app.post("/app/password")
+def change_password(request: Request, body: PasswordIn) -> dict:
+    user = require_session(request)
+    if not store.verify_password(body.current, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="wrong current password")
+    if len(body.new) < 8:
+        raise HTTPException(status_code=400, detail="new password must be at least 8 characters")
+    store.set_password(user["id"], body.new)
+    return {"ok": True}
+
+
+STYLE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Watch Bridge</title>
+<style>
+ :root{--bg:#0d1117;--panel:#161b22;--border:#2d333b;--text:#e6edf3;--muted:#8b949e;--accent:#4fb3ff;--green:#3fb950;--code:#0a0d12;--mono:ui-monospace,Menlo,monospace}
+ *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,"Segoe UI",Roboto,sans-serif;line-height:1.6}
+ main{max-width:640px;margin:0 auto;padding:48px 20px 80px}
+ h1{font-size:1.4rem;margin:0 0 4px}.sub{color:var(--muted);font-size:.9rem}
+ .card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:18px;margin:16px 0}
+ input{width:100%;background:var(--code);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:10px 12px;font-family:var(--mono);font-size:.95rem;margin:6px 0}
+ button{background:var(--accent);color:#04121f;border:none;border-radius:6px;padding:10px 22px;font-weight:600;cursor:pointer;margin-top:10px}
+ button.sec{background:transparent;border:1px solid var(--border);color:var(--muted);font-family:var(--mono);font-size:.75rem;padding:3px 10px;font-weight:400;margin:0}
+ a.btn{display:inline-block;background:var(--accent);color:#04121f;border-radius:6px;padding:10px 22px;font-weight:600;text-decoration:none;margin-top:10px}
+ pre{background:var(--code);border:1px solid var(--border);border-radius:6px;padding:10px 12px;font-family:var(--mono);font-size:.82rem;overflow-x:auto;word-break:break-all}
+ .row{display:flex;justify-content:space-between;align-items:center;gap:8px;margin:14px 0 6px}
+ .row b{font-size:.95rem}
+ .ok{color:var(--green)}#err{color:#f85149;font-size:.85rem;min-height:1.2em}
+ ol{padding-left:20px}li{margin-bottom:8px}
+ .token{font-family:var(--mono);font-size:.8rem;word-break:break-all;background:var(--code);border:1px solid var(--border);border-radius:6px;padding:8px 10px}
+ .top{display:flex;justify-content:space-between;align-items:baseline}
+ .top a{color:var(--muted);font-size:.85rem}
+ details summary{cursor:pointer;color:var(--muted);font-size:.85rem}
+ ul{margin:6px 0;padding-left:20px}
+</style></head><body><main>
+"""
+
+LANDING_HTML = STYLE + """<h1>Watch Bridge</h1>
+<p class="sub">Speak a command on your Apple Watch; it lands on your Trello boards.</p>
+<div class="card">
+ <p><a class="btn" href="/login">Log in</a> <a class="btn" href="/signup">Sign up</a></p>
+ <p class="sub">Signing up needs an invite code from the operator. You then connect
+ your own Trello account and get a personal token for your watch shortcut.</p>
+</div>
+</main></body></html>"""
+
+SIGNUP_HTML = STYLE + """<h1>Sign up</h1>
+<p class="sub">Accounts are invite-only. Ask the operator for the code.</p>
+<div class="card">
+ <input id="invite" placeholder="Invite code" autocomplete="off">
+ <input id="username" placeholder="Username (a-z, 0-9, -)" autocomplete="username">
+ <input id="password" type="password" placeholder="Password (8+ characters)" autocomplete="new-password">
+ <button onclick="go()">Create account</button>
+ <span id="err"></span>
+</div>
+<p class="sub">Already have one? <a href="/login" style="color:var(--accent)">Log in</a></p>
+<script>
+async function go(){
+ const err=document.getElementById('err'); err.textContent='';
+ const r=await fetch('/auth/signup',{method:'POST',headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({invite:invite.value,username:username.value,password:password.value})});
+ if(r.ok){location.href='/app';return}
+ const d=await r.json().catch(()=>({detail:'error '+r.status}));
+ err.textContent=d.detail||('error '+r.status);
+}
+document.querySelectorAll('input').forEach(i=>i.addEventListener('keydown',e=>{if(e.key==='Enter')go()}));
+</script></main></body></html>"""
+
+LOGIN_HTML = STYLE + """<h1>Watch Bridge</h1>
+<p class="sub">Log in to manage your watch shortcut and Trello connection.</p>
+<div class="card">
+ <input id="username" placeholder="Username" autocomplete="username">
+ <input id="password" type="password" placeholder="Password" autocomplete="current-password">
+ <button onclick="go()">Log in</button>
+ <span id="err"></span>
+</div>
+<p class="sub">No account? <a href="/signup" style="color:var(--accent)">Sign up</a> (invite code needed).</p>
+<script>
+async function go(){
+ const err=document.getElementById('err'); err.textContent='';
+ const r=await fetch('/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({username:username.value,password:password.value})});
+ if(r.ok){location.href='/app';return}
+ const d=await r.json().catch(()=>({detail:'error '+r.status}));
+ err.textContent=r.status===429?'slow down — too many attempts':(d.detail||('error '+r.status));
+}
+document.querySelectorAll('input').forEach(i=>i.addEventListener('keydown',e=>{if(e.key==='Enter')go()}));
+</script></main></body></html>"""
+
+DASHBOARD_HTML = STYLE + """<div class="top"><h1>Watch Bridge</h1><span><span id="who" class="sub"></span> · <a href="/logout">log out</a></span></div>
+<div id="trello"></div>
+<div id="watch" class="card"></div>
+<div class="card">
+ <div class="row"><b>Change password</b></div>
+ <input id="cur" type="password" placeholder="Current password" autocomplete="current-password">
+ <input id="new" type="password" placeholder="New password (8+ characters)" autocomplete="new-password">
+ <button onclick="pw()">Update</button> <span id="pwerr"></span>
+</div>
+<script>
+function copy(btn, text){navigator.clipboard.writeText(text).then(()=>{const o=btn.textContent;btn.textContent='Copied';setTimeout(()=>btn.textContent=o,1400)})}
+function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}
+async function pw(){
+ const err=document.getElementById('pwerr'); err.textContent='';
+ const r=await fetch('/app/password',{method:'POST',headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({current:cur.value,new:new.value})});
+ if(r.ok){err.className='ok';err.textContent='updated';cur.value=new.value='';return}
+ const d=await r.json().catch(()=>({detail:'error '+r.status})); err.className=''; err.textContent=d.detail||'error '+r.status;
+}
+function recipe(d){
+ const headers='Content-Type: application/json\\nAuthorization: Bearer '+d.token;
+ const bodyJson='{"text": "<Dictated Text>"}';
+ return `
+ <div class="row"><b>Your watch shortcut</b></div>
+ <ol>
+  <li><b>Dictate Text</b></li>
+  <li><b>Get Contents of URL</b> — URL below, Method <b>POST</b>, Headers as below, Request Body → JSON with a field <code>text</code> = the <i>Dictated Text</i> magic variable</li>
+  <li><b>Get Dictionary Value</b> — key <code>reply</code></li>
+  <li><b>Speak Text</b></li>
+ </ol>
+ <div class="row"><b>Endpoint URL</b><button class="sec" onclick="copy(this,'${d.command_url}')">Copy</button></div>
+ <pre>${esc(d.command_url)}</pre>
+ <div class="row"><b>Headers</b><button class="sec" onclick="copy(this,headers)">Copy</button></div>
+ <pre>${esc(headers)}</pre>
+ <div class="row"><b>Request body (JSON)</b><button class="sec" onclick="copy(this,bodyJson)">Copy</button></div>
+ <pre>${esc(bodyJson)}</pre>
+ <p class="sub">This token is yours alone — it can create and read cards on your boards. Enable <b>Show on Apple Watch</b>; on an Ultra assign it to the Action button.</p>`;
+}
+function trelloCard(d){
+ if(d.connected){
+  const boards=Object.entries(d.boards).map(([b,lists])=>`<li><b>${esc(b)}</b>: ${lists.map(esc).join(' · ')||'<i>no lists</i>'}</li>`).join('');
+  return `<div class="card">
+   <div class="row"><b>Trello</b><span class="ok">connected — ${Object.keys(d.boards).length} boards</span></div>
+   <ul>${boards}</ul>
+   <details><summary>Connect a different Trello account</summary>
+    <p class="sub">Open the authorize link, copy the token, paste it below.</p>
+    <p><a class="btn" href="${d.authorize_url}" target="_blank" rel="noopener">Authorize on Trello</a></p>
+    <input id="tok" placeholder="Paste your Trello token">
+    <button onclick="connect()">Connect</button> <span id="terr"></span>
+   </details></div>`;
+ }
+ return `<div class="card">
+  <div class="row"><b>Step 1 · Connect your Trello</b></div>
+  <ol><li>Open the <a href="${d.authorize_url}" target="_blank" rel="noopener" style="color:var(--accent)">Trello authorize page</a> and click <b>Allow</b>.</li>
+  <li>Trello shows a long token — copy it (give it a few seconds to appear).</li>
+  <li>Paste it below.</li></ol>
+  <input id="tok" placeholder="Paste your Trello token" autocomplete="off">
+  <button onclick="connect()">Connect</button> <span id="terr"></span></div>`;
+}
+async function connect(){
+ const err=document.getElementById('terr'); err.textContent='';
+ const r=await fetch('/app/trello',{method:'POST',headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({token:tok.value})});
+ if(!r.ok){const d=await r.json().catch(()=>({detail:'error '+r.status}));err.textContent=d.detail||'error '+r.status;return}
+ render(await r.json());
+}
+function render(d){
+ document.getElementById('who').textContent=d.username;
+ document.getElementById('trello').innerHTML=trelloCard(d);
+ document.getElementById('watch').innerHTML=recipe(d);
+}
+(async()=>{render(await (await fetch('/app/state')).json())})();
+document.addEventListener('keydown',e=>{if(e.key==='Enter'&&e.target.id==='cur')pw()});
+</script></main></body></html>"""
 
 
 # --- provisioning page: TOTP-gated reveal of the shortcut recipe + token ---
