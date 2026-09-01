@@ -729,6 +729,10 @@ STYLE = """<!doctype html>
  .top a{color:var(--muted);font-size:.85rem}
  details summary{cursor:pointer;color:var(--muted);font-size:.85rem}
  ul{margin:6px 0;padding-left:20px}
+ .kv{display:flex;align-items:center;gap:8px;background:var(--code);border:1px solid var(--border);border-radius:8px;padding:8px 10px;margin:8px 0}
+ .kv .k{flex:0 0 auto;min-width:118px;color:var(--accent2);font-size:.8rem;letter-spacing:.04em}
+ .kv .v{flex:1 1 auto;font-family:var(--mono);font-size:.8rem;word-break:break-all}
+ .kv button{margin:0;white-space:nowrap}
  code{color:var(--accent2)}
  .orn{color:var(--accent);letter-spacing:.4em;text-align:center;margin:20px 0 0;font-size:.8rem}
 </style></head><body><main>
@@ -801,6 +805,7 @@ DASHBOARD_HTML = STYLE + """<div class="top"><h1>Watch Bridge</h1><span><span id
 <script>
 function copy(btn, text){navigator.clipboard.writeText(text).then(()=>{const o=btn.textContent;btn.textContent='Copied';setTimeout(()=>btn.textContent=o,1400)})}
 function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}
+function escA(s){return esc(s).replace(/"/g,'&quot;')}
 async function pw(){
  const err=document.getElementById('pwerr'); err.textContent='';
  const r=await fetch('/app/password',{method:'POST',headers:{'Content-Type':'application/json'},
@@ -809,22 +814,29 @@ async function pw(){
  const d=await r.json().catch(()=>({detail:'error '+r.status})); err.className=''; err.textContent=d.detail||'error '+r.status;
 }
 function recipe(d){
- const headers='Content-Type: application/json\\nAuthorization: Bearer '+d.token;
- const bodyJson='{"text": "<Dictated Text>"}';
+ const pairs=[
+  {k:'URL', v:d.command_url},
+  {k:'Method', v:'POST'},
+  {k:'Header key 1', v:'Content-Type'},
+  {k:'Header value 1', v:'application/json'},
+  {k:'Header key 2', v:'Authorization'},
+  {k:'Header value 2', v:'Bearer '+d.token},
+  {k:'Body type', v:'JSON'},
+  {k:'Body key', v:'text'},
+  {k:'Body value', v:'<Dictated Text>'},
+ ];
+ const boxes=pairs.map(p=>`
+  <div class="kv"><span class="k">${esc(p.k)}</span><span class="v">${esc(p.v)}</span>
+  <button class="sec" data-v="${escA(p.v)}">Copy</button></div>`).join('');
  return `
  <div class="row"><b>Your watch shortcut</b></div>
  <ol>
   <li><b>Dictate Text</b></li>
-  <li><b>Get Contents of URL</b> — URL below, Method <b>POST</b>, Headers as below, Request Body → JSON with a field <code>text</code> = the <i>Dictated Text</i> magic variable</li>
+  <li><b>Get Contents of URL</b> — fill each field below, one box per field:</li>
   <li><b>Get Dictionary Value</b> — key <code>reply</code></li>
   <li><b>Speak Text</b></li>
  </ol>
- <div class="row"><b>Endpoint URL</b><button class="sec" onclick="copy(this,'${d.command_url}')">Copy</button></div>
- <pre>${esc(d.command_url)}</pre>
- <div class="row"><b>Headers</b><button class="sec" onclick="copy(this,headers)">Copy</button></div>
- <pre>${esc(headers)}</pre>
- <div class="row"><b>Request body (JSON)</b><button class="sec" onclick="copy(this,bodyJson)">Copy</button></div>
- <pre>${esc(bodyJson)}</pre>
+ ${boxes}
  <p class="sub">This token is yours alone — it can create and read cards on your boards. Enable <b>Show on Apple Watch</b>; on an Ultra assign it to the Action button.</p>`;
 }
 function trelloCard(d){
@@ -872,6 +884,8 @@ function render(d){
  if(ib)ib.onclick=e=>copy(e.target,d.invite_code);
 }
 (async()=>{render(await (await fetch('/app/state')).json())})();
+document.getElementById('watch').addEventListener('click',e=>{
+ const b=e.target.closest('button.sec'); if(b&&b.dataset.v!==undefined)copy(b,b.dataset.v)});
 document.addEventListener('keydown',e=>{if(e.key==='Enter'&&e.target.id==='pwcur')pw()});
 </script></main></body></html>"""
 
