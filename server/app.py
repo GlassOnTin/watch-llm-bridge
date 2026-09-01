@@ -918,6 +918,35 @@ document.querySelectorAll('input').forEach(i=>i.addEventListener('keydown',e=>{i
 DASHBOARD_HTML = STYLE + """<div class="top"><h1>Watch Bridge</h1><span><span id="who" class="sub"></span> · <button class="gear" id="gearbtn" title="Settings">⚙</button> · <a href="/logout">log out</a></span></div>
 <details id="trello" class="dcard"><summary id="trellos"></summary><div class="inner" id="trellobody"></div></details>
 <details id="watchd" class="dcard"><summary>⌚ Your watch shortcut</summary><div class="inner" id="watch"></div></details>
+<details id="talkd" class="dcard"><summary>☾ How to talk to it</summary><div class="inner">
+ <p class="sub">Speak one sentence. It goes to the LLM agent together with the exact inventory
+ of your boards and lists — the same names shown in the Trello section above. The agent picks
+ an action, the server carries it out on Trello, and the reply is read aloud in a sentence or two.</p>
+ <p><b>Things you can say</b></p>
+ <ul>
+  <li>“add bin day to chores” — creates a card in the list named Chores</li>
+  <li>“what's on my shopping list” — reads a list out loud</li>
+  <li>“what boards do I have”</li>
+  <li>With more than one account connected: “add milk to shopping on my work trello”</li>
+ </ul>
+ <p><b>One exchange, up close</b></p>
+ <pre>you:    add bin day to chores on my work trello
+agent:  trello_create_card(list "Chores", name "Bin day", account "work")
+trello: POST /1/cards  → card created
+spoken: “Bin day is on the Chores list of Work Stuff.”</pre>
+ <p class="sub">Two rules keep it honest. It never invents board or list names: if your words
+ don't match the inventory it offers the closest options and asks you to try again. And if a
+ list name exists on more than one board or account it asks which one instead of guessing —
+ “Food is on work / Home and personal / Plans — which one?”</p>
+ <p><b>What Trello supports today</b></p>
+ <ul>
+  <li>Create a card in a list — <code>POST /1/cards</code></li>
+  <li>Read the cards in a list — <code>GET /1/lists/{id}/cards</code></li>
+  <li>Enumerate boards and lists — answered from the server's cache</li>
+ </ul>
+ <p class="sub">Not wired yet: moving or deleting cards, due dates, and Calendar. The agent is
+ only given the tools above, so it says it can't do the rest rather than improvising.</p>
+</div></details>
 <details id="invited" class="dcard"><summary>✉ Invite someone</summary><div class="inner" id="invite"></div></details>
 <details id="settings" class="dcard"><summary>⚙ Settings</summary><div class="inner">
  <div class="card">
