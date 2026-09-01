@@ -573,6 +573,7 @@ def app_state(user: dict) -> dict:
         },
         "command_url": COMMAND_URL,
         "token": user["api_token"],
+        "invite_code": INVITE_CODE if user["username"] == OWNER_USERNAME else "",
         "authorize_url": (
             "https://trello.com/1/authorize?expiration=30days&name=Watch+Bridge"
             f"&scope=read,write&response_type=token&key={TRELLO_KEY}"
@@ -684,27 +685,52 @@ def change_password(request: Request, body: PasswordIn) -> dict:
 STYLE = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Watch Bridge</title>
+<title>☾ Watch Bridge</title>
 <style>
- :root{--bg:#0d1117;--panel:#161b22;--border:#2d333b;--text:#e6edf3;--muted:#8b949e;--accent:#4fb3ff;--green:#3fb950;--code:#0a0d12;--mono:ui-monospace,Menlo,monospace}
- *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,"Segoe UI",Roboto,sans-serif;line-height:1.6}
+ :root{--bg:#150b26;--panel:#1f1335;--border:#4a2e6b;--border2:#6b3fa0;--text:#e8dff5;--muted:#a891c9;--accent:#c9a0ff;--accent2:#ffd9a0;--green:#9fe6b8;--code:#120a20;--mono:ui-monospace,Menlo,monospace;--serif:Georgia,'Times New Roman',serif}
+ *{box-sizing:border-box}
+ body{margin:0;color:var(--text);font-family:var(--serif);line-height:1.6;
+  background:radial-gradient(ellipse at 20% -10%,#33205c 0%,transparent 55%),
+   radial-gradient(ellipse at 85% 15%,#241542 0%,transparent 50%),
+   radial-gradient(1.5px 1.5px at 12% 22%,#fff 50%,transparent 51%),
+   radial-gradient(1px 1px at 32% 8%,#e8dff5 50%,transparent 51%),
+   radial-gradient(1.5px 1.5px at 55% 30%,#fff 50%,transparent 51%),
+   radial-gradient(1px 1px at 71% 12%,#ffd9a0 50%,transparent 51%),
+   radial-gradient(2px 2px at 88% 34%,#fff 50%,transparent 51%),
+   radial-gradient(1px 1px at 8% 55%,#e8dff5 50%,transparent 51%),
+   radial-gradient(1.5px 1.5px at 42% 62%,#fff 50%,transparent 51%),
+   radial-gradient(1px 1px at 64% 76%,#ffd9a0 50%,transparent 51%),
+   radial-gradient(1.5px 1.5px at 93% 68%,#fff 50%,transparent 51%),
+   radial-gradient(1px 1px at 22% 88%,#e8dff5 50%,transparent 51%),
+   radial-gradient(1.5px 1.5px at 78% 92%,#fff 50%,transparent 51%),
+   linear-gradient(180deg,#150b26 0%,#1a0f30 60%,#241542 100%);
+  background-attachment:fixed}
  main{max-width:640px;margin:0 auto;padding:48px 20px 80px}
- h1{font-size:1.4rem;margin:0 0 4px}.sub{color:var(--muted);font-size:.9rem}
- .card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:18px;margin:16px 0}
- input{width:100%;background:var(--code);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:10px 12px;font-family:var(--mono);font-size:.95rem;margin:6px 0}
- button{background:var(--accent);color:#04121f;border:none;border-radius:6px;padding:10px 22px;font-weight:600;cursor:pointer;margin-top:10px}
+ h1{font-size:1.5rem;margin:0 0 4px;letter-spacing:.06em;color:var(--accent2);text-shadow:0 0 18px rgba(255,217,160,.35)}
+ h1::before{content:'☾ ';color:var(--accent)}
+ .sub{color:var(--muted);font-size:.92rem}
+ .card{background:rgba(31,19,53,.85);border:1px solid var(--border);border-radius:14px;padding:18px;margin:16px 0;
+  box-shadow:0 0 0 1px rgba(201,160,255,.06),0 6px 24px rgba(0,0,0,.35)}
+ .card b{color:var(--accent2)}
+ input{width:100%;background:var(--code);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:10px 12px;font-family:var(--mono);font-size:.95rem;margin:6px 0}
+ input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 8px rgba(201,160,255,.35)}
+ button{background:linear-gradient(180deg,#c9a0ff,#a874e8);color:#1a0f30;border:1px solid var(--accent);border-radius:8px;padding:10px 22px;font-family:var(--serif);font-weight:700;cursor:pointer;margin-top:10px;letter-spacing:.03em}
+ button:hover{box-shadow:0 0 14px rgba(201,160,255,.5)}
  button.sec{background:transparent;border:1px solid var(--border);color:var(--muted);font-family:var(--mono);font-size:.75rem;padding:3px 10px;font-weight:400;margin:0}
- a.btn{display:inline-block;background:var(--accent);color:#04121f;border-radius:6px;padding:10px 22px;font-weight:600;text-decoration:none;margin-top:10px}
- pre{background:var(--code);border:1px solid var(--border);border-radius:6px;padding:10px 12px;font-family:var(--mono);font-size:.82rem;overflow-x:auto;word-break:break-all}
+ a.btn{display:inline-block;background:linear-gradient(180deg,#c9a0ff,#a874e8);color:#1a0f30;border:1px solid var(--accent);border-radius:8px;padding:10px 22px;font-weight:700;text-decoration:none;margin-top:10px}
+ pre{background:var(--code);border:1px solid var(--border);border-radius:8px;padding:10px 12px;font-family:var(--mono);font-size:.82rem;overflow-x:auto;word-break:break-all}
  .row{display:flex;justify-content:space-between;align-items:center;gap:8px;margin:14px 0 6px}
- .row b{font-size:.95rem}
- .ok{color:var(--green)}#err{color:#f85149;font-size:.85rem;min-height:1.2em}
+ .row b{font-size:.98rem}
+ .ok{color:var(--green)}#err{color:#ff8fa3;font-size:.85rem;min-height:1.2em}
+ a{color:var(--accent)}
  ol{padding-left:20px}li{margin-bottom:8px}
- .token{font-family:var(--mono);font-size:.8rem;word-break:break-all;background:var(--code);border:1px solid var(--border);border-radius:6px;padding:8px 10px}
+ .token{font-family:var(--mono);font-size:.8rem;word-break:break-all;background:var(--code);border:1px solid var(--border);border-radius:8px;padding:8px 10px}
  .top{display:flex;justify-content:space-between;align-items:baseline}
  .top a{color:var(--muted);font-size:.85rem}
  details summary{cursor:pointer;color:var(--muted);font-size:.85rem}
  ul{margin:6px 0;padding-left:20px}
+ code{color:var(--accent2)}
+ .orn{color:var(--accent);letter-spacing:.4em;text-align:center;margin:20px 0 0;font-size:.8rem}
 </style></head><body><main>
 """
 
@@ -715,6 +741,7 @@ LANDING_HTML = STYLE + """<h1>Watch Bridge</h1>
  <p class="sub">Signing up needs an invite code from the operator. You then connect
  your own Trello account and get a personal token for your watch shortcut.</p>
 </div>
+<p class="orn">✦ ✦ ✦</p>
 </main></body></html>"""
 
 SIGNUP_HTML = STYLE + """<h1>Sign up</h1>
@@ -726,7 +753,7 @@ SIGNUP_HTML = STYLE + """<h1>Sign up</h1>
  <button onclick="go()">Create account</button>
  <span id="err"></span>
 </div>
-<p class="sub">Already have one? <a href="/login" style="color:var(--accent)">Log in</a></p>
+<p class="sub">Already have one? <a href="/login">Log in</a></p>
 <script>
 async function go(){
  const err=document.getElementById('err'); err.textContent='';
@@ -747,7 +774,7 @@ LOGIN_HTML = STYLE + """<h1>Watch Bridge</h1>
  <button onclick="go()">Log in</button>
  <span id="err"></span>
 </div>
-<p class="sub">No account? <a href="/signup" style="color:var(--accent)">Sign up</a> (invite code needed).</p>
+<p class="sub">No account? <a href="/signup">Sign up</a> (invite code needed).</p>
 <script>
 async function go(){
  const err=document.getElementById('err'); err.textContent='';
@@ -763,12 +790,14 @@ document.querySelectorAll('input').forEach(i=>i.addEventListener('keydown',e=>{i
 DASHBOARD_HTML = STYLE + """<div class="top"><h1>Watch Bridge</h1><span><span id="who" class="sub"></span> · <a href="/logout">log out</a></span></div>
 <div id="trello"></div>
 <div id="watch" class="card"></div>
+<div id="invite"></div>
 <div class="card">
  <div class="row"><b>Change password</b></div>
  <input id="pwcur" type="password" placeholder="Current password" autocomplete="current-password">
  <input id="pwnew" type="password" placeholder="New password (8+ characters)" autocomplete="new-password">
  <button onclick="pw()">Update</button> <span id="pwerr"></span>
 </div>
+<p class="orn">✦ ☾ ✦</p>
 <script>
 function copy(btn, text){navigator.clipboard.writeText(text).then(()=>{const o=btn.textContent;btn.textContent='Copied';setTimeout(()=>btn.textContent=o,1400)})}
 function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}
@@ -826,10 +855,21 @@ async function connect(){
  if(!r.ok){const d=await r.json().catch(()=>({detail:'error '+r.status}));err.textContent=d.detail||'error '+r.status;return}
  render(await r.json());
 }
+function inviteCard(d){
+ if(!d.invite_code)return '';
+ return `<div class="card">
+  <div class="row"><b>Invite someone</b><button class="sec" id="invbtn">Copy</button></div>
+  <p class="sub">Send them this code with the <a href="/signup" target="_blank" rel="noopener">signup page</a>. They connect their own Trello and get their own token.</p>
+  <div class="token">${esc(d.invite_code)}</div>
+ </div>`;
+}
 function render(d){
  document.getElementById('who').textContent=d.username;
  document.getElementById('trello').innerHTML=trelloCard(d);
  document.getElementById('watch').innerHTML=recipe(d);
+ document.getElementById('invite').innerHTML=inviteCard(d);
+ const ib=document.getElementById('invbtn');
+ if(ib)ib.onclick=e=>copy(e.target,d.invite_code);
 }
 (async()=>{render(await (await fetch('/app/state')).json())})();
 document.addEventListener('keydown',e=>{if(e.key==='Enter'&&e.target.id==='pwcur')pw()});

@@ -187,3 +187,15 @@ def test_system_prompt_is_per_user(client, monkeypatch):
     prompt = app.build_system_prompt(t)
     assert "board 'Mine': Chores" in prompt
     assert "Shopping List" not in prompt  # the owner's inventory doesn't leak in
+
+
+def test_invite_code_shown_to_owner_only(client):
+    owner = store.get_user_by_name(app.OWNER_USERNAME)
+    client.cookies.set(app.SESSION_COOKIE, app.make_session(owner["id"]))
+    state = client.get("/app/state").json()
+    assert state["username"] == app.OWNER_USERNAME
+    assert state["invite_code"] == app.INVITE_CODE
+    signup(client, "beta")
+    s = client.get("/app/state")  # signup replaced the session cookie with beta's
+    assert s.json()["invite_code"] == ""
+    assert s.json()["username"] == "beta"
