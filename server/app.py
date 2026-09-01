@@ -155,11 +155,12 @@ def route(text: str) -> str:
     return f"echo: {text}"
 
 
-# --- LLM routing (Phase 2): Groq tool-calling over the same tools ---
+# --- LLM routing (Phase 2): any OpenAI-compatible chat endpoint with tools ---
+# Configured in .env: LLM_BASE_URL, LLM_API_KEY, LLM_MODEL.
 
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "")
+LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
+LLM_MODEL = os.environ.get("LLM_MODEL", "")
 
 # Spoken aliases for board names dictation cannot produce verbatim.
 # Extend or override with VOICE_ALIASES=<json object> in .env.
@@ -300,8 +301,8 @@ def spoken_error(message: str, max_candidates: int = 5) -> str:
 def route(text: str) -> str:
     """Send the sentence to the LLM; the LLM picks tools, the server keeps
     resolve_target as the fail-loud authority on where cards go. Echoes only
-    while no Groq key is configured (Phase 1 fallback)."""
-    if not GROQ_API_KEY:
+    while no LLM backend is configured (Phase 1 fallback)."""
+    if not (LLM_BASE_URL and LLM_API_KEY and LLM_MODEL):
         return f"echo: {text}"
     messages = [
         {"role": "system", "content": build_system_prompt()},
@@ -310,10 +311,10 @@ def route(text: str) -> str:
     for _ in range(3):
         try:
             r = requests.post(
-                GROQ_URL,
-                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                f"{LLM_BASE_URL}/chat/completions",
+                headers={"Authorization": f"Bearer {LLM_API_KEY}"},
                 json={
-                    "model": GROQ_MODEL,
+                    "model": LLM_MODEL,
                     "messages": messages,
                     "tools": TOOLS,
                     "tool_choice": "auto",
@@ -325,7 +326,7 @@ def route(text: str) -> str:
             r.raise_for_status()
             msg = r.json()["choices"][0]["message"]
         except requests.RequestException as e:
-            logging.getLogger("uvicorn.error").warning("groq call failed: %s", e)
+            logging.getLogger("uvicorn.error").warning("LLM call failed: %s", e)
             return "The assistant brain is unreachable right now."
         calls = msg.get("tool_calls")
         if not calls:

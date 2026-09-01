@@ -59,13 +59,15 @@ def test_create_card_tool_defaults_desc_to_empty(monkeypatch, stocked_trello):
     assert seen == {"board": "Home", "list_name": "Shopping List", "name": "Milk", "desc": ""}
 
 
-def test_route_echoes_without_groq_key(monkeypatch):
-    monkeypatch.setattr(app, "GROQ_API_KEY", "")
+def test_route_echoes_without_llm_backend(monkeypatch):
+    monkeypatch.setattr(app, "LLM_API_KEY", "")
     assert app.route("hello") == "echo: hello"
 
 
 def test_route_executes_tool_and_replies(monkeypatch, stocked_trello):
-    monkeypatch.setattr(app, "GROQ_API_KEY", "k")
+    monkeypatch.setattr(app, "LLM_API_KEY", "k")
+    monkeypatch.setattr(app, "LLM_BASE_URL", "https://llm.test/v1")
+    monkeypatch.setattr(app, "LLM_MODEL", "test-model")
     monkeypatch.setattr(
         app.trello, "cards", lambda board, list_name: [{"name": "Milk"}, {"name": "Beans"}]
     )
@@ -92,7 +94,9 @@ def test_route_executes_tool_and_replies(monkeypatch, stocked_trello):
 
 
 def test_route_teaches_on_unresolvable_list(monkeypatch, stocked_trello):
-    monkeypatch.setattr(app, "GROQ_API_KEY", "k")
+    monkeypatch.setattr(app, "LLM_API_KEY", "k")
+    monkeypatch.setattr(app, "LLM_BASE_URL", "https://llm.test/v1")
+    monkeypatch.setattr(app, "LLM_MODEL", "test-model")
 
     def fake_post(url, headers=None, **kw):
         tool_call = {
@@ -110,8 +114,10 @@ def test_route_teaches_on_unresolvable_list(monkeypatch, stocked_trello):
     assert "Shopping List" in reply  # candidates are offered, not a guess
 
 
-def test_route_replies_on_groq_outage(monkeypatch):
-    monkeypatch.setattr(app, "GROQ_API_KEY", "k")
+def test_route_replies_on_llm_outage(monkeypatch):
+    monkeypatch.setattr(app, "LLM_API_KEY", "k")
+    monkeypatch.setattr(app, "LLM_BASE_URL", "https://llm.test/v1")
+    monkeypatch.setattr(app, "LLM_MODEL", "test-model")
 
     class Dead:
         def post(self, *a, **kw):
