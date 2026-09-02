@@ -1653,6 +1653,10 @@ def board_overview(board: str, authorization: str = Header(default="")) -> dict:
 
 # --- calendar REST: same find-by-name rules as the event voice tools ---
 
+class CalendarPickIn(BaseModel):
+    id: str
+
+
 def _gcal_or_409(authorization: str) -> tuple[dict, Gcal]:
     user = require_user(authorization)
     try:
@@ -1663,6 +1667,34 @@ def _gcal_or_409(authorization: str) -> tuple[dict, Gcal]:
         raise HTTPException(status_code=409,
                             detail="google calendar not connected for this user")
     return user, g
+
+
+def _choose_calendar(user: dict, g: Gcal, wanted: str) -> str:
+    """Validate `wanted` against the live calendarList, persist it (adopting
+    its timezone) and drop the cached client so the next use re-reads it.
+    Shared by the bearer and dashboard picker routes. Returns the timezone."""
+    wanted = wanted.strip()
+    if not wanted:
+        raise HTTPException(status_code=422, detail="calendar id is required")
+    try:
+        entries = g.calendars()
+    except (GcalDisconnected, requests.RequestException):
+        raise HTTPException(
+            status_code=409, detail="couldn't check your calendars — try again")
+    entry = next((e for e in entries if e["id"] == wanted), None)
+    if entry is None:
+        raise HTTPException(
+            status_code=404, detail="that calendar is not on this Google account")
+    if entry["accessRole"] == "freeBusyReader":
+        raise HTTPException(
+            status_code=400, detail="that calendar is free/busy only — pick one with events")
+    try:
+        tz = g._get(f"/calendars/{wanted}").get("timeZone") or g.timezone
+    except (GcalDisconnected, requests.RequestException):
+        tz = g.timezone  # rare: keep the account timezone rather than failing
+    store.save_google_calendar(user["id"], wanted, tz)
+    _gcal.pop(user["id"], None)
+    return tz
 
 
 @app.get("/events")
@@ -1732,6 +1764,28 @@ def remove_event(day: str = "", name: str = "",
         raise HTTPException(status_code=404, detail=str(e))
     g.delete_event(hit["id"])
     return {"id": hit["id"], "deleted": hit.get("summary", "")}
+
+
+@app.get("/calendars")
+def api_calendars(authorization: str = Header(default="")) -> dict:
+    """The account's calendar list plus the current default."""
+    _, g = _gcal_or_409(authorization)
+    try:
+        items = g.calendars()
+    except (GcalDisconnected, requests.RequestException):
+        raise HTTPException(
+            status_code=409, detail="couldn't list your calendars — try again")
+    return {"current": g.calendar_id, "calendars": items}
+
+
+@app.post("/calendar")
+def api_choose_calendar(pick: CalendarPickIn,
+                        authorization: str = Header(default="")) -> dict:
+    """Set the default calendar the event tools act on."""
+    user, g = _gcal_or_409(authorization)
+    tz = _choose_calendar(user, g, pick.id)
+    acc = store.get_google_account(user["id"])
+    return {"current": acc["calendar_id"], "timezone": acc["timezone"] or tz}
 
 
 # --- multi-user web front end: signup, login, dashboard, Trello onboarding ---
@@ -2070,10 +2124,6 @@ def google_disconnect(request: Request) -> dict:
 # Voice commands act on one calendar per user. Until they pick one it is
 # "primary"; the choice is stored with the grant and survives reconnects.
 
-class CalendarPickIn(BaseModel):
-    id: str
-
-
 def _live_gcal(request: Request) -> tuple[dict, Gcal]:
     """A signed-in user with a working grant; 409 with a plain reason else."""
     user = require_session(request)
@@ -2104,25 +2154,7 @@ def choose_google_calendar(request: Request, body: CalendarPickIn) -> dict:
     calendars; free/busy-only ones are refused because no event could ever
     be read from or written to them."""
     user, g = _live_gcal(request)
-    wanted = body.id.strip()
-    try:
-        entries = g.calendars()
-    except (GcalDisconnected, requests.RequestException):
-        raise HTTPException(
-            status_code=409, detail="couldn't check your calendars — try again")
-    entry = next((e for e in entries if e["id"] == wanted), None)
-    if entry is None:
-        raise HTTPException(
-            status_code=404, detail="that calendar is not on this Google account")
-    if entry["accessRole"] == "freeBusyReader":
-        raise HTTPException(
-            status_code=400, detail="that calendar is free/busy only — pick one with events")
-    try:
-        tz = g._get(f"/calendars/{wanted}").get("timeZone") or g.timezone
-    except (GcalDisconnected, requests.RequestException):
-        tz = g.timezone  # rare: keep the account timezone rather than failing
-    store.save_google_calendar(user["id"], wanted, tz)
-    _gcal.pop(user["id"], None)
+    _choose_calendar(user, g, body.id)
     return app_state(store.get_user(user["id"]))
 
 

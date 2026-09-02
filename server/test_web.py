@@ -1404,6 +1404,77 @@ def test_rest_event_routes_need_a_connection(client):
     assert r.status_code == 409
 
 
+def test_rest_calendar_picker_lists_and_chooses(client, monkeypatch):
+    user, g = rest_gcal_user(client)
+    listing = {"items": [
+        {"id": "ian@example.com", "summary": "ian@example.com",
+         "primary": True, "accessRole": "owner"},
+        {"id": "work@example.com", "summary": "Work", "accessRole": "owner"},
+        {"id": "holidays@group.calendar.google.com", "summary": "Holidays",
+         "accessRole": "freeBusyReader"},
+    ]}
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+        if url.endswith("/users/me/calendarList"):
+            return GResp(listing)
+        if url.endswith("/calendars/work@example.com"):
+            return GResp({"id": "work@example.com", "summary": "Work",
+                          "timeZone": "Europe/Paris"})
+        return GResp({"id": url, "summary": url})
+
+    monkeypatch.setattr(app.requests, "get", fake_get)
+
+    r = client.get("/calendars", headers=bearer(user))
+    assert r.status_code == 200
+    assert r.json()["current"] == "primary"
+    assert [c["id"] for c in r.json()["calendars"]] == [
+        "ian@example.com", "work@example.com",
+        "holidays@group.calendar.google.com"]
+
+    r = client.post("/calendar", json={"id": "work@example.com"},
+                    headers=bearer(user))
+    assert r.status_code == 200
+    assert r.json() == {"current": "work@example.com",
+                        "timezone": "Europe/Paris"}
+    acc = store.get_google_account(user["id"])
+    assert acc["calendar_id"] == "work@example.com"
+    assert acc["timezone"] == "Europe/Paris"
+    # the cached client was dropped; the next use re-reads the new calendar
+    assert app._gcal.get(user["id"]) is None
+
+
+def test_rest_calendar_picker_rejects_unknown_and_freebusy(client, monkeypatch):
+    user, g = rest_gcal_user(client)
+    listing = {"items": [
+        {"id": "ian@example.com", "summary": "ian@example.com",
+         "primary": True, "accessRole": "owner"},
+        {"id": "holidays@group.calendar.google.com", "summary": "Holidays",
+         "accessRole": "freeBusyReader"},
+    ]}
+    monkeypatch.setattr(app.requests, "get",
+                        lambda *a, **kw: GResp(listing))
+    r = client.post("/calendar", json={"id": "nope@example.com"},
+                    headers=bearer(user))
+    assert r.status_code == 404
+    r = client.post("/calendar", json={"id": "holidays@group.calendar.google.com"},
+                    headers=bearer(user))
+    assert r.status_code == 400
+    assert "free/busy" in r.json()["detail"]
+    r = client.post("/calendar", json={"id": "  "}, headers=bearer(user))
+    assert r.status_code == 422
+    assert store.get_google_account(user["id"])["calendar_id"] == "primary"
+
+
+def test_rest_calendar_picker_needs_a_connection(client):
+    signup(client)
+    user = store.get_user_by_name("tester")
+    app._gcal.pop(user["id"], None)  # stale cache from another test's DB
+    assert client.get("/calendars", headers=bearer(user)).status_code == 409
+    assert client.post("/calendar", json={"id": "work@example.com"},
+                       headers=bearer(user)).status_code == 409
+    assert client.get("/calendars").status_code == 401  # bad token too
+
+
 def test_rest_event_routes_refuse_bad_names(client, monkeypatch):
     user, g = rest_gcal_user(client)
     monkeypatch.setattr(app.requests, "get",
