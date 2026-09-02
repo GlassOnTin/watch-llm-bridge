@@ -988,6 +988,33 @@ def signup_page() -> str:
     return SIGNUP_HTML
 
 
+PRIVACY_HTML = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<title>Privacy — Watch Bridge</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>body{font-family:Georgia,serif;max-width:40rem;margin:3rem auto;
+padding:0 1rem;line-height:1.6}h1{font-size:1.4rem}</style></head><body>
+<h1>Privacy</h1>
+<p>This is a private, personal voice-assistant bridge. It is not a commercial
+product and has no analytics or advertising.</p>
+<p>What it stores: your username and a salted hash of your password, the
+tokens you connect (Trello, Google Calendar), your calendar's timezone, and
+a log of the commands you send. Commands are relayed to the LLM backend
+configured by the operator to decide what to do, and actions are carried out
+on the services you connected.</p>
+<p>What it never does: load remote content in your browser, track you, or
+share your data with anyone else. Google is told only that this app may read
+and add events on your primary calendar. Disconnecting a service from the
+dashboard deletes its stored token (and revokes the Google grant).</p>
+<p>Operator contact: the person who gave you your invite code.</p>
+</body></html>"""
+
+
+@app.get("/privacy", response_class=HTMLResponse)
+def privacy_page() -> str:
+    return PRIVACY_HTML
+
+
 @app.post("/auth/signup")
 def auth_signup(request: Request, body: SignupIn, response: Response) -> dict:
     if not INVITE_CODE:
