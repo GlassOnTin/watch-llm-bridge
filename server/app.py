@@ -75,6 +75,38 @@ class CardIn(BaseModel):
     desc: str = ""
 
 
+class CardPatchIn(BaseModel):
+    """Edit / move / due-date / archive a card picked by name."""
+    board: str
+    name: str
+    list: str = ""
+    new_name: str = ""
+    desc: str = ""
+    due_day: str = ""
+    due_time: str = ""
+    to_list: str = ""
+    to_board: str = ""
+    archive: bool = False
+
+
+class CommentIn(BaseModel):
+    board: str
+    name: str
+    text: str
+    list: str = ""
+
+
+class ListIn(BaseModel):
+    board: str
+    name: str
+
+
+class ListPatchIn(BaseModel):
+    board: str
+    list: str
+    new_name: str
+
+
 def resolve_target(boards: dict, lists_by_board: dict, board: str, list_name: str) -> tuple[str, str]:
     """Map (board name, list name) to (board_id, list_id), case-insensitive.
 
@@ -137,6 +169,88 @@ class Trello:
         board_id, list_id = resolve_target(self.boards, self.lists_by_board, board, list_name)
         cards = self._get(f"/lists/{list_id}/cards", fields="name,desc,due,url")
         return cards
+
+    def _put(self, path: str, **params) -> dict:
+        r = requests.put(f"{TRELLO_API}{path}", params={**self.auth, **params}, timeout=15)
+        r.raise_for_status()
+        return r.json()
+
+    def find_card(self, board: str, name: str, list_name: str = "") -> dict:
+        """Look a card up by spoken name in a list, or the whole board when no
+        list is given. Exact (case-insensitive) first, then substring; a miss
+        or several hits raise KeyError with the candidates so the agent can
+        offer them instead of guessing."""
+        board_id = self._board_id(board)
+        if list_name:
+            _, list_id = resolve_target(self.boards, self.lists_by_board,
+                                        board, list_name)
+            cards = self._get(f"/lists/{list_id}/cards", fields="id,name")
+        else:
+            cards = self._get(f"/boards/{board_id}/cards", filter="open",
+                              fields="id,name")
+        low = name.lower()
+        hits = [c for c in cards if c["name"].lower() == low] or \
+               [c for c in cards if low in c["name"].lower()]
+        if len(hits) != 1:
+            known = ", ".join(sorted(c["name"] for c in cards))
+            where = f" on list '{list_name}'" if list_name else f" on board '{board}'"
+            raise KeyError(f"card '{name}' matches {len(hits) or 'nothing'}{where}"
+                           f" (known: {known})")
+        return hits[0]
+
+    def card_details(self, board: str, name: str, list_name: str = "") -> dict:
+        card = self.find_card(board, name, list_name)
+        full = self._get(f"/cards/{card['id']}", fields="name,desc,due,url,labels",
+                         actions="commentCard", action_fields="data")
+        comments = [a["data"]["text"] for a in reversed(full.get("actions", []))
+                    if "text" in a.get("data", {})][-5:]
+        return {"id": full["id"], "name": full["name"], "desc": full["desc"],
+                "due": full.get("due"), "url": full.get("url"),
+                "labels": [l["name"] or l["color"] for l in full.get("labels", [])],
+                "comments": comments}
+
+    def update_card(self, card_id: str, **fields) -> dict:
+        return self._put(f"/cards/{card_id}", **fields)
+
+    def add_comment(self, card_id: str, text: str) -> dict:
+        r = requests.post(f"{TRELLO_API}/cards/{card_id}/actions/comments",
+                          params={**self.auth, "text": text}, timeout=15)
+        r.raise_for_status()
+        return r.json()
+
+    def _board_id(self, board: str) -> str:
+        hits = [b for b in self.boards if b.lower() == board.lower()]
+        if len(hits) != 1:
+            raise KeyError(f"board '{board}' matches {len(hits) or 'nothing'} "
+                           f"(known: {', '.join(sorted(self.boards))})")
+        return self.boards[hits[0]]
+
+    def create_list(self, board: str, name: str) -> dict:
+        board_id = self._board_id(board)
+        created = requests.post(
+            f"{TRELLO_API}/lists",
+            params={**self.auth, "idBoard": board_id, "name": name},
+            timeout=15,
+        )
+        created.raise_for_status()
+        body = created.json()
+        self.lists_by_board.setdefault(board_id, []).append((body["name"], body["id"]))
+        return body
+
+    def rename_list(self, board: str, list_name: str, new_name: str) -> dict:
+        board_id, list_id = resolve_target(self.boards, self.lists_by_board,
+                                           board, list_name)
+        updated = self._put(f"/lists/{list_id}", name=new_name)
+        pairs = self.lists_by_board.get(board_id, [])
+        self.lists_by_board[board_id] = [(new_name, lid) if lid == list_id
+                                         else (n, lid) for n, lid in pairs]
+        return updated
+
+    def board_overview(self, board: str) -> dict[str, list[str]]:
+        board_id = self._board_id(board)
+        lists = self._get(f"/boards/{board_id}/lists", cards="open",
+                          card_fields="name")
+        return {l["name"]: [c["name"] for c in l.get("cards", [])] for l in lists}
 
 
 trello = Trello(TRELLO_KEY, TRELLO_TOKEN)
@@ -475,6 +589,20 @@ def spoken_aliases() -> dict[str, str]:
     return dict(DEFAULT_ALIASES)
 
 
+def _card_params(required: list[str] | None = None, **extra) -> dict:
+    """Parameter schema for the card-targeting tools: board/list optional,
+    the card picked by name, plus any tool-specific extras."""
+    props = {
+        "board": {"type": "string"},
+        "list": {"type": "string"},
+        "name": {"type": "string"},
+        "account": {"type": "string",
+                    "description": "Trello account label, when the user named one"},
+        **extra,
+    }
+    return {"type": "object", "properties": props, "required": required or ["name"]}
+
+
 TOOLS = [
     {
         "type": "function",
@@ -520,6 +648,116 @@ TOOLS = [
             "name": "trello_list_boards",
             "description": "Enumerate every board and its lists.",
             "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "trello_card_details",
+            "description": "Read one card's description, due date, labels and "
+                           "comments. The card is picked by name.",
+            "parameters": _card_params(),
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "trello_move_card",
+            "description": "Move a card to another list. The card is picked by "
+                           "name; to_board is only for a cross-board move.",
+            "parameters": _card_params(to_list={"type": "string"},
+                                       to_board={"type": "string"}),
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "trello_edit_card",
+            "description": "Rename a card or change its description. At least "
+                           "one of new_name / desc must be given.",
+            "parameters": _card_params(new_name={"type": "string"},
+                                       desc={"type": "string"}),
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "trello_set_due",
+            "description": "Set a card's due date. day is today, tomorrow, or "
+                           "YYYY-MM-DD; omit time for a due date with no time of day.",
+            "parameters": _card_params(day={"type": "string",
+                                            "description": "today, tomorrow, or YYYY-MM-DD"},
+                                       time={"type": "string",
+                                             "description": "24-hour HH:MM; omit for no time"},
+                                       required=["day"]),
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "trello_archive_card",
+            "description": "Close (archive) a card. The card is picked by name.",
+            "parameters": _card_params(),
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "trello_comment_card",
+            "description": "Add a comment to a card.",
+            "parameters": _card_params(text={"type": "string"},
+                                       required=["text"]),
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "trello_create_list",
+            "description": "Create a new list on a board.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "board": {"type": "string"},
+                    "name": {"type": "string"},
+                    "account": {"type": "string",
+                                "description": "Trello account label, when the user named one"},
+                },
+                "required": ["board", "name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "trello_rename_list",
+            "description": "Rename a list on a board.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "board": {"type": "string"},
+                    "list": {"type": "string"},
+                    "new_name": {"type": "string"},
+                    "account": {"type": "string",
+                                "description": "Trello account label, when the user named one"},
+                },
+                "required": ["board", "list", "new_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "trello_board_overview",
+            "description": "Read a board's lists together with each list's cards.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "board": {"type": "string"},
+                    "account": {"type": "string",
+                                "description": "Trello account label, when the user named one"},
+                },
+                "required": ["board"],
+            },
         },
     },
 ]
@@ -587,7 +825,7 @@ def build_system_prompt(t: Trello | None = None,
     today = datetime.now(timezone.utc).strftime("%A %d %B %Y")
     account_rules = ""
     if multi:
-        account_rules = """8. The user has several Trello accounts. When they name one ("on my work
+        account_rules = """9. The user has several Trello accounts. When they name one ("on my work
    trello"), pass its label as the account argument; when the tool result has
    pairs, ask which account and board, e.g. "that Food list is on work / Home
    and personal / Plans — which one?". Never guess an account."""
@@ -595,6 +833,15 @@ def build_system_prompt(t: Trello | None = None,
         "- trello_create_card(board, list, name, desc) — add a card to a list",
         "- trello_list_cards(board, list) — read the cards in a list",
         "- trello_list_boards() — enumerate boards and their lists",
+        "- trello_card_details(board, list, name) — read a card's description, due date, labels and comments",
+        "- trello_move_card(board, list, name, to_list, to_board) — move a card to another list",
+        "- trello_edit_card(board, list, name, new_name, desc) — rename a card or change its description",
+        "- trello_set_due(board, list, name, day, time) — set a card's due date",
+        "- trello_archive_card(board, list, name) — close (archive) a card",
+        "- trello_comment_card(board, list, name, text) — add a comment to a card",
+        "- trello_create_list(board, name) — create a list on a board",
+        "- trello_rename_list(board, list, new_name) — rename a list",
+        "- trello_board_overview(board) — read a board's lists and their cards",
     ]
     if calendar:
         tool_lines += [
@@ -602,14 +849,14 @@ def build_system_prompt(t: Trello | None = None,
             "- gcal_create_event(title, day, time, duration) — create an event",
         ]
     calendar_rule = (
-        """6. Calendar: the user's Google Calendar is connected. "day" is today,
+        """7. Calendar: the user's Google Calendar is connected. "day" is today,
    tomorrow, yesterday, or YYYY-MM-DD in the user's timezone. Convert spoken
    times to 24-hour HH:MM ("3pm" is 15:00); when the user gives no time,
    omit it so the event is all-day. Never guess a day or a time: ask. On a
    calendar_disconnected result, say their calendar needs reconnecting from
    the bridge dashboard."""
         if calendar else
-        """6. Google Calendar is not connected yet. Any calendar or events request gets
+        """7. Google Calendar is not connected yet. Any calendar or events request gets
    a brief "calendar isn't set up yet" reply.""")
     return f"""You are the brain of a voice assistant driven from an Apple Watch. Each
 user message is one spoken sentence. Your reply is read aloud, so keep it to
@@ -641,8 +888,14 @@ Rules:
    (desc) unless asked.
 5. After a successful tool call, confirm in one short sentence what was
    done, or read the items out as a compact spoken list.
+6. Card actions (move, edit, due date, archive, comment) pick the card by
+   name from the list the user mentioned — or the whole board when they
+   named no list. On a no_card or ambiguous_card result, offer the closest
+   candidates and ask; never invent a card name. For a due date, "day" is
+   today, tomorrow, or YYYY-MM-DD, and spoken times become 24-hour HH:MM;
+   when the user gives no time, omit it.
 {calendar_rule}
-7. If the request matches no tool, answer helpfully in a sentence or two.
+8. If the request matches no tool, answer helpfully in a sentence or two.
 {account_rules}"""
 
 
@@ -655,6 +908,43 @@ def find_boards_with_list(list_name: str, t: Trello | None = None) -> list[str]:
         for board, bid in t.boards.items()
         if any(n.lower() == want for n, _ in t.lists_by_board.get(bid, []))
     ]
+
+
+def card_error(e: KeyError) -> dict:
+    """A find_card KeyError as an ask-the-user tool result."""
+    msg = e.args[0]
+    _, _, known = msg.partition("(known:")
+    candidates = [c.strip(" '\"") for c in known.rstrip(") ").split(",")]
+    candidates = [c for c in candidates if c]
+    error = "no_card" if ("nothing" in msg or "matches 0" in msg) else "ambiguous_card"
+    return {"ok": False, "error": error, "candidates": candidates}
+
+
+def resolve_card_board(args: dict,
+                       clients: list[tuple[str, Trello]] | None = None) -> dict:
+    """Find the board a spoken card name lives on. A board or list the user
+    named is honoured through resolve_board; when neither was named, the one
+    board holding a card with that name wins, anything else asks."""
+    clients = clients if clients is not None else [(None, trello)]
+    multi = len(clients) > 1
+    if args.get("board") or args.get("list"):
+        return resolve_board(args, args.get("list") or "", clients=clients)
+    hits = []
+    for label, c in clients:
+        for board in c.boards:
+            try:
+                c.find_card(board, args["name"])
+            except KeyError as e:
+                if "nothing" not in e.args[0] and "matches 0" not in e.args[0]:
+                    return card_error(e)  # several cards of that name on one board
+                continue
+            hits.append((label, board))
+    if len(hits) == 1:
+        picked = {"ok": True, "board": hits[0][1]}
+        if multi:
+            picked["account"] = hits[0][0]
+        return picked
+    return {"ok": False, "error": "ambiguous_board", "boards": [b for _, b in hits]}
 
 
 def resolve_board(args: dict, list_name: str, t: Trello | None = None,
@@ -736,6 +1026,134 @@ def execute_tool(name: str, args: dict, t: Trello | None = None,
                     for board, bid in c.boards.items()}
             for label, c in clients
         }
+    def due_tz():
+        """The timezone due dates are interpreted in: the connected calendar's
+        zone when there is one, else the server's clock."""
+        if gcal is not None and gcal.connected and gcal.timezone:
+            return ZoneInfo(gcal.timezone)
+        return timezone.utc
+
+    if name == "trello_card_details":
+        picked = resolve_card_board(args, clients)
+        if not picked["ok"]:
+            return picked
+        try:
+            d = client_for(picked).card_details(picked["board"], args["name"],
+                                                args.get("list") or "")
+        except KeyError as e:
+            return tagged(picked, card_error(e))
+        return tagged(picked, {"ok": True, "name": d["name"], "desc": d["desc"],
+                               "due": d["due"], "labels": d["labels"],
+                               "comments": d["comments"]})
+    if name == "trello_move_card":
+        picked = resolve_card_board(args, clients)
+        if not picked["ok"]:
+            return picked
+        t = client_for(picked)
+        try:
+            card = t.find_card(picked["board"], args["name"], args.get("list") or "")
+        except KeyError as e:
+            return card_error(e)
+        try:
+            _, to_list_id = resolve_target(t.boards, t.lists_by_board,
+                                           args.get("to_board") or picked["board"],
+                                           args["to_list"])
+        except KeyError as e:
+            return {"ok": False, "error": "bad_target", "detail": e.args[0]}
+        fields = {"idList": to_list_id}
+        if args.get("to_board"):
+            fields["idBoard"] = t._board_id(args["to_board"])
+        t.update_card(card["id"], **fields)
+        return tagged(picked, {"ok": True, "moved": card["name"],
+                               "to_list": args["to_list"],
+                               "to_board": args.get("to_board") or picked["board"]})
+    if name == "trello_edit_card":
+        if not (args.get("new_name") or args.get("desc")):
+            return {"ok": False, "error": "nothing_to_edit"}
+        picked = resolve_card_board(args, clients)
+        if not picked["ok"]:
+            return picked
+        t = client_for(picked)
+        try:
+            card = t.find_card(picked["board"], args["name"], args.get("list") or "")
+        except KeyError as e:
+            return card_error(e)
+        fields = {}
+        if args.get("new_name"):
+            fields["name"] = args["new_name"]
+        if args.get("desc"):
+            fields["desc"] = args["desc"]
+        t.update_card(card["id"], **fields)
+        out = {"ok": True, "edited": args["name"]}
+        if args.get("new_name"):
+            out["renamed_to"] = args["new_name"]
+        return tagged(picked, out)
+    if name == "trello_set_due":
+        picked = resolve_card_board(args, clients)
+        if not picked["ok"]:
+            return picked
+        t = client_for(picked)
+        try:
+            card = t.find_card(picked["board"], args["name"], args.get("list") or "")
+        except KeyError as e:
+            return card_error(e)
+        try:
+            day = parse_day(args["day"], due_tz()).date()
+        except KeyError as e:
+            return {"ok": False, "error": "bad_day", "detail": e.args[0]}
+        due = day.isoformat()
+        if args.get("time"):
+            hh, mm = parse_time(args["time"])
+            due += f"T{hh:02d}:{mm:02d}:00"
+        else:
+            due += "T12:00:00"  # noon: a midnight due renders as the wrong day
+        t.update_card(card["id"], due=due)
+        return tagged(picked, {"ok": True, "due": due, "on": card["name"]})
+    if name == "trello_archive_card":
+        picked = resolve_card_board(args, clients)
+        if not picked["ok"]:
+            return picked
+        t = client_for(picked)
+        try:
+            card = t.find_card(picked["board"], args["name"], args.get("list") or "")
+        except KeyError as e:
+            return card_error(e)
+        t.update_card(card["id"], closed="true")
+        return tagged(picked, {"ok": True, "archived": card["name"]})
+    if name == "trello_comment_card":
+        picked = resolve_card_board(args, clients)
+        if not picked["ok"]:
+            return picked
+        t = client_for(picked)
+        try:
+            card = t.find_card(picked["board"], args["name"], args.get("list") or "")
+        except KeyError as e:
+            return card_error(e)
+        t.add_comment(card["id"], args["text"])
+        return tagged(picked, {"ok": True, "commented": args["text"]})
+    if name == "trello_create_list":
+        t = client_for(args)
+        try:
+            t.create_list(args["board"], args["name"])
+        except KeyError as e:
+            return card_error(e)
+        return {"ok": True, "created_list": args["name"], "board": args["board"]}
+    if name == "trello_rename_list":
+        t = client_for(args)
+        try:
+            t.rename_list(args["board"], args["list"], args["new_name"])
+        except KeyError as e:
+            return card_error(e)
+        return {"ok": True, "renamed": args["list"], "to": args["new_name"],
+                "board": args["board"]}
+    if name == "trello_board_overview":
+        t = client_for(args)
+        try:
+            overview = t.board_overview(args["board"])
+        except KeyError as e:
+            return card_error(e)
+        out = {"ok": True, "board": args["board"], "lists": overview}
+        return out
     if name == "gcal_list_events":
         if gcal is None or not gcal.connected:
             return {"ok": False, "error": "calendar_disconnected"}
@@ -880,6 +1298,92 @@ def card(card_in: CardIn, authorization: str = Header(default="")) -> dict:
     except KeyError as e:
         raise HTTPException(status_code=404, detail=str(e))
     return {"id": created["id"], "name": created["name"], "url": created["url"]}
+
+
+def _find_or_404(t: Trello, board: str, name: str, list_name: str = "") -> dict:
+    try:
+        return t.find_card(board, name, list_name)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.get("/card")
+def one_card(board: str, name: str, list: str = "",
+             authorization: str = Header(default="")) -> dict:
+    _, t = _client_or_409(authorization)
+    try:
+        return t.card_details(board, name, list)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.patch("/card")
+def patch_card(patch: CardPatchIn, authorization: str = Header(default="")) -> dict:
+    _, t = _client_or_409(authorization)
+    card = _find_or_404(t, patch.board, patch.name, patch.list)
+    fields: dict = {}
+    if patch.new_name:
+        fields["name"] = patch.new_name
+    if patch.desc:
+        fields["desc"] = patch.desc
+    if patch.archive:
+        fields["closed"] = "true"
+    if patch.to_list:
+        _, list_id = resolve_target(t.boards, t.lists_by_board,
+                                    patch.to_board or patch.board, patch.to_list)
+        fields["idList"] = list_id
+        if patch.to_board:
+            fields["idBoard"] = t._board_id(patch.to_board)
+    if patch.due_day:
+        day = parse_day(patch.due_day, timezone.utc).date()
+        due = day.isoformat()
+        if patch.due_time:
+            hh, mm = parse_time(patch.due_time)
+            due += f"T{hh:02d}:{mm:02d}:00"
+        else:
+            due += "T12:00:00"  # noon: a midnight due renders as the wrong day
+        fields["due"] = due
+    if not fields:
+        raise HTTPException(status_code=400, detail="nothing to change")
+    updated = t.update_card(card["id"], **fields)
+    return {"id": updated.get("id", card["id"]), "name": updated.get("name", card["name"])}
+
+
+@app.post("/card/comment")
+def comment_card(comment: CommentIn, authorization: str = Header(default="")) -> dict:
+    _, t = _client_or_409(authorization)
+    card = _find_or_404(t, comment.board, comment.name, comment.list)
+    t.add_comment(card["id"], comment.text)
+    return {"id": card["id"], "commented": comment.text}
+
+
+@app.post("/list")
+def new_list(list_in: ListIn, authorization: str = Header(default="")) -> dict:
+    _, t = _client_or_409(authorization)
+    try:
+        created = t.create_list(list_in.board, list_in.name)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return {"id": created["id"], "name": created["name"]}
+
+
+@app.patch("/list")
+def patch_list(patch: ListPatchIn, authorization: str = Header(default="")) -> dict:
+    _, t = _client_or_409(authorization)
+    try:
+        t.rename_list(patch.board, patch.list, patch.new_name)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return {"board": patch.board, "list": patch.new_name}
+
+
+@app.get("/board/{board}/overview")
+def board_overview(board: str, authorization: str = Header(default="")) -> dict:
+    _, t = _client_or_409(authorization)
+    try:
+        return t.board_overview(board)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 
 # --- multi-user web front end: signup, login, dashboard, Trello onboarding ---
@@ -1363,6 +1867,10 @@ DASHBOARD_HTML = STYLE + """<div class="top"><h1>Watch Bridge</h1><span><span id
   <li>“add bin day to chores” — creates a card in the list named Chores</li>
   <li>“what's on my shopping list” — reads a list out loud</li>
   <li>“what boards do I have”</li>
+  <li>“move the milk card to done” · “move it to done on plans” for a cross-board move</li>
+  <li>“what's on the bin day card” — description, due date, labels, last comments</li>
+  <li>“put a due date on bin day tomorrow” — or “...tomorrow at 4”</li>
+  <li>“rename the chores list to jobs” · “what's on my home board”</li>
   <li>With more than one account connected: “add milk to shopping on my work trello”</li>
   <li>Once your calendar is connected: “what's on my calendar today” and “put
       dentists appointment in the calendar tomorrow at 3”</li>
@@ -1381,15 +1889,18 @@ spoken: “Bin day is on the Chores list of Work Stuff.”</pre>
   <li>Create a card in a list — <code>POST /1/cards</code></li>
   <li>Read the cards in a list — <code>GET /1/lists/{id}/cards</code></li>
   <li>Enumerate boards and lists — answered from the server's cache</li>
+  <li>Read one card's details and comments — <code>GET /1/cards/{id}</code></li>
+  <li>Move, rename, describe, date, archive and comment on a card — <code>PUT /1/cards/{id}</code></li>
+  <li>Create and rename lists — <code>POST /1/lists</code>, <code>PUT /1/lists/{id}</code></li>
  </ul>
  <p><b>What Calendar supports today</b></p>
  <ul>
   <li>Read a day's events — “today”, “tomorrow”, or a date</li>
   <li>Create an event, timed or all-day — your calendar's own timezone is used</li>
  </ul>
- <p class="sub">Not wired yet: moving or deleting cards, due dates, and editing or deleting
- events. The agent is only given the tools above, so it says it can't do the rest rather
- than improvising.</p>
+ <p class="sub">Closing a card is an archive, so it can be brought back; nothing is deleted.
+ Not wired yet: editing or deleting events. The agent is only given the tools above, so it
+ says it can't do the rest rather than improvising.</p>
 </div></details>
 <details id="invited" class="dcard"><summary>✉ Invite someone</summary><div class="inner" id="invite"></div></details>
 <details id="admind" class="dcard"><summary>✧ Admin</summary><div class="inner" id="admin"></div></details>

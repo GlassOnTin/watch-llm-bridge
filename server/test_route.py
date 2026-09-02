@@ -185,3 +185,223 @@ def test_create_card_without_board_and_ambiguous_list_asks(monkeypatch, stocked_
     out = app.execute_tool("trello_create_card", {"list": "Done", "name": "x"})
     assert out == {"ok": False, "error": "ambiguous_board", "list": "Done", "boards": ["Home", "Plans"]}
     assert not called  # nothing was written before the ask
+
+
+# --- deeper Trello surface: find_card and the card/list tools ---
+
+
+def stub_cards(monkeypatch, cards):
+    """find_card's _get: the open cards of the queried list or board."""
+    seen = {}
+
+    def fake_get(path, **params):
+        seen["path"] = path
+        return cards
+
+    monkeypatch.setattr(app.trello, "_get", fake_get)
+    return seen
+
+
+def test_find_card_exact_then_substring(monkeypatch, stocked_trello):
+    seen = stub_cards(monkeypatch, [
+        {"id": "c1", "name": "Milk"},
+        {"id": "c2", "name": "Bin day reminder"},
+        {"id": "c3", "name": "Beans"},
+    ])
+    hit = app.trello.find_card("Home", "milk")
+    assert hit["id"] == "c1"
+    assert seen["path"] == "/boards/b1/cards"
+    assert app.trello.find_card("Home", "bin day")["id"] == "c2"
+
+
+def test_find_card_in_a_named_list_hits_the_list(monkeypatch, stocked_trello):
+    seen = stub_cards(monkeypatch, [{"id": "c1", "name": "Milk"}])
+    assert app.trello.find_card("Home", "Milk", "Shopping List")["id"] == "c1"
+    assert seen["path"] == "/lists/l1/cards"
+
+
+def test_find_card_not_found_offers_candidates(monkeypatch, stocked_trello):
+    stub_cards(monkeypatch, [{"name": "Milk"}, {"name": "Beans"}])
+    with pytest.raises(KeyError) as e:
+        app.trello.find_card("Home", "Dentist")
+    assert "Beans" in str(e.value) and "Milk" in str(e.value)
+
+
+def test_find_card_two_matches_asks(monkeypatch, stocked_trello):
+    stub_cards(monkeypatch, [{"name": "Milk"}, {"name": "milk"}])
+    with pytest.raises(KeyError, match="matches 2"):
+        app.trello.find_card("Home", "Milk")
+
+
+def test_move_card_tool_targets_the_other_list(monkeypatch, stocked_trello):
+    monkeypatch.setattr(app.trello, "lists_by_board", {
+        **LISTS, "b1": LISTS["b1"] + [("In Basket", "l6")]})
+    monkeypatch.setattr(app.trello, "find_card",
+                        lambda board, name, list_name="": {"id": "c1", "name": "Milk"})
+    seen = {}
+
+    def fake_update(card_id, **fields):
+        seen.update(card_id=card_id, **fields)
+        return {"id": card_id}
+
+    monkeypatch.setattr(app.trello, "update_card", fake_update)
+    out = app.execute_tool("trello_move_card", {
+        "board": "Home", "list": "Shopping List", "name": "Milk", "to_list": "In Basket"})
+    assert out == {"ok": True, "moved": "Milk", "to_list": "In Basket",
+                   "to_board": "Home"}
+    assert seen == {"card_id": "c1", "idList": "l6"}
+
+
+def test_move_card_bad_target_names_the_lists(monkeypatch, stocked_trello):
+    monkeypatch.setattr(app.trello, "find_card",
+                        lambda board, name, list_name="": {"id": "c1", "name": "Milk"})
+    out = app.execute_tool("trello_move_card", {
+        "board": "Home", "name": "Milk", "to_list": "Food"})
+    assert out["error"] == "bad_target"
+
+
+def test_cross_board_move_passes_both_ids(monkeypatch, stocked_trello):
+    monkeypatch.setattr(app.trello, "find_card",
+                        lambda board, name, list_name="": {"id": "c1", "name": "Milk"})
+    seen = {}
+    monkeypatch.setattr(app.trello, "update_card",
+                        lambda card_id, **fields: seen.update(card_id=card_id, **fields)
+                        or {"id": card_id})
+    app.execute_tool("trello_move_card", {
+        "board": "Home", "name": "Milk", "to_list": "Food", "to_board": "Plans"})
+    assert seen == {"card_id": "c1", "idList": "l4", "idBoard": "b2"}
+
+
+def test_archive_card_with_no_match_asks(monkeypatch, stocked_trello):
+    stub_cards(monkeypatch, [{"name": "Milk"}, {"name": "Beans"}])
+    out = app.execute_tool("trello_archive_card", {"board": "Home", "name": "Dentist"})
+    assert out == {"ok": False, "error": "no_card",
+                   "candidates": ["Beans", "Milk"]}
+
+
+def test_archive_card_with_two_matches_asks(monkeypatch, stocked_trello):
+    stub_cards(monkeypatch, [{"name": "Milk"}, {"name": "milk"}])
+    out = app.execute_tool("trello_archive_card", {"board": "Home", "name": "Milk"})
+    assert out["error"] == "ambiguous_card"
+    assert out["candidates"] == ["Milk", "milk"]
+
+
+def test_card_actions_find_the_board_from_the_card_name_alone(monkeypatch, stocked_trello):
+    def fake_find(board, name, list_name=""):
+        if board == "Home":
+            return {"id": "c1", "name": "Milk"}
+        raise KeyError(f"card '{name}' matches nothing on board '{board}' "
+                       f"(known: Beans, Milk)")
+
+    monkeypatch.setattr(app.trello, "find_card", fake_find)
+    seen = {}
+
+    def fake_details(board, name, list_name=""):
+        seen["board"] = board
+        return {"name": "Milk", "desc": "", "due": None, "labels": [], "comments": []}
+
+    monkeypatch.setattr(app.trello, "card_details", fake_details)
+    out = app.execute_tool("trello_card_details", {"name": "Milk"})
+    assert out["ok"] is True
+    assert seen["board"] == "Home"
+
+
+def test_set_due_bare_day_becomes_noon(monkeypatch, stocked_trello):
+    monkeypatch.setattr(app.trello, "find_card",
+                        lambda board, name, list_name="": {"id": "c1", "name": "Milk"})
+    seen = {}
+    monkeypatch.setattr(app.trello, "update_card",
+                        lambda card_id, **fields: seen.update(**fields) or {"id": card_id})
+    out = app.execute_tool("trello_set_due", {
+        "board": "Home", "name": "Milk", "day": "2030-06-05"})
+    assert out["ok"] is True
+    assert seen == {"due": "2030-06-05T12:00:00"}
+
+
+def test_set_due_with_a_time_and_a_bad_day(monkeypatch, stocked_trello):
+    monkeypatch.setattr(app.trello, "find_card",
+                        lambda board, name, list_name="": {"id": "c1", "name": "Milk"})
+    seen = {}
+    monkeypatch.setattr(app.trello, "update_card",
+                        lambda card_id, **fields: seen.update(**fields) or {"id": card_id})
+    app.execute_tool("trello_set_due", {
+        "board": "Home", "name": "Milk", "day": "tomorrow", "time": "14:30"})
+    assert seen["due"].endswith("T14:30:00")
+    bad = app.execute_tool("trello_set_due", {
+        "board": "Home", "name": "Milk", "day": "someday"})
+    assert bad == {"ok": False, "error": "bad_day",
+                   "detail": "calendar day 'someday' is not today, tomorrow, "
+                             "yesterday or YYYY-MM-DD"}
+
+
+def test_edit_card_needs_something_to_change(monkeypatch, stocked_trello):
+    monkeypatch.setattr(app.trello, "find_card",
+                        lambda board, name, list_name="": {"id": "c1", "name": "Milk"})
+    out = app.execute_tool("trello_edit_card", {"board": "Home", "name": "Milk"})
+    assert out == {"ok": False, "error": "nothing_to_edit"}
+    seen = {}
+    monkeypatch.setattr(app.trello, "update_card",
+                        lambda card_id, **fields: seen.update(**fields) or {"id": card_id})
+    out = app.execute_tool("trello_edit_card", {
+        "board": "Home", "name": "Milk", "new_name": "Oat milk", "desc": "from the market"})
+    assert out["ok"] is True and out["renamed_to"] == "Oat milk"
+    assert seen == {"name": "Oat milk", "desc": "from the market"}
+
+
+def test_comment_card_posts_the_text(monkeypatch, stocked_trello):
+    monkeypatch.setattr(app.trello, "find_card",
+                        lambda board, name, list_name="": {"id": "c1", "name": "Milk"})
+    seen = {}
+    monkeypatch.setattr(app.trello, "add_comment",
+                        lambda card_id, text: seen.update(card_id=card_id, text=text)
+                        or {})
+    out = app.execute_tool("trello_comment_card", {
+        "board": "Home", "name": "Milk", "text": "picked up"})
+    assert out == {"ok": True, "commented": "picked up"}
+    assert seen == {"card_id": "c1", "text": "picked up"}
+
+
+def test_board_overview_maps_lists_to_card_names(monkeypatch, stocked_trello):
+    def fake_get(path, **params):
+        assert path == "/boards/b1/lists"
+        return [{"name": "Shopping List", "cards": [{"name": "Milk"}]},
+                {"name": "Done", "cards": []}]
+
+    monkeypatch.setattr(app.trello, "_get", fake_get)
+    out = app.execute_tool("trello_board_overview", {"board": "Home"})
+    assert out == {"ok": True, "board": "Home",
+                   "lists": {"Shopping List": ["Milk"], "Done": []}}
+
+
+def test_create_and_rename_list_update_the_cache(monkeypatch, stocked_trello):
+    def fake_post(url, params=None, timeout=None):
+        assert "/lists" in url
+        return FakeResp({"id": "l9", "name": "Freezer"})
+
+    monkeypatch.setattr(app.requests, "post", fake_post)
+    out = app.execute_tool("trello_create_list", {"board": "Home", "name": "Freezer"})
+    assert out == {"ok": True, "created_list": "Freezer", "board": "Home"}
+    assert ("Freezer", "l9") in app.trello.lists_by_board["b1"]
+
+    monkeypatch.setattr(app.trello, "_put", lambda path, **params: {"id": "l1"})
+    out = app.execute_tool("trello_rename_list", {
+        "board": "Home", "list": "Shopping List", "new_name": "Groceries"})
+    assert out["ok"] is True
+    assert ("Groceries", "l1") in app.trello.lists_by_board["b1"]
+    assert ("Shopping List", "l1") not in app.trello.lists_by_board["b1"]
+
+
+def test_card_details_tool_reads_the_full_body(monkeypatch, stocked_trello):
+    def fake_get(path, **params):
+        if path == "/boards/b1/cards":
+            return [{"id": "c1", "name": "Milk"}]
+        return {"id": "c1", "name": "Milk", "desc": "2 pints", "due": "2030-06-05T12:00:00",
+                "url": "https://trello.com/c/c1",
+                "labels": [{"name": "", "color": "green"}],
+                "actions": [{"data": {"text": "bought it"}}]}
+
+    monkeypatch.setattr(app.trello, "_get", fake_get)
+    out = app.execute_tool("trello_card_details", {"board": "Home", "name": "Milk"})
+    assert out == {"ok": True, "name": "Milk", "desc": "2 pints",
+                   "due": "2030-06-05T12:00:00", "labels": ["green"],
+                   "comments": ["bought it"]}

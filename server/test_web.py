@@ -700,3 +700,167 @@ def test_google_disconnect_survives_a_dead_revoke(gcal, monkeypatch):
     monkeypatch.setattr(app.requests, "post", dead)
     assert gcal.post("/app/google/disconnect").status_code == 200
     assert store.get_google_account(uid) is None
+
+
+# --- card / list REST routes: same find-by-name and archive-not-delete rules
+# as the voice tools, exercised through the user's own api token ---
+
+def rest_user(client, monkeypatch):
+    signup(client)
+    user = store.get_user_by_name("tester")
+    store.add_account(user["id"], "trello", "ATTArest")
+    t = app.Trello("k", "ATTArest")
+    t.boards = {"Home": "b1", "Plans": "b2"}
+    t.lists_by_board = {"b1": [("Shopping List", "l1"), ("Done", "l2")],
+                        "b2": [("Food", "l4")]}
+    app._clients[user["id"]] = {"trello": t}
+    return user, t
+
+
+def bearer(user):
+    return {"Authorization": f"Bearer {user['api_token']}"}
+
+
+def test_rest_get_card_reads_details(client):
+    user, t = rest_user(client, None)
+    seen = {}
+
+    def fake_details(board, name, list_name=""):
+        seen.update(board=board, name=name, list_name=list_name)
+        return {"id": "c1", "name": "Milk", "desc": "oat", "due": None,
+                "labels": ["green"], "comments": ["picked up"]}
+
+    t.card_details = fake_details
+    r = client.get("/card", params={"board": "Home", "name": "Milk",
+                                    "list": "Shopping List"}, headers=bearer(user))
+    assert r.status_code == 200
+    assert r.json()["desc"] == "oat"
+    assert seen == {"board": "Home", "name": "Milk", "list_name": "Shopping List"}
+
+
+def test_rest_get_card_unknown_name_is_404(client):
+    user, t = rest_user(client, None)
+
+    def missing(board, name, list_name=""):
+        raise KeyError("card 'Ghost' matches nothing on board 'Home' "
+                       "(known: Milk, Beans)")
+
+    t.card_details = missing
+    r = client.get("/card", params={"board": "Home", "name": "Ghost"},
+                   headers=bearer(user))
+    assert r.status_code == 404
+    assert "Beans" in r.json()["detail"]
+
+
+def test_rest_patch_card_edits_moves_and_archives(client):
+    user, t = rest_user(client, None)
+    t.find_card = lambda board, name, list_name="": {"id": "c1", "name": "Milk"}
+    seen = {}
+    t.update_card = lambda card_id, **f: seen.update(card_id=card_id, **f) \
+        or {"id": card_id, "name": f.get("name", "Milk")}
+
+    r = client.patch("/card", json={"board": "Home", "name": "Milk",
+                                    "new_name": "Oat milk", "desc": "from the market",
+                                    "to_list": "Done", "archive": True},
+                     headers=bearer(user))
+    assert r.status_code == 200
+    assert r.json()["name"] == "Oat milk"
+    assert seen == {"card_id": "c1", "name": "Oat milk", "desc": "from the market",
+                    "closed": "true", "idList": "l2"}
+
+
+def test_rest_patch_card_due_defaults_to_noon(client):
+    user, t = rest_user(client, None)
+    t.find_card = lambda board, name, list_name="": {"id": "c1", "name": "Milk"}
+    seen = {}
+    t.update_card = lambda card_id, **f: seen.update(**f) or {"id": card_id}
+    r = client.patch("/card", json={"board": "Home", "name": "Milk",
+                                    "due_day": "2030-06-05", "due_time": "14:30"},
+                     headers=bearer(user))
+    assert r.status_code == 200
+    assert seen == {"due": "2030-06-05T14:30:00"}
+
+
+def test_rest_patch_card_rejects_empty_and_unknown(client):
+    user, t = rest_user(client, None)
+    t.find_card = lambda board, name, list_name="": {"id": "c1", "name": "Milk"}
+    r = client.patch("/card", json={"board": "Home", "name": "Milk"},
+                     headers=bearer(user))
+    assert r.status_code == 400 and r.json()["detail"] == "nothing to change"
+
+    def missing(board, name, list_name=""):
+        raise KeyError("card 'Ghost' matches nothing on board 'Home' (known: Milk)")
+
+    t.find_card = missing
+    r = client.patch("/card", json={"board": "Home", "name": "Ghost", "archive": True},
+                     headers=bearer(user))
+    assert r.status_code == 404
+
+
+def test_rest_comment_card(client):
+    user, t = rest_user(client, None)
+    t.find_card = lambda board, name, list_name="": {"id": "c1", "name": "Milk"}
+    seen = {}
+    t.add_comment = lambda card_id, text: seen.update(card_id=card_id, text=text) or {}
+    r = client.post("/card/comment",
+                    json={"board": "Home", "name": "Milk", "text": "picked up"},
+                    headers=bearer(user))
+    assert r.status_code == 200
+    assert r.json() == {"id": "c1", "commented": "picked up"}
+    assert seen == {"card_id": "c1", "text": "picked up"}
+
+
+def test_rest_list_create_and_rename(client):
+    user, t = rest_user(client, None)
+    t.create_list = lambda board, name: {"id": "l9", "name": name}
+    r = client.post("/list", json={"board": "Home", "name": "In Basket"},
+                    headers=bearer(user))
+    assert r.status_code == 200
+    assert r.json() == {"id": "l9", "name": "In Basket"}
+
+    seen = {}
+    t.rename_list = lambda board, list_name, new_name: \
+        seen.update(board=board, list_name=list_name, new_name=new_name) or None
+    r = client.patch("/list", json={"board": "Home", "list": "In Basket",
+                                    "new_name": "Holding"},
+                     headers=bearer(user))
+    assert r.status_code == 200
+    assert r.json() == {"board": "Home", "list": "Holding"}
+    assert seen == {"board": "Home", "list_name": "In Basket", "new_name": "Holding"}
+
+
+def test_rest_list_unknown_board_is_404(client):
+    user, t = rest_user(client, None)
+
+    def missing(board, name=None):
+        raise KeyError("board 'Nowhere' not found (known: Home, Plans)")
+
+    t.create_list = missing
+    t.board_overview = missing
+    r = client.post("/list", json={"board": "Nowhere", "name": "x"},
+                    headers=bearer(user))
+    assert r.status_code == 404
+    r = client.get("/board/Nowhere/overview", headers=bearer(user))
+    assert r.status_code == 404
+
+
+def test_rest_board_overview(client):
+    user, t = rest_user(client, None)
+    t.board_overview = lambda board: {"Shopping List": ["Milk", "Beans"],
+                                      "Done": ["Old bin"]}
+    r = client.get("/board/Home/overview", headers=bearer(user))
+    assert r.status_code == 200
+    assert r.json()["Shopping List"] == ["Milk", "Beans"]
+
+
+def test_rest_card_routes_need_a_connection(client):
+    signup(client)
+    user = store.get_user_by_name("tester")
+    r = client.get("/card", params={"board": "Home", "name": "Milk"},
+                   headers=bearer(user))
+    assert r.status_code == 409
+    r = client.patch("/card", json={"board": "Home", "name": "Milk", "archive": True},
+                     headers=bearer(user))
+    assert r.status_code == 409
+    r = client.get("/board/Home/overview", headers=bearer(user))
+    assert r.status_code == 409
