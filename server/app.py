@@ -107,6 +107,31 @@ class ListPatchIn(BaseModel):
     new_name: str
 
 
+class EventIn(BaseModel):
+    """Create an event: timed when `time` is set (or all_day=False), all-day
+    otherwise. `all_day=True` beats a time."""
+    title: str
+    day: str = ""
+    time: str = ""
+    duration_min: int = 60
+    all_day: bool | None = None
+    location: str = ""
+    description: str = ""
+    attendees: list[str] = []
+
+
+class EventPatchIn(BaseModel):
+    """Edit / move an event picked by spoken name from a day."""
+    day: str = ""
+    name: str
+    new_title: str = ""
+    new_day: str = ""
+    new_time: str = ""
+    duration_min: int | None = None
+    location: str = ""
+    description: str = ""
+
+
 def resolve_target(boards: dict, lists_by_board: dict, board: str, list_name: str) -> tuple[str, str]:
     """Map (board name, list name) to (board_id, list_id), case-insensitive.
 
@@ -337,9 +362,20 @@ class Gcal:
         return self.account["access_token"]
 
     def _get(self, path: str, **params) -> dict:
+        return self._send("GET", path, params=params)
+
+    def _send(self, method: str, path: str, params=None, body=None):
         try:
-            r = requests.get(f"{GCAL_API}{path}", params=params, headers={
-                "Authorization": f"Bearer {self._token()}"}, timeout=15)
+            kw = {"headers": {"Authorization": f"Bearer {self._token()}"},
+                  "timeout": 15}
+            if method == "GET":
+                r = requests.get(f"{GCAL_API}{path}", params=params, **kw)
+            elif method == "POST":
+                r = requests.post(f"{GCAL_API}{path}", json=body, **kw)
+            elif method == "PATCH":
+                r = requests.patch(f"{GCAL_API}{path}", json=body, **kw)
+            else:
+                r = requests.delete(f"{GCAL_API}{path}", **kw)
             r.raise_for_status()
         except requests.HTTPError as e:
             # 401/403 here means the grant died under a token we thought alive.
@@ -349,7 +385,18 @@ class Gcal:
                 store.delete_google_account(self.user_id)
                 raise GcalDisconnected() from e
             raise
+        if method == "DELETE":
+            return None if r.status_code == 204 else r.json()
         return r.json()
+
+    def _post(self, path: str, body: dict) -> dict:
+        return self._send("POST", path, body=body)
+
+    def _patch(self, path: str, body: dict) -> dict:
+        return self._send("PATCH", path, body=body)
+
+    def _delete(self, path: str) -> dict | None:
+        return self._send("DELETE", path)
 
     def refresh(self) -> None:
         """Validate the grant and load the account email and calendar timezone."""
@@ -357,46 +404,88 @@ class Gcal:
         self.timezone = self._get("/users/me/settings/timezone")["value"]
 
     def events(self, day: str) -> list[dict]:
-        """The day's events, in order: [{start: iso, title: str}]."""
+        """The day's events, in order: [{start, title, location, description}]."""
+        items = self._list_events(day)
+        return [{"start": e["start"].get("dateTime") or e["start"].get("date", ""),
+                 "title": e.get("summary", "(untitled)"),
+                 "location": e.get("location", ""),
+                 "description": e.get("description", "")}
+                for e in items]
+
+    def _list_events(self, day: str = "") -> list[dict]:
+        """One events.list call: the named local day, or a rolling 14-day
+        window when the user named no day. singleEvents expands recurring
+        events, so a weekly event shows once per occurrence."""
         tz = ZoneInfo(self.timezone)
-        start = parse_day(day, tz)
-        end = start + timedelta(days=1)
+        start = parse_day(day, tz) if day else \
+            datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0)
+        end = start + timedelta(days=1 if day else 14)
         data = self._get("/calendars/primary/events", timeMin=start.isoformat(),
                          timeMax=end.isoformat(), singleEvents="true",
-                         orderBy="startTime", maxResults="25")
-        return [
-            {"start": e["start"].get("dateTime") or e["start"].get("date", ""),
-             "title": e.get("summary", "(untitled)")}
-            for e in data.get("items", [])
-        ]
+                         orderBy="startTime", maxResults="50")
+        return data.get("items", [])
+
+    def find_events(self, name: str, day: str = "") -> list[dict]:
+        """Events matching the spoken name: exact case-insensitive first, then
+        substring. Nothing or several matches raises KeyError with the
+        candidates, in the same shape as find_card."""
+        items = self._list_events(day)
+        low = name.lower()
+        hits = [e for e in items if e.get("summary", "").lower() == low] or \
+               [e for e in items if low in e.get("summary", "").lower()]
+        if len(hits) != 1:
+            known = ", ".join(sorted(e.get("summary", "(untitled)") for e in items))
+            raise KeyError(f"event '{name}' matches {len(hits) or 'nothing'} "
+                           f"in the calendar (known: {known})")
+        return hits
+
+    def event_details(self, name: str, day: str = "") -> dict:
+        hit = self.find_events(name, day)[0]
+        return {"id": hit["id"],
+                "title": hit.get("summary", "(untitled)"),
+                "when": hit["start"].get("dateTime") or hit["start"].get("date", ""),
+                "end": hit["end"].get("dateTime") or hit["end"].get("date", ""),
+                "location": hit.get("location", ""),
+                "description": hit.get("description", ""),
+                "attendees": [a.get("email", "") for a in hit.get("attendees", [])],
+                "all_day": "date" in hit["start"]}
+
+    def update_event(self, event_id: str, **body) -> dict:
+        """PATCH the event: only the keys sent change (Google partial update)."""
+        return self._patch(f"/calendars/primary/events/{event_id}", body) or {}
+
+    def delete_event(self, event_id: str) -> dict:
+        self._delete(f"/calendars/primary/events/{event_id}")
+        return {"id": event_id}
 
     def create_event(self, title: str, day: str, when: str = "",
-                     duration_min: int = 60) -> dict:
-        """Create on the primary calendar; no `when` means an all-day event."""
+                     duration_min: int = 60, all_day: bool | None = None,
+                     location: str = "", description: str = "",
+                     attendees: list[str] | None = None) -> dict:
+        """Create on the primary calendar. `all_day` wins when given: True
+        forces all-day even with a time, False forces a timed event (so a
+        missing `when` raises). No `all_day` infers from `when`."""
         tz = ZoneInfo(self.timezone)
         start = parse_day(day, tz)
         body: dict = {"summary": title}
-        if when:
+        if location:
+            body["location"] = location
+        if description:
+            body["description"] = description
+        if attendees:
+            body["attendees"] = [{"email": a} for a in attendees]
+        timed = (when != "") if all_day is None else (not all_day)
+        if timed:
             hour, minute = parse_time(when)
             start = start.replace(hour=hour, minute=minute)
             end = start + timedelta(minutes=duration_min)
-            body["start"] = {"dateTime": start.isoformat()}
-            body["end"] = {"dateTime": end.isoformat()}
+            body["start"] = {"dateTime": start.isoformat(), "timeZone": self.timezone}
+            body["end"] = {"dateTime": end.isoformat(), "timeZone": self.timezone}
         else:
             end = start + timedelta(days=1)
             body["start"] = {"date": start.date().isoformat()}
             body["end"] = {"date": end.date().isoformat()}
-        try:
-            r = requests.post(f"{GCAL_API}/calendars/primary/events", json=body,
-                              headers={"Authorization": f"Bearer {self._token()}"},
-                              timeout=15)
-            r.raise_for_status()
-        except requests.HTTPError as e:
-            if e.response is not None and e.response.status_code in (401, 403):
-                store.delete_google_account(self.user_id)
-                raise GcalDisconnected() from e
-            raise
-        return body
+        return self._post("/calendars/primary/events", body) or body
 
 
 def parse_day(day: str, tz) -> datetime:
@@ -792,8 +881,71 @@ GCAL_TOOLS = [
                              "description": "24-hour HH:MM start time; omit for all-day"},
                     "duration": {"type": "number",
                                  "description": "length in minutes; default 60"},
+                    "all_day": {"type": "boolean",
+                                "description": "true forces an all-day event even when a time was said"},
+                    "location": {"type": "string"},
+                    "description": {"type": "string"},
+                    "attendees": {"type": "array", "items": {"type": "string"},
+                                  "description": "email addresses to invite"},
                 },
                 "required": ["title", "day"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "gcal_find_event",
+            "description": "Read one event's details (time, location, description, invitees) by its spoken name.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "day": {"type": "string",
+                            "description": "the day the user mentioned, if any"},
+                    "name": {"type": "string", "description": "the event's spoken name"},
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "gcal_edit_event",
+            "description": "Edit or move an event: rename it, change its day or time, or update location and description.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "day": {"type": "string",
+                            "description": "the day the event is currently on"},
+                    "name": {"type": "string", "description": "the event's spoken name"},
+                    "new_title": {"type": "string"},
+                    "new_day": {"type": "string",
+                                "description": "today, tomorrow, yesterday, or YYYY-MM-DD to move it"},
+                    "new_time": {"type": "string",
+                                 "description": "24-hour HH:MM new start time"},
+                    "duration": {"type": "number",
+                                 "description": "length in minutes when moving the time"},
+                    "location": {"type": "string"},
+                    "description": {"type": "string"},
+                },
+                "required": ["day", "name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "gcal_delete_event",
+            "description": "Delete an event from the user's Google Calendar by its spoken name. Confirm with the user first.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "day": {"type": "string",
+                            "description": "the day the event is on"},
+                    "name": {"type": "string", "description": "the event's spoken name"},
+                },
+                "required": ["day", "name"],
             },
         },
     },
@@ -846,15 +998,21 @@ def build_system_prompt(t: Trello | None = None,
     if calendar:
         tool_lines += [
             "- gcal_list_events(day) — read a day's events from the calendar",
-            "- gcal_create_event(title, day, time, duration) — create an event",
+            "- gcal_find_event(day, name) — read one event's time, location, description and invitees",
+            "- gcal_create_event(title, day, time, duration, all_day, location, description, attendees) — create an event",
+            "- gcal_edit_event(day, name, new_title, new_day, new_time, duration, location, description) — edit or move an event",
+            "- gcal_delete_event(day, name) — delete an event",
         ]
     calendar_rule = (
         """7. Calendar: the user's Google Calendar is connected. "day" is today,
    tomorrow, yesterday, or YYYY-MM-DD in the user's timezone. Convert spoken
    times to 24-hour HH:MM ("3pm" is 15:00); when the user gives no time,
-   omit it so the event is all-day. Never guess a day or a time: ask. On a
-   calendar_disconnected result, say their calendar needs reconnecting from
-   the bridge dashboard."""
+   omit it so the event is all-day. Events are picked by the name the user
+   said, from the day they mentioned. On a no_event or ambiguous_event
+   result, offer the closest candidates and ask; never invent an event name.
+   Confirm before deleting: "shall I delete Dentist tomorrow?". Never guess
+   a day, a time, or which event. On a calendar_disconnected result, say
+   their calendar needs reconnecting from the bridge dashboard."""
         if calendar else
         """7. Google Calendar is not connected yet. Any calendar or events request gets
    a brief "calendar isn't set up yet" reply.""")
@@ -912,11 +1070,20 @@ def find_boards_with_list(list_name: str, t: Trello | None = None) -> list[str]:
 
 def card_error(e: KeyError) -> dict:
     """A find_card KeyError as an ask-the-user tool result."""
+    return _match_error(e, "no_card", "ambiguous_card")
+
+
+def event_error(e: KeyError) -> dict:
+    """A find_events KeyError as an ask-the-user tool result."""
+    return _match_error(e, "no_event", "ambiguous_event")
+
+
+def _match_error(e: KeyError, none_name: str, ambiguous_name: str) -> dict:
     msg = e.args[0]
     _, _, known = msg.partition("(known:")
     candidates = [c.strip(" '\"") for c in known.rstrip(") ").split(",")]
     candidates = [c for c in candidates if c]
-    error = "no_card" if ("nothing" in msg or "matches 0" in msg) else "ambiguous_card"
+    error = none_name if ("nothing" in msg or "matches 0" in msg) else ambiguous_name
     return {"ok": False, "error": error, "candidates": candidates}
 
 
@@ -1163,18 +1330,55 @@ def execute_tool(name: str, args: dict, t: Trello | None = None,
         except KeyError as e:
             return {"ok": False, "error": "bad_day", "detail": e.args[0]}
         return {"ok": True, "day": day, "events": [
-            {"when": spoken_when(e["start"]), "title": e["title"]} for e in events]}
+            {"when": spoken_when(e["start"]), "title": e["title"],
+             **({"location": e["location"]} if e.get("location") else {}),
+             **({"description": e["description"]} if e.get("description") else {})}
+            for e in events]}
     if name == "gcal_create_event":
         if gcal is None or not gcal.connected:
             return {"ok": False, "error": "calendar_disconnected"}
         try:
-            gcal.create_event(args["title"], args.get("day") or "today",
-                              args.get("time", ""), int(args.get("duration") or 60))
+            created = gcal.create_event(
+                args["title"], args.get("day") or "today",
+                args.get("time", ""), int(args.get("duration") or 60),
+                all_day=args.get("all_day"),
+                location=args.get("location", ""),
+                description=args.get("description", ""),
+                attendees=args.get("attendees") or None)
         except KeyError as e:
             return {"ok": False, "error": "bad_day", "detail": e.args[0]}
-        return {"ok": True, "created": args["title"],
+        return {"ok": True, "created": args["title"], "id": created.get("id", ""),
                 "day": args.get("day") or "today",
                 "time": args.get("time") or "all day"}
+    if name in ("gcal_find_event", "gcal_edit_event", "gcal_delete_event"):
+        if gcal is None or not gcal.connected:
+            return {"ok": False, "error": "calendar_disconnected"}
+        day = args.get("day") or ""
+        try:
+            hit = gcal.find_events(args["name"], day)[0]
+        except KeyError as e:
+            return event_error(e)
+        if name == "gcal_find_event":
+            return {"ok": True,
+                    "title": hit.get("summary", "(untitled)"),
+                    "when": spoken_when(hit["start"].get("dateTime")
+                                        or hit["start"].get("date", "")),
+                    "location": hit.get("location", ""),
+                    "description": hit.get("description", ""),
+                    "attendees": [a.get("email", "") for a in hit.get("attendees", [])]}
+        if name == "gcal_edit_event":
+            body = _edit_event_body(args, hit, gcal.timezone)
+            if body is None:
+                return {"ok": False, "error": "nothing_to_edit"}
+            gcal.update_event(hit["id"], **body)
+            title = body.get("summary", hit.get("summary", "(untitled)"))
+            out = {"ok": True, "edited": title}
+            if "start" in body:
+                out["moved_to"] = spoken_when(body["start"].get("dateTime")
+                                              or body["start"].get("date", ""))
+            return out
+        gcal.delete_event(hit["id"])
+        return {"ok": True, "deleted": hit.get("summary", "(untitled)")}
     raise NotImplementedError(f"unknown tool '{name}'")
 
 
@@ -1186,6 +1390,42 @@ def spoken_when(start: str) -> str:
         return datetime.fromisoformat(start).strftime("%H:%M")
     except ValueError:
         return start
+
+
+def _edit_event_body(args: dict, hit: dict, tz_name: str) -> dict | None:
+    """The PATCH body for an edit: only what was asked. A day/time change
+    sends the full new start/end pair (timed keeps its duration; all-day
+    moves to date + next-day date) so Google never silently clears the end."""
+    body: dict = {}
+    if args.get("new_title"):
+        body["summary"] = args["new_title"]
+    if args.get("location"):
+        body["location"] = args["location"]
+    if args.get("description"):
+        body["description"] = args["description"]
+    if not (args.get("new_day") or args.get("new_time")):
+        return body or None
+    all_day = "date" in hit["start"]
+    duration = int(args.get("duration") or 60)
+    if all_day and not args.get("new_time"):
+        day = parse_day(args.get("new_day") or "today", ZoneInfo(tz_name))
+        body["start"] = {"date": day.date().isoformat()}
+        body["end"] = {"date": (day + timedelta(days=1)).date().isoformat()}
+        return body
+    # timed: keep the existing start time unless a new one was said
+    base = hit["start"].get("dateTime") or hit["start"].get("date", "")
+    start = datetime.fromisoformat(base)
+    if args.get("new_day"):
+        day = parse_day(args["new_day"], ZoneInfo(tz_name))
+        start = day.replace(hour=start.hour, minute=start.minute,
+                            second=0, microsecond=0)
+    if args.get("new_time"):
+        hour, minute = parse_time(args["new_time"])
+        start = start.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    end = start + timedelta(minutes=duration)
+    body["start"] = {"dateTime": start.isoformat(), "timeZone": tz_name}
+    body["end"] = {"dateTime": end.isoformat(), "timeZone": tz_name}
+    return body
 
 
 def spoken_error(message: str, max_candidates: int = 5) -> str:
@@ -1386,6 +1626,89 @@ def board_overview(board: str, authorization: str = Header(default="")) -> dict:
         raise HTTPException(status_code=404, detail=str(e))
 
 
+# --- calendar REST: same find-by-name rules as the event voice tools ---
+
+def _gcal_or_409(authorization: str) -> tuple[dict, Gcal]:
+    user = require_user(authorization)
+    try:
+        g = gcal_for(user)
+    except requests.RequestException:
+        raise HTTPException(status_code=502, detail="google calendar unreachable")
+    if g is None or not g.connected:
+        raise HTTPException(status_code=409,
+                            detail="google calendar not connected for this user")
+    return user, g
+
+
+@app.get("/events")
+def list_events(day: str = "", authorization: str = Header(default="")) -> dict:
+    _, g = _gcal_or_409(authorization)
+    try:
+        return {"day": day or "today",
+                "events": [{"when": spoken_when(e["start"]), "title": e["title"],
+                            **({"location": e["location"]} if e.get("location") else {}),
+                            **({"description": e["description"]} if e.get("description") else {})}
+                           for e in g.events(day or "today")]}
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.get("/event")
+def one_event(day: str = "", name: str = "",
+              authorization: str = Header(default="")) -> dict:
+    _, g = _gcal_or_409(authorization)
+    if not name:
+        raise HTTPException(status_code=422, detail="name is required")
+    try:
+        return g.event_details(name, day)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.post("/event")
+def new_event(event_in: EventIn, authorization: str = Header(default="")) -> dict:
+    _, g = _gcal_or_409(authorization)
+    try:
+        created = g.create_event(event_in.title, event_in.day or "today",
+                                 event_in.time, event_in.duration_min,
+                                 all_day=event_in.all_day,
+                                 location=event_in.location,
+                                 description=event_in.description,
+                                 attendees=event_in.attendees or None)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return {"id": created.get("id", ""), "title": created.get("summary", event_in.title)}
+
+
+@app.patch("/event")
+def patch_event(patch: EventPatchIn, authorization: str = Header(default="")) -> dict:
+    _, g = _gcal_or_409(authorization)
+    try:
+        hit = g.find_events(patch.name, patch.day)[0]
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    body = _edit_event_body(patch.model_dump(), hit, g.timezone)
+    if body is None:
+        raise HTTPException(status_code=400, detail="nothing to change")
+    updated = g.update_event(hit["id"], **body)
+    return {"id": updated.get("id", hit["id"]),
+            "title": updated.get("summary", hit.get("summary", ""))}
+
+
+@app.delete("/event")
+def remove_event(day: str = "", name: str = "",
+                 authorization: str = Header(default="")) -> dict:
+    _, g = _gcal_or_409(authorization)
+    if not name:
+        raise HTTPException(status_code=422, detail="name is required")
+    try:
+        hit = g.find_events(name, day)[0]
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    g.delete_event(hit["id"])
+    return {"id": hit["id"], "deleted": hit.get("summary", "")}
+
+
 # --- multi-user web front end: signup, login, dashboard, Trello onboarding ---
 
 import sqlite3
@@ -1495,12 +1818,20 @@ def signup_page() -> str:
     return SIGNUP_HTML
 
 
+FOOTER = """<p class="foot">
+ <a href="/privacy">privacy</a> ·
+ <a href="https://github.com/GlassOnTin/watch-llm-bridge">source on GitHub</a> ·
+ <a href="/health">status</a>
+</p>"""
+
 PRIVACY_HTML = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <title>Privacy — Watch Bridge</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>body{font-family:Georgia,serif;max-width:40rem;margin:3rem auto;
-padding:0 1rem;line-height:1.6}h1{font-size:1.4rem}</style></head><body>
+padding:0 1rem;line-height:1.6}h1{font-size:1.4rem}
+.foot{margin-top:2.5rem;font-size:.8rem}
+.foot a{color:#666}</style></head><body>
 <h1>Privacy</h1>
 <p>This is a private, personal voice-assistant bridge. It is not a commercial
 product and has no analytics or advertising.</p>
@@ -1514,6 +1845,7 @@ share your data with anyone else. Google is told only that this app may read
 and add events on your primary calendar. Disconnecting a service from the
 dashboard deletes its stored token (and revokes the Google grant).</p>
 <p>Operator contact: the person who gave you your invite code.</p>
+""" + FOOTER + """
 </body></html>"""
 
 
@@ -1798,6 +2130,8 @@ STYLE = """<!doctype html>
  .gear:hover{color:var(--accent);text-shadow:0 0 10px rgba(201,160,255,.6)}
  code{color:var(--accent2)}
  .orn{color:var(--accent);letter-spacing:.4em;text-align:center;margin:20px 0 0;font-size:.8rem}
+ .foot{margin-top:2.5rem;font-size:.8rem;text-align:center}
+ .foot a{color:var(--muted)}
 </style></head><body><main>
 """
 
@@ -1809,7 +2143,7 @@ LANDING_HTML = STYLE + """<h1>Watch Bridge</h1>
  your own Trello account and get a personal token for your watch shortcut.</p>
 </div>
 <p class="orn">✦ ✦ ✦</p>
-</main></body></html>"""
+""" + FOOTER + """</main></body></html>"""
 
 SIGNUP_HTML = STYLE + """<h1>Sign up</h1>
 <p class="sub">Accounts are invite-only. Ask the operator for the code.</p>
@@ -1831,7 +2165,7 @@ async function go(){
  err.textContent=d.detail||('error '+r.status);
 }
 document.querySelectorAll('input').forEach(i=>i.addEventListener('keydown',e=>{if(e.key==='Enter')go()}));
-</script></main></body></html>"""
+</script>""" + FOOTER + """</main></body></html>"""
 
 LOGIN_HTML = STYLE + """<h1>Watch Bridge</h1>
 <p class="sub">Log in to manage your watch shortcut and Trello connection.</p>
@@ -1852,7 +2186,7 @@ async function go(){
  err.textContent=r.status===429?'slow down — too many attempts':(d.detail||('error '+r.status));
 }
 document.querySelectorAll('input').forEach(i=>i.addEventListener('keydown',e=>{if(e.key==='Enter')go()}));
-</script></main></body></html>"""
+</script>""" + FOOTER + """</main></body></html>"""
 
 DASHBOARD_HTML = STYLE + """<div class="top"><h1>Watch Bridge</h1><span><span id="who" class="sub"></span> · <button class="gear" id="gearbtn" title="Settings">⚙</button> · <a href="/logout">log out</a></span></div>
 <details id="trello" class="dcard"><summary id="trellos"></summary><div class="inner" id="trellobody"></div></details>
@@ -1896,11 +2230,15 @@ spoken: “Bin day is on the Chores list of Work Stuff.”</pre>
  <p><b>What Calendar supports today</b></p>
  <ul>
   <li>Read a day's events — “today”, “tomorrow”, or a date</li>
+  <li>Read one event's details — who's invited, where, the description</li>
+  <li>Find an event by name — “the dentist thing next week”</li>
+  <li>Edit or move an event — rename, new day, new time</li>
+  <li>Delete an event — after the agent confirms with you</li>
   <li>Create an event, timed or all-day — your calendar's own timezone is used</li>
  </ul>
- <p class="sub">Closing a card is an archive, so it can be brought back; nothing is deleted.
- Not wired yet: editing or deleting events. The agent is only given the tools above, so it
- says it can't do the rest rather than improvising.</p>
+ <p class="sub">Closing a card is an archive, so it can be brought back; a calendar event is
+ deleted for real, which is why the agent asks before it deletes. The agent is only given
+ the tools above, so it says it can't do the rest rather than improvising.</p>
 </div></details>
 <details id="invited" class="dcard"><summary>✉ Invite someone</summary><div class="inner" id="invite"></div></details>
 <details id="admind" class="dcard"><summary>✧ Admin</summary><div class="inner" id="admin"></div></details>
@@ -2060,7 +2398,7 @@ document.getElementById('admin').addEventListener('click',e=>{
 document.getElementById('gearbtn').onclick=()=>{
  const s=document.getElementById('settings'); s.open=true; s.scrollIntoView({behavior:'smooth'})};
 document.addEventListener('keydown',e=>{if(e.key==='Enter'&&e.target.id==='pwcur')pw()});
-</script></main></body></html>"""
+</script>""" + FOOTER + """</main></body></html>"""
 
 
 # --- provisioning page: TOTP-gated reveal of the shortcut recipe + token ---
@@ -2107,6 +2445,8 @@ PROVISION_HTML = """<!doctype html>
  *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,"Segoe UI",Roboto,sans-serif;line-height:1.6}
  main{max-width:640px;margin:0 auto;padding:48px 20px 80px}
  h1{font-size:1.4rem;margin:0 0 4px}.sub{color:var(--muted)}
+ .foot{margin-top:2.5rem;font-size:.8rem;text-align:center}
+ .foot a{color:var(--muted)}
  .card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:18px;margin:16px 0}
  input{width:100%;background:var(--code);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:10px 12px;font-family:var(--mono);font-size:1.1rem;text-align:center;letter-spacing:0.3em}
  button{background:var(--accent);color:#04121f;border:none;border-radius:6px;padding:10px 22px;font-weight:600;cursor:pointer;margin-top:10px}
@@ -2154,4 +2494,4 @@ async function go(){
  <p class="sub">Then enable <b>Show on Apple Watch</b>; on an Ultra you can assign it to the Action button. Keep this token private — it can create and read cards on your boards.</p>`;
 }
 document.getElementById('code').addEventListener('keydown',e=>{if(e.key==='Enter')go()});
-</script></main></body></html>"""
+</script>""" + FOOTER + """</main></body></html>"""

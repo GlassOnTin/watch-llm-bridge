@@ -588,8 +588,10 @@ def test_gcal_events_day_window_uses_the_stored_timezone(gcal, monkeypatch):
     assert seen["params"]["timeMax"] == "2030-01-16T00:00:00+09:00"
     assert seen["params"]["singleEvents"] == "true"
     assert seen["auth"] == "Bearer live"
-    assert events == [{"start": "2030-01-15T10:00:00+09:00", "title": "Standup"},
-                      {"start": "2030-01-15", "title": "Off skiing"}]
+    assert events == [{"start": "2030-01-15T10:00:00+09:00", "title": "Standup",
+                       "location": "", "description": ""},
+                      {"start": "2030-01-15", "title": "Off skiing",
+                       "location": "", "description": ""}]
 
 
 def test_gcal_create_event_all_day_and_timed(gcal, monkeypatch):
@@ -604,11 +606,14 @@ def test_gcal_create_event_all_day_and_timed(gcal, monkeypatch):
 
     monkeypatch.setattr(app.requests, "post", fake_post)
     g = app.Gcal(uid)
-    assert g.create_event("Bin day", "2030-06-05")["start"] == {"date": "2030-06-05"}
+    g.create_event("Bin day", "2030-06-05")
+    assert bodies[-1]["start"] == {"date": "2030-06-05"}
     assert bodies[-1]["end"] == {"date": "2030-06-06"}
-    assert g.create_event("Dentist", "2030-06-05", "14:30",
-                          duration_min=45)["start"] == {"dateTime": "2030-06-05T14:30:00+01:00"}
-    assert bodies[-1]["end"] == {"dateTime": "2030-06-05T15:15:00+01:00"}
+    g.create_event("Dentist", "2030-06-05", "14:30", duration_min=45)
+    assert bodies[-1]["start"] == {"dateTime": "2030-06-05T14:30:00+01:00",
+                                   "timeZone": "Europe/London"}
+    assert bodies[-1]["end"] == {"dateTime": "2030-06-05T15:15:00+01:00",
+                                 "timeZone": "Europe/London"}
 
 
 def test_gcal_api_401_deletes_the_row_and_raises(gcal, monkeypatch):
@@ -622,6 +627,139 @@ def test_gcal_api_401_deletes_the_row_and_raises(gcal, monkeypatch):
     assert store.get_google_account(uid) is None
 
 
+GCAL_ITEMS = [
+    {"id": "e1", "summary": "Dentist",
+     "start": {"dateTime": "2030-01-15T14:30:00+00:00"},
+     "end": {"dateTime": "2030-01-15T15:00:00+00:00"},
+     "location": "10 High St", "description": "check-up",
+     "attendees": [{"email": "surgery@example.com"}, {"self": True}]},
+    {"id": "e2", "summary": "Bin day reminder",
+     "start": {"date": "2030-01-15"}, "end": {"date": "2030-01-16"}},
+]
+
+
+def seed_gcal_row(tz="Europe/London"):
+    uid = store.get_user_by_name("tester")["id"]
+    store.save_google_account(uid, "live", "REF", time.time() + 3600, tz)
+    return uid
+
+
+def test_gcal_find_events_exact_then_substring(gcal, monkeypatch):
+    signup(gcal)
+    seed_gcal_row()
+    monkeypatch.setattr(app.requests, "get",
+                        lambda *a, **kw: GResp({"items": GCAL_ITEMS}))
+    g = app.Gcal(store.get_user_by_name("tester")["id"])
+    assert g.find_events("dentist")[0]["id"] == "e1"  # exact, case-insensitive
+    assert g.find_events("bin day")[0]["id"] == "e2"  # exact beats substring
+    assert g.find_events("dent")[0]["id"] == "e1"     # then substring
+    with pytest.raises(KeyError) as e:
+        g.find_events("Gym")
+    assert "(known: Bin day reminder, Dentist)" in str(e.value)
+
+
+def test_gcal_find_events_two_matches_raise(gcal, monkeypatch):
+    signup(gcal)
+    seed_gcal_row()
+    monkeypatch.setattr(app.requests, "get", lambda *a, **kw: GResp(
+        {"items": [{"id": "e1", "summary": "Dentist",
+                    "start": {"dateTime": "2030-01-15T14:30:00+00:00"},
+                    "end": {"dateTime": "2030-01-15T15:00:00+00:00"}},
+                   {"id": "e2", "summary": "Dentist",
+                    "start": {"dateTime": "2030-01-16T14:30:00+00:00"},
+                    "end": {"dateTime": "2030-01-16T15:00:00+00:00"}}]}))
+    g = app.Gcal(store.get_user_by_name("tester")["id"])
+    with pytest.raises(KeyError, match="matches 2"):
+        g.find_events("Dentist")
+
+
+def test_gcal_rolling_window_when_no_day_named(gcal, monkeypatch):
+    from zoneinfo import ZoneInfo
+    from datetime import datetime, timedelta
+    signup(gcal)
+    seed_gcal_row()
+    seen = {}
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+        seen.update(params=params)
+        return GResp({"items": []})
+
+    monkeypatch.setattr(app.requests, "get", fake_get)
+    g = app.Gcal(store.get_user_by_name("tester")["id"])
+    g.events("")
+    tz = ZoneInfo("Europe/London")
+    start = datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0)
+    assert seen["params"]["timeMin"] == start.isoformat()
+    assert seen["params"]["timeMax"] == (start + timedelta(days=14)).isoformat()
+
+
+def test_gcal_event_details_carry_location_and_attendees(gcal, monkeypatch):
+    signup(gcal)
+    seed_gcal_row()
+    monkeypatch.setattr(app.requests, "get",
+                        lambda *a, **kw: GResp({"items": GCAL_ITEMS}))
+    g = app.Gcal(store.get_user_by_name("tester")["id"])
+    d = g.event_details("dentist")
+    assert d == {"id": "e1", "title": "Dentist",
+                 "when": "2030-01-15T14:30:00+00:00",
+                 "end": "2030-01-15T15:00:00+00:00",
+                 "location": "10 High St", "description": "check-up",
+                 "attendees": ["surgery@example.com", ""],
+                 "all_day": False}
+    assert g.event_details("bin day reminder")["all_day"] is True
+
+
+def test_gcal_patch_hits_the_event_url_with_only_the_sent_keys(gcal, monkeypatch):
+    signup(gcal)
+    seed_gcal_row()
+    seen = {}
+
+    def fake_patch(url, json=None, headers=None, timeout=None):
+        seen.update(url=url, json=json)
+        return GResp({"id": "e1", "summary": "Optician"})
+
+    monkeypatch.setattr(app.requests, "patch", fake_patch)
+    g = app.Gcal(store.get_user_by_name("tester")["id"])
+    g.update_event("e1", summary="Optician")
+    assert seen["url"] == f"{app.GCAL_API}/calendars/primary/events/e1"
+    assert seen["json"] == {"summary": "Optician"}
+
+
+def test_gcal_401_on_patch_deletes_the_row_and_raises(gcal, monkeypatch):
+    signup(gcal)
+    seed_gcal_row()
+    monkeypatch.setattr(app.requests, "patch",
+                        lambda *a, **kw: GResp({}, status=401))
+    uid = store.get_user_by_name("tester")["id"]
+    with pytest.raises(app.GcalDisconnected):
+        app.Gcal(uid).update_event("e1", summary="x")
+    assert store.get_google_account(uid) is None
+
+
+def test_gcal_create_event_rich_fields(gcal, monkeypatch):
+    signup(gcal)
+    seed_gcal_row()
+    bodies = []
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        bodies.append(json)
+        return GResp({"id": "e1"})
+
+    monkeypatch.setattr(app.requests, "post", fake_post)
+    g = app.Gcal(store.get_user_by_name("tester")["id"])
+    g.create_event("Dentist", "2030-06-05", "09:00", location="10 High St",
+                   description="check-up", attendees=["a@x.io", "b@x.io"])
+    b = bodies[-1]
+    assert b["location"] == "10 High St" and b["description"] == "check-up"
+    assert b["attendees"] == [{"email": "a@x.io"}, {"email": "b@x.io"}]
+    g.create_event("Bin day", "2030-06-05", "09:00", all_day=True)  # all_day beats a time
+    assert bodies[-1]["start"] == {"date": "2030-06-05"}
+    with pytest.raises(KeyError, match="HH:MM"):
+        g.create_event("Timed", "2030-06-05", all_day=False)  # forced timed, no time
+    g.create_event("Sparse", "2030-06-05")
+    assert "location" not in bodies[-1] and "attendees" not in bodies[-1]
+
+
 class FakeGcal:
     """Connected stub for tool/prompt tests."""
 
@@ -632,8 +770,31 @@ class FakeGcal:
     def events(self, day):
         return [{"start": "2030-01-15T10:00:00+09:00", "title": "Standup"}]
 
-    def create_event(self, title, day, when="", duration_min=60):
-        return {"summary": title}
+    def create_event(self, title, day, when="", duration_min=60,
+                     all_day=None, location="", description="", attendees=None):
+        return {"id": "e1", "summary": title}
+
+    def find_events(self, name, day=""):
+        low = name.lower()
+        exact = [e for e in self._hits if e["summary"].lower() == low]
+        hits = exact or [e for e in self._hits if low in e["summary"].lower()]
+        if len(hits) != 1:  # faithful to Gcal.find_events: ask, don't guess
+            known = ", ".join(sorted(e["summary"] for e in self._hits))
+            raise KeyError(f"event '{name}' matches {len(hits) or 'nothing'} "
+                           f"in the calendar (known: {known})")
+        return hits
+
+    _hits = [{"id": "e1", "summary": "Dentist",
+              "start": {"dateTime": "2030-01-15T14:30:00+00:00"},
+              "end": {"dateTime": "2030-01-15T15:00:00+00:00"},
+              "location": "10 High St", "description": "check-up",
+              "attendees": [{"email": "surgery@example.com"}, {"self": True}]}]
+
+    def update_event(self, event_id, **body):
+        return {"id": event_id}
+
+    def delete_event(self, event_id):
+        return {"id": event_id}
 
 
 def test_execute_tool_speaks_calendar_results(gcal):
@@ -669,9 +830,82 @@ def test_prompt_lists_calendar_only_when_connected(gcal):
     assert "gcal_list_events" not in no_cal
     assert "calendar isn't set up yet" in no_cal
     with_cal = app.build_system_prompt(t=app.Trello("k", "t"), gcal=FakeGcal())
-    assert "gcal_list_events" in with_cal
-    assert "Never guess a day or a time" in with_cal
+    for tool in ("gcal_list_events", "gcal_create_event", "gcal_find_event",
+                 "gcal_edit_event", "gcal_delete_event"):
+        assert tool in with_cal
+    assert "Never guess" in with_cal and "a day, a time, or which event" in with_cal
+    assert "Confirm before deleting" in with_cal
     assert "timezone Europe/London" in with_cal
+
+
+def test_calendar_find_edit_delete_tools_speak_their_results(gcal):
+    f = FakeGcal()
+    out = app.execute_tool("gcal_find_event",
+                           {"day": "tomorrow", "name": "Dentist"}, gcal=f)
+    assert out == {"ok": True, "title": "Dentist", "when": "14:30",
+                   "location": "10 High St", "description": "check-up",
+                   "attendees": ["surgery@example.com", ""]}
+    f.updates = []
+
+    def record_update(self, event_id, **body):
+        self.updates.append((event_id, body))
+        return {"id": event_id}
+
+    f.update_event = record_update.__get__(f)
+    out = app.execute_tool("gcal_edit_event",
+                           {"day": "tomorrow", "name": "Dentist",
+                            "new_title": "Optician"}, gcal=f)
+    assert out == {"ok": True, "edited": "Optician"}
+    out = app.execute_tool("gcal_delete_event",
+                           {"day": "tomorrow", "name": "Dentist"}, gcal=f)
+    assert out == {"ok": True, "deleted": "Dentist"}
+
+
+def test_calendar_edit_moves_day_and_time_building_full_start_end(gcal):
+    class Moving(FakeGcal):
+        def __init__(self):
+            self.updates = []
+
+        def update_event(self, event_id, **body):
+            self.updates.append((event_id, body))
+            return {"id": event_id}
+
+    m = Moving()
+    out = app.execute_tool("gcal_edit_event",
+                           {"day": "2030-01-15", "name": "Dentist",
+                            "new_day": "2030-01-16", "new_time": "09:15",
+                            "duration": 30}, gcal=m)
+    assert out == {"ok": True, "edited": "Dentist", "moved_to": "09:15"}
+    assert m.updates == [("e1", {
+        "start": {"dateTime": "2030-01-16T09:15:00+00:00",
+                  "timeZone": "Europe/London"},
+        "end": {"dateTime": "2030-01-16T09:45:00+00:00",
+                "timeZone": "Europe/London"}})]
+
+
+def test_calendar_find_edit_report_no_event_and_ambiguity(gcal):
+    f = FakeGcal()
+    f._hits = [{"id": "e1", "summary": "Dentist",
+                "start": {"dateTime": "2030-01-15T14:30:00+00:00"},
+                "end": {"dateTime": "2030-01-15T15:00:00+00:00"}},
+               {"id": "e2", "summary": "Dentist",
+                "start": {"dateTime": "2030-01-16T14:30:00+00:00"},
+                "end": {"dateTime": "2030-01-16T15:00:00+00:00"}}]
+    out = app.execute_tool("gcal_find_event",
+                           {"day": "tomorrow", "name": "Dentist"}, gcal=f)
+    assert out == {"ok": False, "error": "ambiguous_event",
+                   "candidates": ["Dentist", "Dentist"]}
+    out = app.execute_tool("gcal_delete_event",
+                           {"day": "tomorrow", "name": "Gym"}, gcal=f)
+    assert out["ok"] is False and out["error"] == "no_event"
+    assert "Dentist" in out["candidates"]
+
+
+def test_calendar_edit_with_no_changes_is_refused(gcal):
+    f = FakeGcal()
+    out = app.execute_tool("gcal_edit_event",
+                           {"day": "tomorrow", "name": "Dentist"}, gcal=f)
+    assert out == {"ok": False, "error": "nothing_to_edit"}
 
 
 def test_google_disconnect_revokes_and_deletes(gcal, monkeypatch):
@@ -864,3 +1098,121 @@ def test_rest_card_routes_need_a_connection(client):
     assert r.status_code == 409
     r = client.get("/board/Home/overview", headers=bearer(user))
     assert r.status_code == 409
+
+
+# --- calendar REST routes: the same find-by-name, confirm-before-delete
+# surface the voice tools use, exercised through the user's api token ---
+
+def rest_gcal_user(client):
+    signup(client)
+    user = store.get_user_by_name("tester")
+    store.add_account(user["id"], "trello", "ATTArest")
+    app._gcal.pop(user["id"], None)
+    store.save_google_account(user["id"], "live", "REF",
+                              time.time() + 3600, "Europe/London")
+    g = app.Gcal(user["id"])
+    app._gcal[user["id"]] = g
+    return user, g
+
+
+def test_rest_events_read_and_one_event(client, monkeypatch):
+    user, g = rest_gcal_user(client)
+    monkeypatch.setattr(app.requests, "get",
+                        lambda *a, **kw: GResp({"items": GCAL_ITEMS}))
+    r = client.get("/events", params={"day": "2030-01-15"},
+                   headers=bearer(user))
+    assert r.status_code == 200
+    body = r.json()
+    assert body["day"] == "2030-01-15"
+    assert body["events"][0] == {"when": "14:30", "title": "Dentist",
+                                 "location": "10 High St",
+                                 "description": "check-up"}
+    assert body["events"][1] == {"when": "all day", "title": "Bin day reminder"}
+    r = client.get("/event", params={"day": "2030-01-15", "name": "dentist"},
+                   headers=bearer(user))
+    assert r.status_code == 200
+    assert r.json()["attendees"] == ["surgery@example.com", ""]
+    assert r.json()["location"] == "10 High St"
+
+
+def test_rest_event_round_trip_create_patch_delete(client, monkeypatch):
+    user, g = rest_gcal_user(client)
+    monkeypatch.setattr(app.requests, "get",
+                        lambda *a, **kw: GResp({"items": GCAL_ITEMS}))
+    posts, patches, deletes = [], [], []
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        posts.append((url, json))
+        return GResp({"id": "e9", "summary": json["summary"]})
+
+    def fake_patch(url, json=None, headers=None, timeout=None):
+        patches.append((url, json))
+        return GResp({"id": "e1", "summary": "Optician"})
+
+    def fake_delete(url, headers=None, timeout=None):
+        deletes.append(url)
+        return GResp(None, status=204)
+
+    monkeypatch.setattr(app.requests, "post", fake_post)
+    monkeypatch.setattr(app.requests, "patch", fake_patch)
+    monkeypatch.setattr(app.requests, "delete", fake_delete)
+
+    r = client.post("/event", json={"title": "Dentist", "day": "2030-01-15",
+                                    "time": "09:00", "location": "10 High St",
+                                    "attendees": ["surgery@example.com"]},
+                    headers=bearer(user))
+    assert r.status_code == 200
+    assert r.json() == {"id": "e9", "title": "Dentist"}
+    assert posts[0][0] == f"{app.GCAL_API}/calendars/primary/events"
+    assert posts[0][1]["attendees"] == [{"email": "surgery@example.com"}]
+
+    r = client.patch("/event", json={"day": "2030-01-15", "name": "Dentist",
+                                     "new_title": "Optician"},
+                     headers=bearer(user))
+    assert r.status_code == 200
+    assert r.json() == {"id": "e1", "title": "Optician"}
+    assert patches[0][0] == f"{app.GCAL_API}/calendars/primary/events/e1"
+    assert patches[0][1] == {"summary": "Optician"}
+
+    r = client.delete("/event", params={"day": "2030-01-15", "name": "Dentist"},
+                      headers=bearer(user))
+    assert r.status_code == 200
+    assert r.json() == {"id": "e1", "deleted": "Dentist"}
+    assert deletes[0] == f"{app.GCAL_API}/calendars/primary/events/e1"
+
+
+def test_rest_event_routes_need_a_connection(client):
+    signup(client)
+    user = store.get_user_by_name("tester")
+    app._gcal.pop(user["id"], None)  # stale cache from another test's DB
+    r = client.get("/events", headers=bearer(user))
+    assert r.status_code == 409
+    r = client.post("/event", json={"title": "x", "day": "today"},
+                    headers=bearer(user))
+    assert r.status_code == 409
+    r = client.patch("/event", json={"day": "today", "name": "x"},
+                     headers=bearer(user))
+    assert r.status_code == 409
+    r = client.delete("/event", params={"day": "today", "name": "x"},
+                      headers=bearer(user))
+    assert r.status_code == 409
+
+
+def test_rest_event_routes_refuse_bad_names(client, monkeypatch):
+    user, g = rest_gcal_user(client)
+    monkeypatch.setattr(app.requests, "get",
+                        lambda *a, **kw: GResp({"items": GCAL_ITEMS}))
+    r = client.get("/event", headers=bearer(user))
+    assert r.status_code == 422  # no name given
+    r = client.delete("/event", params={"day": "today"}, headers=bearer(user))
+    assert r.status_code == 422  # no name given
+    r = client.get("/event", params={"day": "today", "name": "gym"},
+                   headers=bearer(user))
+    assert r.status_code == 404  # nothing matches
+    r = client.patch("/event", json={"day": "today", "name": "gym",
+                                     "new_title": "y"},
+                     headers=bearer(user))
+    assert r.status_code == 404
+    r = client.patch("/event", json={"day": "2030-01-15", "name": "Dentist"},
+                     headers=bearer(user))
+    assert r.status_code == 400  # a match, but nothing to change

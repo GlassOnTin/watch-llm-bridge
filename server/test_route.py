@@ -405,3 +405,68 @@ def test_card_details_tool_reads_the_full_body(monkeypatch, stocked_trello):
     assert out == {"ok": True, "name": "Milk", "desc": "2 pints",
                    "due": "2030-06-05T12:00:00", "labels": ["green"],
                    "comments": ["bought it"]}
+
+
+# --- calendar edit / delete tools ---
+
+def test_calendar_edit_delete_without_a_connection_says_disconnected(stocked_trello):
+    out = app.execute_tool("gcal_edit_event",
+                           {"day": "tomorrow", "name": "Dentist", "new_time": "09:00"})
+    assert out == {"ok": False, "error": "calendar_disconnected"}
+    out = app.execute_tool("gcal_delete_event", {"day": "tomorrow", "name": "Dentist"})
+    assert out == {"ok": False, "error": "calendar_disconnected"}
+
+
+class FakeGcal:
+    connected = True
+    timezone = "Europe/London"
+    _hit = {"id": "e1", "summary": "Dentist",
+            "start": {"dateTime": "2030-01-15T14:30:00+00:00"},
+            "end": {"dateTime": "2030-01-15T15:00:00+00:00"}}
+
+    def __init__(self):
+        self.updates = []
+        self.deleted = None
+
+    def find_events(self, name, day=""):
+        return [self._hit]
+
+    def update_event(self, event_id, **body):
+        self.updates.append((event_id, body))
+        return {"id": event_id}
+
+    def delete_event(self, event_id):
+        self.deleted = event_id
+        return {"id": event_id}
+
+
+def test_calendar_edit_moves_day_and_time_sends_both_start_and_end(stocked_trello):
+    from datetime import timedelta
+    g = FakeGcal()
+    out = app.execute_tool("gcal_edit_event",
+                           {"day": "tomorrow", "name": "Dentist",
+                            "new_day": "2030-01-20", "new_time": "09:15",
+                            "duration": 45}, gcal=g)
+    assert out["ok"] is True and out["edited"] == "Dentist"
+    assert out["moved_to"] == "09:15"
+    assert g.updates == [("e1", {
+        "start": {"dateTime": "2030-01-20T09:15:00+00:00",
+                  "timeZone": "Europe/London"},
+        "end": {"dateTime": "2030-01-20T10:00:00+00:00",
+                "timeZone": "Europe/London"}})]
+    assert timedelta(hours=1)  # keeps the duration import used below
+
+
+def test_calendar_edit_with_no_changes_is_refused(stocked_trello):
+    out = app.execute_tool("gcal_edit_event",
+                           {"day": "tomorrow", "name": "Dentist"},
+                           gcal=FakeGcal())
+    assert out == {"ok": False, "error": "nothing_to_edit"}
+
+
+def test_calendar_delete_removes_the_matched_event(stocked_trello):
+    g = FakeGcal()
+    out = app.execute_tool("gcal_delete_event",
+                           {"day": "tomorrow", "name": "Dentist"}, gcal=g)
+    assert out == {"ok": True, "deleted": "Dentist"}
+    assert g.deleted == "e1"
