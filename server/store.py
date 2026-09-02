@@ -32,6 +32,14 @@ CREATE TABLE IF NOT EXISTS trello_accounts (
   token TEXT NOT NULL,
   created_at TEXT NOT NULL,
   UNIQUE(user_id, label)
+);
+
+CREATE TABLE IF NOT EXISTS google_accounts (
+  user_id INTEGER PRIMARY KEY,
+  access_token TEXT NOT NULL,
+  refresh_token TEXT NOT NULL,
+  expires_at REAL NOT NULL,
+  timezone TEXT NOT NULL
 )
 """
 
@@ -197,3 +205,33 @@ def set_password(user_id: int, password: str) -> None:
     with connect() as db:
         db.execute("UPDATE users SET password_hash = ? WHERE id = ?",
                    (hash_password(password), user_id))
+
+
+# --- Google Calendar OAuth, one connection per user --------------------------
+# One row per user: the Google account is singular (unlike Trello's labelled
+# accounts). expires_at is epoch seconds for the access token.
+
+def save_google_account(user_id: int, access_token: str, refresh_token: str,
+                        expires_at: float, tz: str) -> None:
+    with connect() as db:
+        db.execute(
+            "INSERT INTO google_accounts (user_id, access_token, refresh_token, "
+            "expires_at, timezone) VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET access_token=excluded.access_token, "
+            "refresh_token=excluded.refresh_token, expires_at=excluded.expires_at, "
+            "timezone=excluded.timezone",
+            (user_id, access_token, refresh_token, expires_at, tz),
+        )
+
+
+def get_google_account(user_id: int) -> dict | None:
+    row = connect().execute(
+        "SELECT * FROM google_accounts WHERE user_id = ?", (user_id,)
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def delete_google_account(user_id: int) -> bool:
+    with connect() as db:
+        cur = db.execute("DELETE FROM google_accounts WHERE user_id = ?", (user_id,))
+    return cur.rowcount > 0

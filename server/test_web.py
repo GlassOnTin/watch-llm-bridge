@@ -2,6 +2,7 @@
 Trello paste-connect flow. All network is faked; the DB is a tmp file."""
 
 
+import time
 import pytest
 from fastapi.testclient import TestClient
 
@@ -388,3 +389,313 @@ def test_legacy_trello_token_migrates_on_first_use(client, monkeypatch):
     t = app.clients_for(store.get_user(ua["id"]))  # fresh row: has trello_token
     assert [label for label, _ in t] == ["trello"]
     assert store.get_account(ua["id"], "trello")["token"] == "ATTAlegacy"
+
+# --- Google Calendar OAuth ---------------------------------------------------
+
+GOOGLE_STATE_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+
+
+class GResp:
+    """Fake response with a status code, for token/calendar endpoints."""
+
+    def __init__(self, payload, status=200):
+        self._payload = payload
+        self.status_code = status
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            e = app.requests.HTTPError(f"HTTP {self.status_code}")
+            e.response = self
+            raise e
+
+    def json(self):
+        return self._payload
+
+
+@pytest.fixture
+def gcal(client, monkeypatch):
+    """Feature gate on, CSRF state and client caches empty."""
+    monkeypatch.setattr(app, "GOOGLE_CLIENT_ID", "cid")
+    monkeypatch.setattr(app, "GOOGLE_CLIENT_SECRET", "secret")
+    monkeypatch.setattr(app, "_google_state", {})
+    monkeypatch.setattr(app, "_gcal", {})
+    return client
+
+
+def google_state_of(client):
+    from urllib.parse import parse_qs, urlparse
+    r = client.get("/app/google/start", follow_redirects=False)
+    return r, parse_qs(urlparse(r.headers["location"]).query)
+
+
+def test_google_start_hidden_when_unconfigured(client):
+    signup(client)
+    assert client.get("/app/google/start", follow_redirects=False).status_code == 404
+
+
+def test_google_start_sends_consent_url_with_state(gcal):
+    signup(gcal)
+    r, q = google_state_of(gcal)
+    assert r.status_code == 303
+    assert r.headers["location"].startswith(GOOGLE_STATE_URL)
+    assert q["client_id"] == ["cid"]
+    assert q["redirect_uri"] == [app.GOOGLE_REDIRECT_URI]
+    assert q["scope"] == [app.GCAL_SCOPE]
+    assert q["response_type"] == ["code"]
+    assert q["access_type"] == ["offline"] and q["prompt"] == ["consent"]
+    state = q["state"][0]
+    assert app._google_state[store.get_user_by_name("tester")["id"]][0] == state
+
+
+def test_google_callback_exchanges_code_and_stores_account(gcal, monkeypatch):
+    signup(gcal)
+    _, q = google_state_of(gcal)
+    posts, gets = [], []
+
+    def fake_post(url, data=None, **kw):
+        posts.append((url, data))
+        return GResp({"access_token": "ACC", "refresh_token": "REF",
+                      "expires_in": 3600})
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+        gets.append(url)
+        return GResp({"value": "Europe/London"})
+
+    monkeypatch.setattr(app.requests, "post", fake_post)
+    monkeypatch.setattr(app.requests, "get", fake_get)
+    r = gcal.get("/app/google/callback", params={"code": "xyz", "state": q["state"][0]},
+                 follow_redirects=False)
+    assert r.status_code == 303 and r.headers["location"] == "/app?google=connected"
+    url, data = posts[0]
+    assert url == app.GOOGLE_TOKEN_URL and data["code"] == "xyz"
+    assert data["redirect_uri"] == app.GOOGLE_REDIRECT_URI
+    assert gets == [f"{app.GCAL_API}/users/me/settings/timezone"]
+    acc = store.get_google_account(store.get_user_by_name("tester")["id"])
+    assert acc["access_token"] == "ACC" and acc["refresh_token"] == "REF"
+    assert acc["timezone"] == "Europe/London"
+    assert acc["expires_at"] > time.time()
+
+
+def test_google_callback_rejects_wrong_and_reused_state(gcal, monkeypatch):
+    signup(gcal)
+    stored = {}
+
+    def fail_post(url, data=None, **kw):  # the token endpoint must never be hit
+        stored["hit"] = True
+        return GResp({})
+
+    monkeypatch.setattr(app.requests, "post", fail_post)
+    r, q = google_state_of(gcal)
+    bad = gcal.get("/app/google/callback",
+                   params={"code": "xyz", "state": "forged"}, follow_redirects=False)
+    assert bad.status_code == 303
+    assert "expired" in bad.headers["location"]
+    # single use: the real state was consumed by the failed attempt's pop
+    reused = gcal.get("/app/google/callback", params={"code": "xyz", "state": q["state"][0]},
+                      follow_redirects=False)
+    assert "expired" in reused.headers["location"]
+    assert "hit" not in stored
+    assert store.get_google_account(store.get_user_by_name("tester")["id"]) is None
+
+
+def test_google_callback_handles_denial_cleanly(gcal, monkeypatch):
+    signup(gcal)
+    _, q = google_state_of(gcal)
+    monkeypatch.setattr(app.requests, "post",
+                        lambda *a, **kw: pytest.fail("no exchange on denial"))
+    r = gcal.get("/app/google/callback", params={"error": "access_denied"},
+                 follow_redirects=False)
+    assert r.status_code == 303 and "denied" in r.headers["location"]
+    assert store.get_google_account(store.get_user_by_name("tester")["id"]) is None
+    assert gcal.get("/app/google/callback", params={"code": "xyz", "state": q["state"][0]},
+                    follow_redirects=False).status_code == 303  # state still valid
+
+
+def test_google_callback_survives_a_failed_token_exchange(gcal, monkeypatch):
+    signup(gcal)
+    _, q = google_state_of(gcal)
+    monkeypatch.setattr(app.requests, "post",
+                        lambda *a, **kw: GResp({}, status=400))
+    r = gcal.get("/app/google/callback", params={"code": "xyz", "state": q["state"][0]},
+                 follow_redirects=False)
+    assert "refused" in r.headers["location"]
+    assert store.get_google_account(store.get_user_by_name("tester")["id"]) is None
+
+
+def test_gcal_refreshes_an_expired_token_in_place(gcal, monkeypatch):
+    signup(gcal)
+    uid = store.get_user_by_name("tester")["id"]
+    store.save_google_account(uid, "old", "REF", time.time() - 10, "UTC")
+    posts = []
+
+    def fake_post(url, data=None, **kw):
+        posts.append(data)
+        return GResp({"access_token": "new", "expires_in": 3500})
+
+    monkeypatch.setattr(app.requests, "post", fake_post)
+    monkeypatch.setattr(app.requests, "get", lambda *a, **kw: GResp({"items": []}))
+    g = app.Gcal(uid)
+    assert g._token() == "new"
+    assert posts[0]["grant_type"] == "refresh_token"
+    assert posts[0]["refresh_token"] == "REF"
+    row = store.get_google_account(uid)
+    assert row["access_token"] == "new" and row["refresh_token"] == "REF"
+    assert row["expires_at"] > time.time()
+
+
+def test_gcal_untouched_token_skips_the_refresh(gcal, monkeypatch):
+    signup(gcal)
+    uid = store.get_user_by_name("tester")["id"]
+    store.save_google_account(uid, "live", "REF", time.time() + 3600, "UTC")
+
+    def fail_post(*a, **kw):
+        pytest.fail("no refresh while the token is fresh")
+
+    monkeypatch.setattr(app.requests, "post", fail_post)
+    monkeypatch.setattr(app.requests, "get", lambda *a, **kw: GResp({"items": []}))
+    assert app.Gcal(uid)._token() == "live"
+
+
+def test_gcal_invalid_grant_deletes_the_row_and_raises(gcal, monkeypatch):
+    signup(gcal)
+    uid = store.get_user_by_name("tester")["id"]
+    store.save_google_account(uid, "old", "REF", time.time() - 10, "UTC")
+    monkeypatch.setattr(app.requests, "post",
+                        lambda *a, **kw: GResp({"error": "invalid_grant"}, status=400))
+    with pytest.raises(app.GcalDisconnected):
+        app.Gcal(uid)._token()
+    assert store.get_google_account(uid) is None
+
+
+def test_gcal_events_day_window_uses_the_stored_timezone(gcal, monkeypatch):
+    signup(gcal)
+    uid = store.get_user_by_name("tester")["id"]
+    store.save_google_account(uid, "live", "REF", time.time() + 3600, "Asia/Tokyo")
+    seen = {}
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+        seen.update(url=url, params=params, auth=headers["Authorization"])
+        return GResp({"items": [
+            {"start": {"dateTime": "2030-01-15T10:00:00+09:00"}, "summary": "Standup"},
+            {"start": {"date": "2030-01-15"}, "summary": "Off skiing"},
+        ]})
+
+    monkeypatch.setattr(app.requests, "get", fake_get)
+    events = app.Gcal(uid).events("2030-01-15")
+    assert seen["url"] == f"{app.GCAL_API}/calendars/primary/events"
+    assert seen["params"]["timeMin"] == "2030-01-15T00:00:00+09:00"
+    assert seen["params"]["timeMax"] == "2030-01-16T00:00:00+09:00"
+    assert seen["params"]["singleEvents"] == "true"
+    assert seen["auth"] == "Bearer live"
+    assert events == [{"start": "2030-01-15T10:00:00+09:00", "title": "Standup"},
+                      {"start": "2030-01-15", "title": "Off skiing"}]
+
+
+def test_gcal_create_event_all_day_and_timed(gcal, monkeypatch):
+    signup(gcal)
+    uid = store.get_user_by_name("tester")["id"]
+    store.save_google_account(uid, "live", "REF", time.time() + 3600, "Europe/London")
+    bodies = []
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        bodies.append(json)
+        return GResp({"id": "e1"})
+
+    monkeypatch.setattr(app.requests, "post", fake_post)
+    g = app.Gcal(uid)
+    assert g.create_event("Bin day", "2030-06-05")["start"] == {"date": "2030-06-05"}
+    assert bodies[-1]["end"] == {"date": "2030-06-06"}
+    assert g.create_event("Dentist", "2030-06-05", "14:30",
+                          duration_min=45)["start"] == {"dateTime": "2030-06-05T14:30:00+01:00"}
+    assert bodies[-1]["end"] == {"dateTime": "2030-06-05T15:15:00+01:00"}
+
+
+def test_gcal_api_401_deletes_the_row_and_raises(gcal, monkeypatch):
+    signup(gcal)
+    uid = store.get_user_by_name("tester")["id"]
+    store.save_google_account(uid, "live", "REF", time.time() + 3600, "UTC")
+    monkeypatch.setattr(app.requests, "get",
+                        lambda *a, **kw: GResp({}, status=401))
+    with pytest.raises(app.GcalDisconnected):
+        app.Gcal(uid).events("today")
+    assert store.get_google_account(uid) is None
+
+
+class FakeGcal:
+    """Connected stub for tool/prompt tests."""
+
+    connected = True
+    email = "ian@example.com"
+    timezone = "Europe/London"
+
+    def events(self, day):
+        return [{"start": "2030-01-15T10:00:00+09:00", "title": "Standup"}]
+
+    def create_event(self, title, day, when="", duration_min=60):
+        return {"summary": title}
+
+
+def test_execute_tool_speaks_calendar_results(gcal):
+    out = app.execute_tool("gcal_list_events", {"day": "today"}, gcal=FakeGcal())
+    assert out == {"ok": True, "day": "today", "events": [
+        {"when": "10:00", "title": "Standup"}]}
+    out = app.execute_tool("gcal_create_event",
+                           {"title": "Dentist", "day": "tomorrow", "time": "14:30"},
+                           gcal=FakeGcal())
+    assert out["ok"] is True and out["created"] == "Dentist" and out["time"] == "14:30"
+    out = app.execute_tool("gcal_create_event", {"title": "Off", "day": "tomorrow"},
+                           gcal=FakeGcal())
+    assert out["time"] == "all day"
+
+
+def test_bad_day_and_time_reach_the_llm_as_errors(gcal, monkeypatch):
+    signup(gcal)
+    uid = store.get_user_by_name("tester")["id"]
+    store.save_google_account(uid, "live", "REF", time.time() + 3600, "UTC")
+    monkeypatch.setattr(app.requests, "post",
+                        lambda *a, **kw: pytest.fail("bad input never reaches Google"))
+    g = app.Gcal(uid)
+    out = app.execute_tool("gcal_create_event", {"title": "x", "day": "next week"},
+                           gcal=g)
+    assert out["ok"] is False and "next week" in out["detail"]
+    out = app.execute_tool("gcal_create_event",
+                           {"title": "x", "day": "tomorrow", "time": "3pm"}, gcal=g)
+    assert out["ok"] is False and "3pm" in out["detail"]
+
+
+def test_prompt_lists_calendar_only_when_connected(gcal):
+    no_cal = app.build_system_prompt(t=app.Trello("k", "t"))
+    assert "gcal_list_events" not in no_cal
+    assert "calendar isn't set up yet" in no_cal
+    with_cal = app.build_system_prompt(t=app.Trello("k", "t"), gcal=FakeGcal())
+    assert "gcal_list_events" in with_cal
+    assert "Never guess a day or a time" in with_cal
+    assert "timezone Europe/London" in with_cal
+
+
+def test_google_disconnect_revokes_and_deletes(gcal, monkeypatch):
+    signup(gcal)
+    uid = store.get_user_by_name("tester")["id"]
+    store.save_google_account(uid, "ACC", "REF", time.time() + 3600, "UTC")
+    posts = []
+    monkeypatch.setattr(app.requests, "post",
+                        lambda url, data=None, **kw: posts.append((url, data)) or GResp({}))
+    r = gcal.post("/app/google/disconnect")
+    assert r.status_code == 200
+    assert r.json()["calendar"]["connected"] is False
+    assert posts[0][0] == "https://oauth2.googleapis.com/revoke"
+    assert posts[0][1] == {"token": "REF"}
+    assert store.get_google_account(uid) is None
+
+
+def test_google_disconnect_survives_a_dead_revoke(gcal, monkeypatch):
+    signup(gcal)
+    uid = store.get_user_by_name("tester")["id"]
+    store.save_google_account(uid, "ACC", "REF", time.time() + 3600, "UTC")
+
+    def dead(url, data=None, **kw):
+        raise app.requests.ConnectionError("down")
+
+    monkeypatch.setattr(app.requests, "post", dead)
+    assert gcal.post("/app/google/disconnect").status_code == 200
+    assert store.get_google_account(uid) is None

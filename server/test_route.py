@@ -40,7 +40,14 @@ def test_list_boards_tool_keeps_duplicate_names(stocked_trello):
 
 def test_unknown_tool_raises_not_implemented(stocked_trello):
     with pytest.raises(NotImplementedError, match="unknown tool"):
-        app.execute_tool("gcal_list_events", {})
+        app.execute_tool("gcal_what", {})
+
+
+def test_calendar_tool_without_a_connection_says_disconnected(stocked_trello):
+    out = app.execute_tool("gcal_list_events", {"day": "today"})
+    assert out == {"ok": False, "error": "calendar_disconnected"}
+    out = app.execute_tool("gcal_create_event", {"title": "x", "day": "today"})
+    assert out == {"ok": False, "error": "calendar_disconnected"}
 
 
 def test_create_card_tool_defaults_desc_to_empty(monkeypatch, stocked_trello):

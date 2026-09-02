@@ -3,10 +3,11 @@ import pytest
 
 import store
 from store import (accounts_for, add_account, count_users, create_user,
-                   delete_account, get_account, get_user, get_user_by_name,
-                   get_user_by_token, hash_password, list_users, migrate_accounts,
-                   new_api_token, set_admin, set_password, set_trello_token,
-                   verify_password)
+                   delete_account, delete_google_account, get_account,
+                   get_google_account, get_user, get_user_by_name,
+                   get_user_by_token, hash_password, list_users,
+                   migrate_accounts, new_api_token, save_google_account,
+                   set_admin, set_password, set_trello_token, verify_password)
 
 
 @pytest.fixture(autouse=True)
@@ -104,3 +105,22 @@ def test_migrate_accounts_copies_legacy_tokens_once():
     set_trello_token(u["id"], "ATTAother")
     migrate_accounts()
     assert [a["label"] for a in accounts_for(u["id"])] == ["trello", "work"]
+
+
+def test_google_account_save_get_delete():
+    u = create_user("ian", "hunter2hunter")
+    v = create_user("jenni", "hunter2hunter")
+    assert get_google_account(u["id"]) is None  # absent before connect
+    save_google_account(u["id"], "access1", "refresh1", 1234.5, "Europe/London")
+    acc = get_google_account(u["id"])
+    assert acc["access_token"] == "access1" and acc["refresh_token"] == "refresh1"
+    assert acc["expires_at"] == 1234.5 and acc["timezone"] == "Europe/London"
+    # re-save replaces the single row (reconnecting the calendar)
+    save_google_account(u["id"], "access2", "refresh2", 5678.0, "America/New_York")
+    acc = get_google_account(u["id"])
+    assert acc["access_token"] == "access2" and acc["expires_at"] == 5678.0
+    # rows are strictly per user
+    assert get_google_account(v["id"]) is None
+    assert delete_google_account(u["id"]) is True
+    assert delete_google_account(u["id"]) is False  # already gone
+    assert get_google_account(u["id"]) is None

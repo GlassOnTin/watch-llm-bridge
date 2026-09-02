@@ -18,7 +18,9 @@ import os
 import re
 import secrets
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from urllib.parse import quote, urlencode
+from zoneinfo import ZoneInfo
 
 import pyotp
 import requests
@@ -46,6 +48,17 @@ INVITE_CODE = os.environ.get("INVITE_CODE", "")
 SESSION_SECRET = os.environ.get("SESSION_SECRET", "") or secrets.token_hex(32)
 OWNER_USERNAME = os.environ.get("OWNER_USERNAME", "ian")
 OWNER_PASSWORD = os.environ.get("OWNER_PASSWORD", "")
+# Google Calendar OAuth (one connection per user). Unset = the calendar is
+# simply absent: no dashboard card, no tools. The redirect URI must match the
+# OAuth client in Google Cloud Console exactly.
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+GOOGLE_REDIRECT_URI = os.environ.get(
+    "GOOGLE_REDIRECT_URI", "https://bridge.upperpeas.com/app/google/callback")
+GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GCAL_API = "https://www.googleapis.com/calendar/v3"
+GCAL_SCOPE = "https://www.googleapis.com/auth/calendar.events"
 
 TRELLO_API = "https://api.trello.com/1"
 
@@ -162,6 +175,156 @@ def trello_for(user: dict) -> Trello | None:
     return clients[0][1] if clients else None
 
 
+# --- Google Calendar: hand-rolled OAuth 2.0, one connection per user ---------
+# Unlike Trello's paste-a-token flow, Google needs an authorization redirect:
+# /app/google/start sends the user to consent, /app/google/callback trades the
+# code for tokens, and the refresh token is refreshed-on-use from then on.
+
+class GcalDisconnected(Exception):
+    """The stored Google grant is gone (revoked, or the refresh token expired
+    because the consent screen is still in Testing)."""
+
+
+class Gcal:
+    """Minimal Google Calendar client on top of a stored OAuth grant."""
+
+    def __init__(self, user_id: int):
+        self.user_id = user_id
+        self.account = store.get_google_account(user_id) or {}
+        self.timezone = self.account.get("timezone", "UTC")
+        self.email = ""
+
+    @property
+    def connected(self) -> bool:
+        return bool(self.account)
+
+    def _token(self) -> str:
+        """A live access token, refreshing and persisting it near expiry."""
+        if not self.account:
+            raise GcalDisconnected()
+        if self.account["expires_at"] - 60 < time.time():
+            r = requests.post(GOOGLE_TOKEN_URL, data={
+                "client_id": GOOGLE_CLIENT_ID,
+                "client_secret": GOOGLE_CLIENT_SECRET,
+                "grant_type": "refresh_token",
+                "refresh_token": self.account["refresh_token"],
+            }, timeout=15)
+            if r.status_code != 200:  # invalid_grant: revoked or expired
+                store.delete_google_account(self.user_id)
+                raise GcalDisconnected()
+            payload = r.json()
+            self.account["access_token"] = payload["access_token"]
+            self.account["expires_at"] = time.time() + payload["expires_in"]
+            store.save_google_account(
+                self.user_id, payload["access_token"],
+                self.account["refresh_token"], self.account["expires_at"],
+                self.timezone)
+        return self.account["access_token"]
+
+    def _get(self, path: str, **params) -> dict:
+        try:
+            r = requests.get(f"{GCAL_API}{path}", params=params, headers={
+                "Authorization": f"Bearer {self._token()}"}, timeout=15)
+            r.raise_for_status()
+        except requests.HTTPError as e:
+            # 401/403 here means the grant died under a token we thought alive.
+            if e.response is not None and e.response.status_code in (401, 403):
+                store.delete_google_account(self.user_id)
+                raise GcalDisconnected() from e
+            raise
+        return r.json()
+
+    def refresh(self) -> None:
+        """Validate the grant and load the account email and calendar timezone."""
+        self.email = self._get("/calendars/primary").get("id", "")
+        self.timezone = self._get("/users/me/settings/timezone")["value"]
+
+    def events(self, day: str) -> list[dict]:
+        """The day's events, in order: [{start: iso, title: str}]."""
+        tz = ZoneInfo(self.timezone)
+        start = parse_day(day, tz)
+        end = start + timedelta(days=1)
+        data = self._get("/calendars/primary/events", timeMin=start.isoformat(),
+                         timeMax=end.isoformat(), singleEvents="true",
+                         orderBy="startTime", maxResults="25")
+        return [
+            {"start": e["start"].get("dateTime") or e["start"].get("date", ""),
+             "title": e.get("summary", "(untitled)")}
+            for e in data.get("items", [])
+        ]
+
+    def create_event(self, title: str, day: str, when: str = "",
+                     duration_min: int = 60) -> dict:
+        """Create on the primary calendar; no `when` means an all-day event."""
+        tz = ZoneInfo(self.timezone)
+        start = parse_day(day, tz)
+        body: dict = {"summary": title}
+        if when:
+            hour, minute = parse_time(when)
+            start = start.replace(hour=hour, minute=minute)
+            end = start + timedelta(minutes=duration_min)
+            body["start"] = {"dateTime": start.isoformat()}
+            body["end"] = {"dateTime": end.isoformat()}
+        else:
+            end = start + timedelta(days=1)
+            body["start"] = {"date": start.date().isoformat()}
+            body["end"] = {"date": end.date().isoformat()}
+        try:
+            r = requests.post(f"{GCAL_API}/calendars/primary/events", json=body,
+                              headers={"Authorization": f"Bearer {self._token()}"},
+                              timeout=15)
+            r.raise_for_status()
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code in (401, 403):
+                store.delete_google_account(self.user_id)
+                raise GcalDisconnected() from e
+            raise
+        return body
+
+
+def parse_day(day: str, tz) -> datetime:
+    """The day's midnight in the user's timezone: today/tomorrow/yesterday or
+    YYYY-MM-DD. Anything else raises KeyError with what was actually said."""
+    text = (day or "today").strip().lower()
+    now = datetime.now(tz)
+    if text in ("", "today"):
+        return now.replace(hour=0, minute=0, second=0, microsecond=0)
+    steps = {"tomorrow": 1, "yesterday": -1}
+    if text in steps:
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        return start + timedelta(days=steps[text])
+    try:
+        return datetime.strptime(text, "%Y-%m-%d").replace(tzinfo=tz)
+    except ValueError:
+        raise KeyError(f"calendar day '{day}' is not today, tomorrow, "
+                       "yesterday or YYYY-MM-DD") from None
+
+
+def parse_time(when: str) -> tuple[int, int]:
+    """(hour, minute) of the 24-hour HH:MM time the LLM converts spoken words
+    into. Anything else raises KeyError with what was actually said."""
+    try:
+        t = datetime.strptime((when or "").strip(), "%H:%M")
+        return t.hour, t.minute
+    except ValueError:
+        raise KeyError(f"calendar time '{when}' is not HH:MM") from None
+
+
+_gcal: dict[int, Gcal] = {}
+
+
+def gcal_for(user: dict) -> Gcal:
+    """The user's calendar client. First use after a restart re-validates the
+    grant and reloads the timezone; unconnected users get an empty client."""
+    g = _gcal.get(user["id"])
+    if g is None:
+        g = Gcal(user["id"])
+        if g.connected:
+            g.refresh()
+            _gcal[user["id"]] = g
+    return g
+
+
 def require_user(authorization: str) -> dict:
     """Resolve the Authorization header to a user row; 401 on anything else."""
     token = authorization.removeprefix("Bearer ").strip()
@@ -260,7 +423,17 @@ def command(cmd: Command, authorization: str = Header(default="")) -> dict:
         return {"reply": "Trello is unreachable right now."}
     if t is None:
         return {"reply": "Your Trello isn't connected yet. Open the bridge dashboard to connect it."}
-    return {"reply": route(cmd.text, clients=clients_for(user))}
+    g = None
+    if google_configured():
+        try:
+            g = gcal_for(user)
+            if not g.connected:
+                g = None
+        except (GcalDisconnected, requests.RequestException) as e:
+            logging.getLogger("uvicorn.error").warning(
+                "Calendar for %s failed: %s", user["username"], e)
+            g = None
+    return {"reply": route(cmd.text, clients=clients_for(user), gcal=g)}
 
 
 def route(text: str) -> str:
@@ -348,9 +521,52 @@ TOOLS = [
     },
 ]
 
+GCAL_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "gcal_list_events",
+            "description": "Read the day's events on the user's Google Calendar.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "day": {"type": "string",
+                            "description": "today, tomorrow, yesterday, or YYYY-MM-DD"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "gcal_create_event",
+            "description": "Create an event on the user's Google Calendar.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "day": {"type": "string",
+                            "description": "today, tomorrow, yesterday, or YYYY-MM-DD"},
+                    "time": {"type": "string",
+                             "description": "24-hour HH:MM start time; omit for all-day"},
+                    "duration": {"type": "number",
+                                 "description": "length in minutes; default 60"},
+                },
+                "required": ["title", "day"],
+            },
+        },
+    },
+]
+
+
+def tools_for(gcal: Gcal | None = None) -> list[dict]:
+    """The tools this user's agent gets: calendar tools only once connected."""
+    return TOOLS + (GCAL_TOOLS if gcal is not None and gcal.connected else [])
+
 
 def build_system_prompt(t: Trello | None = None,
-                        clients: list[tuple[str, Trello]] | None = None) -> str:
+                        clients: list[tuple[str, Trello]] | None = None,
+                        gcal: Gcal | None = None) -> str:
     clients = clients if clients is not None else [(None, t or trello)]
     multi = len(clients) > 1
     lines = []
@@ -359,6 +575,10 @@ def build_system_prompt(t: Trello | None = None,
             names = " | ".join(n for n, _ in c.lists_by_board.get(bid, []))
             lines.append(f"- account '{label}', board '{board}': {names}"
                          if multi else f"- board '{board}': {names}")
+    calendar = gcal if gcal is not None and gcal.connected else None
+    if calendar:
+        lines.append(f"- calendar '{calendar.email or 'primary'}': "
+                     f"timezone {calendar.timezone}")
     inventory = "\n".join(lines)
     aliases = ", ".join(f'"{k}" means board "{v}"' for k, v in spoken_aliases().items())
     today = datetime.now(timezone.utc).strftime("%A %d %B %Y")
@@ -368,6 +588,26 @@ def build_system_prompt(t: Trello | None = None,
    trello"), pass its label as the account argument; when the tool result has
    pairs, ask which account and board, e.g. "that Food list is on work / Home
    and personal / Plans — which one?". Never guess an account."""
+    tool_lines = [
+        "- trello_create_card(board, list, name, desc) — add a card to a list",
+        "- trello_list_cards(board, list) — read the cards in a list",
+        "- trello_list_boards() — enumerate boards and their lists",
+    ]
+    if calendar:
+        tool_lines += [
+            "- gcal_list_events(day) — read a day's events from the calendar",
+            "- gcal_create_event(title, day, time, duration) — create an event",
+        ]
+    calendar_rule = (
+        """6. Calendar: the user's Google Calendar is connected. "day" is today,
+   tomorrow, yesterday, or YYYY-MM-DD in the user's timezone. Convert spoken
+   times to 24-hour HH:MM ("3pm" is 15:00); when the user gives no time,
+   omit it so the event is all-day. Never guess a day or a time: ask. On a
+   calendar_disconnected result, say their calendar needs reconnecting from
+   the bridge dashboard."""
+        if calendar else
+        """6. Google Calendar is not connected yet. Any calendar or events request gets
+   a brief "calendar isn't set up yet" reply.""")
     return f"""You are the brain of a voice assistant driven from an Apple Watch. Each
 user message is one spoken sentence. Your reply is read aloud, so keep it to
 one or two short sentences of plain words; never mention IDs, JSON, or URLs.
@@ -375,9 +615,7 @@ one or two short sentences of plain words; never mention IDs, JSON, or URLs.
 Today is {today} (UTC).
 
 Tools:
-- trello_create_card(board, list, name, desc) — add a card to a list
-- trello_list_cards(board, list) — read the cards in a list
-- trello_list_boards() — enumerate boards and their lists
+{chr(10).join(tool_lines)}
 
 Exact inventory of boards and lists:
 
@@ -400,8 +638,7 @@ Rules:
    (desc) unless asked.
 5. After a successful tool call, confirm in one short sentence what was
    done, or read the items out as a compact spoken list.
-6. Google Calendar is not connected yet. Any calendar or events request gets
-   a brief "calendar isn't set up yet" reply.
+{calendar_rule}
 7. If the request matches no tool, answer helpfully in a sentence or two.
 {account_rules}"""
 
@@ -450,7 +687,8 @@ def resolve_board(args: dict, list_name: str, t: Trello | None = None,
 
 
 def execute_tool(name: str, args: dict, t: Trello | None = None,
-                 clients: list[tuple[str, Trello]] | None = None) -> dict:
+                 clients: list[tuple[str, Trello]] | None = None,
+                 gcal: Gcal | None = None) -> dict:
     """Dispatch one tool call. KeyError from resolve_target = mismatch."""
     clients = clients if clients is not None else [(None, t or trello)]
     multi = len(clients) > 1
@@ -495,7 +733,38 @@ def execute_tool(name: str, args: dict, t: Trello | None = None,
                     for board, bid in c.boards.items()}
             for label, c in clients
         }
+    if name == "gcal_list_events":
+        if gcal is None or not gcal.connected:
+            return {"ok": False, "error": "calendar_disconnected"}
+        day = args.get("day") or "today"
+        try:
+            events = gcal.events(day)
+        except KeyError as e:
+            return {"ok": False, "error": "bad_day", "detail": e.args[0]}
+        return {"ok": True, "day": day, "events": [
+            {"when": spoken_when(e["start"]), "title": e["title"]} for e in events]}
+    if name == "gcal_create_event":
+        if gcal is None or not gcal.connected:
+            return {"ok": False, "error": "calendar_disconnected"}
+        try:
+            gcal.create_event(args["title"], args.get("day") or "today",
+                              args.get("time", ""), int(args.get("duration") or 60))
+        except KeyError as e:
+            return {"ok": False, "error": "bad_day", "detail": e.args[0]}
+        return {"ok": True, "created": args["title"],
+                "day": args.get("day") or "today",
+                "time": args.get("time") or "all day"}
     raise NotImplementedError(f"unknown tool '{name}'")
+
+
+def spoken_when(start: str) -> str:
+    """An event start as spoken words: 'all day' or a 24-hour HH:MM."""
+    if "T" not in start:
+        return "all day"  # a bare YYYY-MM-DD date from the all-day shape
+    try:
+        return datetime.fromisoformat(start).strftime("%H:%M")
+    except ValueError:
+        return start
 
 
 def spoken_error(message: str, max_candidates: int = 5) -> str:
@@ -512,7 +781,8 @@ def spoken_error(message: str, max_candidates: int = 5) -> str:
 
 
 def route(text: str, t: Trello | None = None,
-          clients: list[tuple[str, Trello]] | None = None) -> str:
+          clients: list[tuple[str, Trello]] | None = None,
+          gcal: Gcal | None = None) -> str:
     """Send the sentence to the LLM; the LLM picks tools, the server keeps
     resolve_target as the fail-loud authority on where cards go. Echoes only
     while no LLM backend is configured (Phase 1 fallback)."""
@@ -520,7 +790,8 @@ def route(text: str, t: Trello | None = None,
     if not (LLM_BASE_URL and LLM_API_KEY and LLM_MODEL):
         return f"echo: {text}"
     messages = [
-        {"role": "system", "content": build_system_prompt(clients=clients)},
+        {"role": "system",
+         "content": build_system_prompt(clients=clients, gcal=gcal)},
         {"role": "user", "content": text},
     ]
     for _ in range(3):
@@ -531,7 +802,7 @@ def route(text: str, t: Trello | None = None,
                 json={
                     "model": LLM_MODEL,
                     "messages": messages,
-                    "tools": TOOLS,
+                    "tools": tools_for(gcal),
                     "tool_choice": "auto",
                     "temperature": 0.1,
                     "max_tokens": 300,
@@ -550,7 +821,8 @@ def route(text: str, t: Trello | None = None,
         for call in calls:
             args = json.loads(call["function"]["arguments"] or "{}")
             try:
-                result = execute_tool(call["function"]["name"], args, clients=clients)
+                result = execute_tool(call["function"]["name"], args,
+                                      clients=clients, gcal=gcal)
             except KeyError as e:
                 return spoken_error(e.args[0])
             messages.append({
@@ -677,11 +949,19 @@ def app_state(user: dict) -> dict:
         "token": user["api_token"],
         "is_admin": is_admin,
         "invite_code": INVITE_CODE if is_admin else "",
+        "google_configured": google_configured(),
         "authorize_url": (
             "https://trello.com/1/authorize?expiration=30days&name=Watch+Bridge"
             f"&scope=read,write&response_type=token&key={TRELLO_KEY}"
         ),
     }
+    if google_configured():
+        try:
+            g = gcal_for(user)
+            state["calendar"] = {"connected": g.connected, "email": g.email,
+                                 "timezone": g.timezone}
+        except (GcalDisconnected, requests.RequestException):
+            state["calendar"] = {"connected": False, "email": "", "timezone": ""}
     if is_admin:
         state["users"] = [
             {"username": u["username"], "is_admin": bool(u["is_admin"]),
@@ -798,6 +1078,95 @@ def disconnect_account(request: Request, label: str) -> dict:
     if not store.delete_account(user["id"], label.strip().lower()):
         raise HTTPException(status_code=404, detail="no account with that name")
     _clients.pop(user["id"], None)
+    return app_state(store.get_user(user["id"]))
+
+
+# --- Google Calendar OAuth: consent redirect, callback, disconnect ----------
+
+# user id -> (state, created); the callback consumes it once. In-memory like
+# _attempts — a restart just means the user clicks Connect again.
+_google_state: dict[int, tuple[str, float]] = {}
+
+
+def google_configured() -> bool:
+    return bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET)
+
+
+def google_start_url(state: str) -> str:
+    return GOOGLE_AUTH_URL + "?" + urlencode({
+        "client_id": GOOGLE_CLIENT_ID,
+        "redirect_uri": GOOGLE_REDIRECT_URI,
+        "response_type": "code",
+        "scope": GCAL_SCOPE,
+        "access_type": "offline",   # a refresh token must come back
+        "prompt": "consent",        # re-issue it even for repeat connections
+        "state": state,
+    })
+
+
+@app.get("/app/google/start")
+def google_start(request: Request):
+    user = require_session(request)
+    if not google_configured():
+        raise HTTPException(status_code=404, detail="calendar not configured")
+    state = secrets.token_urlsafe(16)
+    _google_state[user["id"]] = (state, time.time())
+    return RedirectResponse(google_start_url(state), status_code=303)
+
+
+@app.get("/app/google/callback")
+def google_callback(request: Request, code: str = "", state: str = "",
+                    error: str = ""):
+    user = require_session(request)
+
+    def back(reason: str):
+        return RedirectResponse(f"/app?google_err={quote(reason)}", status_code=303)
+
+    held = _google_state.pop(user["id"], (None, 0.0))  # single use
+    if error:
+        return back("Google denied the connection"
+                    if error == "access_denied" else f"Google error: {error}")
+    if state != held[0] or time.time() - held[1] > 600:
+        return back("that connection attempt expired — try again")
+    if not code:
+        return back("no authorization code came back from Google")
+    try:
+        r = requests.post(GOOGLE_TOKEN_URL, data={
+            "code": code, "client_id": GOOGLE_CLIENT_ID,
+            "client_secret": GOOGLE_CLIENT_SECRET,
+            "redirect_uri": GOOGLE_REDIRECT_URI,
+            "grant_type": "authorization_code"}, timeout=15)
+        r.raise_for_status()
+        payload = r.json()
+        access, refresh = payload["access_token"], payload["refresh_token"]
+    except (requests.RequestException, KeyError):
+        return back("Google refused the token exchange — try connecting again")
+    tz = "UTC"
+    try:
+        r = requests.get(f"{GCAL_API}/users/me/settings/timezone", headers={
+            "Authorization": f"Bearer {access}"}, timeout=15)
+        r.raise_for_status()
+        tz = r.json()["value"]
+    except (requests.RequestException, KeyError):
+        pass  # rare: keep UTC rather than failing the whole connect
+    store.save_google_account(user["id"], access, refresh,
+                              time.time() + payload.get("expires_in", 3600), tz)
+    _gcal.pop(user["id"], None)
+    return RedirectResponse("/app?google=connected", status_code=303)
+
+
+@app.post("/app/google/disconnect")
+def google_disconnect(request: Request) -> dict:
+    user = require_session(request)
+    account = store.get_google_account(user["id"])
+    if account:
+        try:  # best effort: drop the grant server-side too
+            requests.post("https://oauth2.googleapis.com/revoke",
+                          data={"token": account["refresh_token"]}, timeout=15)
+        except requests.RequestException:
+            pass
+    store.delete_google_account(user["id"])
+    _gcal.pop(user["id"], None)
     return app_state(store.get_user(user["id"]))
 
 
@@ -953,6 +1322,7 @@ document.querySelectorAll('input').forEach(i=>i.addEventListener('keydown',e=>{i
 
 DASHBOARD_HTML = STYLE + """<div class="top"><h1>Watch Bridge</h1><span><span id="who" class="sub"></span> · <button class="gear" id="gearbtn" title="Settings">⚙</button> · <a href="/logout">log out</a></span></div>
 <details id="trello" class="dcard"><summary id="trellos"></summary><div class="inner" id="trellobody"></div></details>
+<details id="cald" class="dcard"><summary id="cals"></summary><div class="inner" id="calbody"></div></details>
 <details id="watchd" class="dcard"><summary>⌚ Your watch shortcut</summary><div class="inner" id="watch"></div></details>
 <details id="talkd" class="dcard"><summary>☾ How to talk to it</summary><div class="inner">
  <p class="sub">Speak one sentence. It goes to the LLM agent together with the exact inventory
@@ -964,6 +1334,8 @@ DASHBOARD_HTML = STYLE + """<div class="top"><h1>Watch Bridge</h1><span><span id
   <li>“what's on my shopping list” — reads a list out loud</li>
   <li>“what boards do I have”</li>
   <li>With more than one account connected: “add milk to shopping on my work trello”</li>
+  <li>Once your calendar is connected: “what's on my calendar today” and “put
+      dentists appointment in the calendar tomorrow at 3”</li>
  </ul>
  <p><b>One exchange, up close</b></p>
  <pre>you:    add bin day to chores on my work trello
@@ -980,8 +1352,14 @@ spoken: “Bin day is on the Chores list of Work Stuff.”</pre>
   <li>Read the cards in a list — <code>GET /1/lists/{id}/cards</code></li>
   <li>Enumerate boards and lists — answered from the server's cache</li>
  </ul>
- <p class="sub">Not wired yet: moving or deleting cards, due dates, and Calendar. The agent is
- only given the tools above, so it says it can't do the rest rather than improvising.</p>
+ <p><b>What Calendar supports today</b></p>
+ <ul>
+  <li>Read a day's events — “today”, “tomorrow”, or a date</li>
+  <li>Create an event, timed or all-day — your calendar's own timezone is used</li>
+ </ul>
+ <p class="sub">Not wired yet: moving or deleting cards, due dates, and editing or deleting
+ events. The agent is only given the tools above, so it says it can't do the rest rather
+ than improvising.</p>
 </div></details>
 <details id="invited" class="dcard"><summary>✉ Invite someone</summary><div class="inner" id="invite"></div></details>
 <details id="admind" class="dcard"><summary>✧ Admin</summary><div class="inner" id="admin"></div></details>
@@ -1064,6 +1442,21 @@ async function connect(){
  if(!r.ok){const d=await r.json().catch(()=>({detail:'error '+r.status}));err.textContent=d.detail||'error '+r.status;return}
  render(await r.json());
 }
+function calendarCard(d){
+ if(!d.google_configured)return '';
+ if(!d.calendar||!d.calendar.connected)
+  return `<p class="sub">Connect your Google Calendar to ask “what's on today” and add events
+  by voice. Google shows a consent page; only your calendar events are touched.</p>
+  <a class="btn" href="/app/google/start">Connect Google Calendar</a><span id="calerr"></span>`;
+ return `<p class="sub"><span class="ok">connected</span> — ${esc(d.calendar.email||'primary calendar')}
+  · ${esc(d.calendar.timezone)}</p>
+  <button class="sec" id="caldisc">Disconnect</button><span id="calerr"></span>`;
+}
+async function disconnectGoogle(){
+ if(!confirm('Disconnect your Google Calendar?'))return;
+ const r=await fetch('/app/google/disconnect',{method:'POST'});
+ if(r.ok)render(await r.json());
+}
 async function removeAccount(label){
  if(!confirm('Remove the Trello account "'+label+'"?'))return;
  const r=await fetch('/app/trello?label='+encodeURIComponent(label),{method:'DELETE'});
@@ -1097,6 +1490,17 @@ function render(d){
   :`🔮 Trello — ${d.accounts.length} accounts`;
  document.getElementById('trellobody').innerHTML=trelloCard(d);
  document.getElementById('trello').open=!d.connected;
+ document.getElementById('cals').textContent=!d.google_configured?'':(!d.calendar||!d.calendar.connected)
+  ?'📅 Calendar — connect Google':'📅 Calendar — connected';
+ document.getElementById('calbody').innerHTML=calendarCard(d);
+ document.getElementById('cald').style.display=d.google_configured?'':'none';
+ document.getElementById('cald').open=d.google_configured&&(!d.calendar||!d.calendar.connected);
+ const cd=document.getElementById('caldisc');
+ if(cd)cd.onclick=disconnectGoogle;
+ const q=new URLSearchParams(location.search), ce=document.getElementById('calerr');
+ if(ce&&q.get('google_err'))ce.textContent=q.get('google_err');
+ if(ce&&q.get('google')==='connected'){ce.className='ok';ce.textContent='calendar connected'}
+ if(q.get('google')||q.get('google_err'))history.replaceState(null,'','/app');
  document.getElementById('watch').innerHTML=recipe(d);
  document.getElementById('invite').innerHTML=inviteCard(d);
  document.getElementById('invited').style.display=d.invite_code?'':'none';
