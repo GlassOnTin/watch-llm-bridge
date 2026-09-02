@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS users (
   password_hash TEXT NOT NULL,
   api_token TEXT UNIQUE NOT NULL,
   trello_token TEXT,
+  is_admin INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL
 );
 
@@ -45,6 +46,11 @@ def connect(path: str | None = None) -> sqlite3.Connection:
         _conn.row_factory = sqlite3.Row
         _conn.execute("PRAGMA journal_mode=WAL")
         _conn.executescript(SCHEMA)
+        # SQLite can't add a column IF NOT EXISTS; patch live DBs created
+        # before admins existed.
+        cols = {row[1] for row in _conn.execute("PRAGMA table_info(users)")}
+        if "is_admin" not in cols:
+            _conn.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0")
         _conn.commit()
     return _conn
 
@@ -75,15 +81,15 @@ def new_api_token() -> str:
 
 
 def create_user(username: str, password: str, api_token: str | None = None,
-                trello_token: str | None = None) -> dict:
+                trello_token: str | None = None, is_admin: bool = False) -> dict:
     """Insert a user; raises sqlite3.IntegrityError on duplicate username."""
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     with connect() as db:
         cur = db.execute(
-            "INSERT INTO users (username, password_hash, api_token, trello_token, created_at) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO users (username, password_hash, api_token, trello_token, "
+            "is_admin, created_at) VALUES (?, ?, ?, ?, ?, ?)",
             (username, hash_password(password), api_token or new_api_token(),
-             trello_token, now),
+             trello_token, 1 if is_admin else 0, now),
         )
     return get_user(cur.lastrowid)
 
@@ -105,6 +111,21 @@ def get_user_by_token(api_token: str) -> dict | None:
 
 def count_users() -> int:
     return connect().execute("SELECT COUNT(*) FROM users").fetchone()[0]
+
+
+def list_users() -> list[dict]:
+    """Dashboard-facing summary: no password hashes, no bearer tokens."""
+    rows = connect().execute(
+        "SELECT id, username, is_admin, created_at FROM users ORDER BY id"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def set_admin(user_id: int, is_admin: bool) -> bool:
+    with connect() as db:
+        cur = db.execute("UPDATE users SET is_admin = ? WHERE id = ?",
+                         (1 if is_admin else 0, user_id))
+    return cur.rowcount > 0
 
 
 def set_trello_token(user_id: int, trello_token: str) -> None:

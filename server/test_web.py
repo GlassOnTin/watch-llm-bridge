@@ -202,6 +202,57 @@ def test_invite_code_shown_to_owner_only(client):
     assert s.json()["username"] == "beta"
 
 
+# --- admins -----------------------------------------------------------------
+
+def owner_session(client):
+    owner = store.get_user_by_name(app.OWNER_USERNAME)
+    client.cookies.set(app.SESSION_COOKIE, app.make_session(owner["id"]))
+    return owner
+
+
+def test_owner_is_seeded_and_backfilled_as_admin(client):
+    assert store.get_user_by_name(app.OWNER_USERNAME)["is_admin"] == 1
+    # simulate a live DB created before admins existed
+    store.set_admin(store.get_user_by_name(app.OWNER_USERNAME)["id"], False)
+    app.seed_owner()
+    assert store.get_user_by_name(app.OWNER_USERNAME)["is_admin"] == 1
+
+
+def test_admin_promotes_a_user_and_state_lists_them(client):
+    signup(client, "beta")
+    owner = owner_session(client)  # re-set: signup replaced the session cookie
+    r = client.post("/app/admin", json={"username": "beta", "admin": True})
+    assert r.status_code == 200
+    assert store.get_user_by_name("beta")["is_admin"] == 1
+    state = r.json()
+    assert [u["username"] for u in state["users"]] == [app.OWNER_USERNAME, "beta"]
+    assert state["users"][1]["is_admin"] is True
+    # a promoted user sees the invite code too, though they are not the owner
+    client.cookies.set(app.SESSION_COOKIE, app.make_session(
+        store.get_user_by_name("beta")["id"]))
+    beta_state = client.get("/app/state").json()
+    assert beta_state["invite_code"] == app.INVITE_CODE
+    assert [u["username"] for u in beta_state["users"]] == [app.OWNER_USERNAME, "beta"]
+
+
+def test_non_admin_cannot_promote_or_see_the_user_list(client):
+    signup(client)
+    r = client.post("/app/admin", json={"username": "ian", "admin": True})
+    assert r.status_code == 403
+    state = client.get("/app/state").json()
+    assert "users" not in state
+    assert state["invite_code"] == ""
+
+
+def test_admin_cannot_change_own_status(client):
+    owner = owner_session(client)
+    r = client.post("/app/admin", json={"username": app.OWNER_USERNAME, "admin": False})
+    assert r.status_code == 400
+    assert store.get_user(owner["id"])["is_admin"] == 1
+    r = client.post("/app/admin", json={"username": "ghost", "admin": True})
+    assert r.status_code == 404
+
+
 # --- multiple Trello accounts per user ---
 
 def mkclient(boards, lists):

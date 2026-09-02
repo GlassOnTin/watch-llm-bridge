@@ -204,10 +204,15 @@ def seed_owner() -> None:
     """First boot: turn the single-tenant .env credentials into the owner's
     account so the existing BRIDGE_TOKEN watch shortcut keeps working."""
     if store.count_users():
+        # The named owner is the operator: an admin after any migration.
+        owner = store.get_user_by_name(OWNER_USERNAME)
+        if owner and not owner["is_admin"]:
+            store.set_admin(owner["id"], True)
         return
     password = OWNER_PASSWORD or secrets.token_urlsafe(12)
     owner = store.create_user(OWNER_USERNAME, password,
-                              api_token=BRIDGE_TOKEN, trello_token=TRELLO_TOKEN)
+                              api_token=BRIDGE_TOKEN, trello_token=TRELLO_TOKEN,
+                              is_admin=True)
     store.add_account(owner["id"], "trello", TRELLO_TOKEN)
     _clients[owner["id"]] = {"trello": trello}
     if not OWNER_PASSWORD:
@@ -633,6 +638,11 @@ class PasswordIn(BaseModel):
     new: str
 
 
+class AdminIn(BaseModel):
+    username: str
+    admin: bool
+
+
 def require_session(request: Request) -> dict:
     user = session_user(request)
     if not user:
@@ -656,7 +666,8 @@ def app_state(user: dict) -> dict:
         }
         for label, c in clients
     ]
-    return {
+    is_admin = bool(user["is_admin"])
+    state = {
         "username": user["username"],
         "connected": bool(accounts) and bool(accounts[0]["boards"]),
         "accounts": accounts,
@@ -664,12 +675,20 @@ def app_state(user: dict) -> dict:
         "boards": accounts[0]["boards"] if accounts else {},
         "command_url": COMMAND_URL,
         "token": user["api_token"],
-        "invite_code": INVITE_CODE if user["username"] == OWNER_USERNAME else "",
+        "is_admin": is_admin,
+        "invite_code": INVITE_CODE if is_admin else "",
         "authorize_url": (
             "https://trello.com/1/authorize?expiration=30days&name=Watch+Bridge"
             f"&scope=read,write&response_type=token&key={TRELLO_KEY}"
         ),
     }
+    if is_admin:
+        state["users"] = [
+            {"username": u["username"], "is_admin": bool(u["is_admin"]),
+             "created": u["created_at"]}
+            for u in store.list_users()
+        ]
+    return state
 
 
 @app.get("/")
@@ -791,6 +810,23 @@ def change_password(request: Request, body: PasswordIn) -> dict:
         raise HTTPException(status_code=400, detail="new password must be at least 8 characters")
     store.set_password(user["id"], body.new)
     return {"ok": True}
+
+
+@app.post("/app/admin")
+def set_user_admin(request: Request, body: AdminIn) -> dict:
+    """Promote or demote a user. Admins may not change their own flag, so the
+    last admin can never lock themselves out."""
+    actor = require_session(request)
+    if not actor["is_admin"]:
+        raise HTTPException(status_code=403, detail="admin only")
+    target = store.get_user_by_name(body.username.strip().lower())
+    if not target:
+        raise HTTPException(status_code=404, detail="no such user")
+    if target["id"] == actor["id"]:
+        raise HTTPException(status_code=400, detail="you cannot change your own admin status")
+    store.set_admin(target["id"], body.admin)
+    # the actor's own state: the user list must refresh under the admin's view
+    return app_state(store.get_user(actor["id"]))
 
 
 STYLE = """<!doctype html>
@@ -948,6 +984,7 @@ spoken: “Bin day is on the Chores list of Work Stuff.”</pre>
  only given the tools above, so it says it can't do the rest rather than improvising.</p>
 </div></details>
 <details id="invited" class="dcard"><summary>✉ Invite someone</summary><div class="inner" id="invite"></div></details>
+<details id="admind" class="dcard"><summary>✧ Admin</summary><div class="inner" id="admin"></div></details>
 <details id="settings" class="dcard"><summary>⚙ Settings</summary><div class="inner">
  <div class="card">
   <div class="row"><b>Change password</b></div>
@@ -1037,6 +1074,21 @@ function inviteCard(d){
  return `<p class="sub">Send them this code with the <a href="/signup" target="_blank" rel="noopener">signup page</a>. They connect their own Trello and get their own token.</p>
  <div class="row"><span class="token" style="flex:1">${esc(d.invite_code)}</span><button class="sec" id="invbtn">Copy</button></div>`;
 }
+function adminCard(d){
+ const rows=d.users.map(u=>`
+  <div class="kv"><span class="k">${esc(u.username)}${u.is_admin?' ✦':''}</span>
+   <span class="v" style="color:var(--muted)">${esc(u.created.slice(0,10))}${u.is_admin?' · admin':''}</span>
+   ${u.username===d.username?'':`<button class="sec" data-user="${escA(u.username)}" data-to="${u.is_admin?0:1}">${u.is_admin?'Revoke admin':'Make admin'}</button>`}
+  </div>`).join('');
+ return `<p class="sub">Admins see the invite code and can make other users admin. You cannot change your own status.</p>${rows}`;
+}
+async function setAdmin(username,to){
+ if(!confirm((to?'Make ':'Revoke admin for ')+'"'+username+'"?'))return;
+ const r=await fetch('/app/admin',{method:'POST',headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({username,admin:to})});
+ if(!r.ok)return;
+ render(await r.json());
+}
 function render(d){
  document.getElementById('who').textContent=d.username;
  document.getElementById('trellos').textContent=!d.accounts.length
@@ -1050,12 +1102,16 @@ function render(d){
  document.getElementById('invited').style.display=d.invite_code?'':'none';
  const ib=document.getElementById('invbtn');
  if(ib)ib.onclick=e=>copy(e.target,d.invite_code);
+ document.getElementById('admin').innerHTML=adminCard(d);
+ document.getElementById('admind').style.display=d.is_admin?'':'none';
 }
 (async()=>{render(await (await fetch('/app/state')).json())})();
 document.getElementById('watch').addEventListener('click',e=>{
  const b=e.target.closest('button.sec'); if(b&&b.dataset.v!==undefined)copy(b,b.dataset.v)});
 document.getElementById('trellobody').addEventListener('click',e=>{
  const b=e.target.closest('button.sec'); if(b&&b.dataset.acc!==undefined)removeAccount(b.dataset.acc)});
+document.getElementById('admin').addEventListener('click',e=>{
+ const b=e.target.closest('button.sec'); if(b&&b.dataset.user!==undefined)setAdmin(b.dataset.user,b.dataset.to==='1')});
 document.getElementById('gearbtn').onclick=()=>{
  const s=document.getElementById('settings'); s.open=true; s.scrollIntoView({behavior:'smooth'})};
 document.addEventListener('keydown',e=>{if(e.key==='Enter'&&e.target.id==='pwcur')pw()});

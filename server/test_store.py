@@ -4,8 +4,9 @@ import pytest
 import store
 from store import (accounts_for, add_account, count_users, create_user,
                    delete_account, get_account, get_user, get_user_by_name,
-                   get_user_by_token, hash_password, migrate_accounts,
-                   new_api_token, set_password, set_trello_token, verify_password)
+                   get_user_by_token, hash_password, list_users, migrate_accounts,
+                   new_api_token, set_admin, set_password, set_trello_token,
+                   verify_password)
 
 
 @pytest.fixture(autouse=True)
@@ -57,6 +58,22 @@ def test_set_trello_token_and_password():
     assert not verify_password("hunter2hunter", get_user(u["id"])["password_hash"])
     assert verify_password("new-password-9", get_user(u["id"])["password_hash"])
     assert count_users() == 1
+
+
+def test_admin_flag_round_trip_and_listing():
+    admin = create_user("ian", "hunter2hunter", is_admin=True)
+    member = create_user("jenni", "hunter2hunter")
+    assert get_user(admin["id"])["is_admin"] == 1
+    assert get_user(member["id"])["is_admin"] == 0
+    assert set_admin(member["id"], True)
+    assert get_user(member["id"])["is_admin"] == 1
+    assert set_admin(member["id"], False)
+    assert get_user(member["id"])["is_admin"] == 0
+    assert not set_admin(999, True)  # no such user
+    users = list_users()
+    assert [u["username"] for u in users] == ["ian", "jenni"]  # insert order
+    assert users[0]["is_admin"] == 1 and users[1]["is_admin"] == 0
+    assert "password_hash" not in users[0] and "api_token" not in users[0]
 
 
 def test_accounts_crud_and_label_uniqueness():
