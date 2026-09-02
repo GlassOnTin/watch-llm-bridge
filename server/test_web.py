@@ -627,6 +627,211 @@ def test_gcal_api_401_deletes_the_row_and_raises(gcal, monkeypatch):
     assert store.get_google_account(uid) is None
 
 
+# --- chosen default calendar --------------------------------------------------
+
+def test_chosen_calendar_sets_every_gcal_path(gcal, monkeypatch):
+    signup(gcal)
+    uid = store.get_user_by_name("tester")["id"]
+    store.save_google_account(uid, "live", "REF", time.time() + 3600, "UTC")
+    store.save_google_calendar(uid, "work@example.com", "Europe/Paris")
+    gets, posts, patches, deletes = [], [], [], []
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+        gets.append(url)
+        return GResp({"items": []})
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        posts.append(url)
+        return GResp({"id": "e9"})
+
+    def fake_patch(url, json=None, headers=None, timeout=None):
+        patches.append(url)
+        return GResp({"id": "e1"})
+
+    def fake_delete(url, headers=None, timeout=None):
+        deletes.append(url)
+        return GResp(None, status=204)
+
+    monkeypatch.setattr(app.requests, "get", fake_get)
+    monkeypatch.setattr(app.requests, "post", fake_post)
+    monkeypatch.setattr(app.requests, "patch", fake_patch)
+    monkeypatch.setattr(app.requests, "delete", fake_delete)
+    g = app.Gcal(uid)
+    assert g.calendar_id == "work@example.com"
+    g.events("2030-01-15")
+    g.create_event("Bin day", "2030-01-15")
+    g.update_event("e1", summary="x")
+    g.delete_event("e1")
+    base = f"{app.GCAL_API}/calendars/work@example.com"
+    assert gets == [f"{base}/events"]
+    assert posts == [f"{base}/events"]
+    assert patches == [f"{base}/events/e1"]
+    assert deletes == [f"{base}/events/e1"]
+    # the primary calendar is never touched once one is chosen
+    assert not any("calendars/primary" in u for u in gets + posts + patches + deletes)
+
+
+def test_gcal_refresh_takes_the_chosen_calendar_name_and_timezone(gcal, monkeypatch):
+    signup(gcal)
+    uid = store.get_user_by_name("tester")["id"]
+    store.save_google_account(uid, "live", "REF", time.time() + 3600, "UTC")
+    store.save_google_calendar(uid, "work@example.com", "Europe/London")
+    seen = []
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+        seen.append(url)
+        if url.endswith("/calendars/work@example.com"):
+            return GResp({"id": "work@example.com", "summary": "Work",
+                          "timeZone": "America/New_York"})
+        return GResp({"value": "Europe/London"})
+
+    monkeypatch.setattr(app.requests, "get", fake_get)
+    g = app.Gcal(uid)
+    g.refresh()
+    assert g.email == "work@example.com"
+    assert g.summary == "Work"
+    assert g.timezone == "America/New_York"
+    assert f"{app.GCAL_API}/users/me/settings/timezone" not in seen
+
+
+def test_chosen_calendar_survives_a_reconnect(gcal, monkeypatch):
+    signup(gcal)
+    uid = store.get_user_by_name("tester")["id"]
+    store.save_google_account(uid, "ACC", "REF", time.time() + 3600, "UTC")
+    store.save_google_calendar(uid, "work@example.com", "Europe/Paris")
+    _, q = google_state_of(gcal)
+    monkeypatch.setattr(app.requests, "post",
+                        lambda url, data=None, **kw:
+                        GResp({"access_token": "ACC2", "refresh_token": "REF2",
+                               "expires_in": 3600}))
+    monkeypatch.setattr(app.requests, "get",
+                        lambda url, params=None, headers=None, timeout=None:
+                        GResp({"value": "Europe/London"}))
+    r = gcal.get("/app/google/callback", params={"code": "xyz", "state": q["state"][0]},
+                 follow_redirects=False)
+    assert r.status_code == 303
+    acc = store.get_google_account(uid)
+    assert acc["access_token"] == "ACC2"
+    assert acc["calendar_id"] == "work@example.com"
+
+
+def test_gcal_calendars_lists_the_account_calendarlist(gcal, monkeypatch):
+    signup(gcal)
+    uid = store.get_user_by_name("tester")["id"]
+    store.save_google_account(uid, "live", "REF", time.time() + 3600, "UTC")
+    listing = {"items": [
+        {"id": "ian@example.com", "summary": "ian@example.com",
+         "primary": True, "accessRole": "owner"},
+        {"id": "work@example.com", "summary": "Work", "accessRole": "owner"},
+        {"id": "holidays@group.calendar.google.com", "summary": "Holidays",
+         "accessRole": "freeBusyReader"},
+    ]}
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+        assert url == f"{app.GCAL_API}/users/me/calendarList"
+        assert params["minAccessRole"] == "reader"
+        return GResp(listing)
+
+    monkeypatch.setattr(app.requests, "get", fake_get)
+    out = app.Gcal(uid).calendars()
+    assert out == [
+        {"id": "ian@example.com", "summary": "ian@example.com",
+         "primary": True, "accessRole": "owner"},
+        {"id": "work@example.com", "summary": "Work",
+         "primary": False, "accessRole": "owner"},
+        {"id": "holidays@group.calendar.google.com", "summary": "Holidays",
+         "primary": False, "accessRole": "freeBusyReader"},
+    ]
+
+
+def test_picker_routes_list_and_choose(gcal, monkeypatch):
+    signup(gcal)
+    user = store.get_user_by_name("tester")
+    uid = user["id"]
+    store.save_google_account(uid, "live", "REF", time.time() + 3600, "UTC")
+    app._gcal.pop(uid, None)
+    listing = {"items": [
+        {"id": "ian@example.com", "summary": "ian@example.com",
+         "primary": True, "accessRole": "owner"},
+        {"id": "work@example.com", "summary": "Work", "accessRole": "owner"},
+        {"id": "holidays@group.calendar.google.com", "summary": "Holidays",
+         "accessRole": "freeBusyReader"},
+    ]}
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+        if url.endswith("/users/me/calendarList"):
+            return GResp(listing)
+        if url.endswith("/calendars/work@example.com"):
+            return GResp({"id": "work@example.com", "summary": "Work",
+                          "timeZone": "Europe/Paris"})
+        if url.endswith("/users/me/settings/timezone"):
+            return GResp({"value": "Europe/London"})
+        return GResp({"id": url, "summary": url})
+
+    monkeypatch.setattr(app.requests, "get", fake_get)
+
+    r = gcal.get("/app/google/calendars")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["current"] == "primary"
+    assert [c["id"] for c in body["calendars"]] == [
+        "ian@example.com", "work@example.com",
+        "holidays@group.calendar.google.com"]
+
+    old = app._gcal[uid]
+    r = gcal.post("/app/google/calendar", json={"id": "work@example.com"})
+    assert r.status_code == 200
+    assert r.json()["calendar"]["calendar_id"] == "work@example.com"
+    assert r.json()["calendar"]["timezone"] == "Europe/Paris"
+    acc = store.get_google_account(uid)
+    assert acc["calendar_id"] == "work@example.com"
+    assert acc["timezone"] == "Europe/Paris"
+    # app_state() re-caches a Gcal, but it must be a fresh one reading the
+    # chosen calendar, not the instance that pointed at primary
+    assert app._gcal.get(uid) is not old
+
+
+def test_picker_refuses_unknown_and_freebusy_calendars(gcal, monkeypatch):
+    signup(gcal)
+    user = store.get_user_by_name("tester")
+    uid = user["id"]
+    store.save_google_account(uid, "live", "REF", time.time() + 3600, "UTC")
+    app._gcal.pop(uid, None)
+    listing = {"items": [
+        {"id": "ian@example.com", "summary": "ian@example.com",
+         "primary": True, "accessRole": "owner"},
+        {"id": "holidays@group.calendar.google.com", "summary": "Holidays",
+         "accessRole": "freeBusyReader"},
+    ]}
+    def fake_get(url, params=None, headers=None, timeout=None):
+        if url.endswith("/users/me/calendarList"):
+            return GResp(listing)
+        # refresh() reads /calendars/primary before the picker logic runs
+        if url.endswith("/calendars/primary"):
+            return GResp({"id": "ian@example.com", "summary": "ian@example.com",
+                          "timeZone": "Europe/London"})
+        return GResp(listing)
+
+    monkeypatch.setattr(app.requests, "get", fake_get)
+    r = gcal.post("/app/google/calendar", json={"id": "nope@example.com"})
+    assert r.status_code == 404
+    assert store.get_google_account(uid)["calendar_id"] == "primary"
+    r = gcal.post("/app/google/calendar",
+                  json={"id": "holidays@group.calendar.google.com"})
+    assert r.status_code == 400
+    assert "free/busy" in r.json()["detail"]
+    assert store.get_google_account(uid)["calendar_id"] == "primary"
+
+
+def test_picker_routes_need_a_connection(gcal):
+    signup(gcal)
+    uid = store.get_user_by_name("tester")["id"]
+    app._gcal.pop(uid, None)  # stale cache from another test's DB
+    assert gcal.get("/app/google/calendars").status_code == 409
+    assert gcal.post("/app/google/calendar",
+                     json={"id": "work@example.com"}).status_code == 409
+
+
 GCAL_ITEMS = [
     {"id": "e1", "summary": "Dentist",
      "start": {"dateTime": "2030-01-15T14:30:00+00:00"},
@@ -765,6 +970,7 @@ class FakeGcal:
 
     connected = True
     email = "ian@example.com"
+    summary = "ian@example.com"
     timezone = "Europe/London"
 
     def events(self, day):

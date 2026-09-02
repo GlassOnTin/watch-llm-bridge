@@ -332,7 +332,22 @@ class Gcal:
         self.user_id = user_id
         self.account = store.get_google_account(user_id) or {}
         self.timezone = self.account.get("timezone", "UTC")
+        # The default calendar every tool acts on, chosen in the dashboard.
+        self.calendar_id = self.account.get("calendar_id") or "primary"
         self.email = ""
+        self.summary = ""
+
+    @property
+    def connected(self) -> bool:
+        return bool(self.account)
+
+    def calendars(self) -> list[dict]:
+        """The account's calendar list, trimmed to what the picker needs."""
+        items = self._get("/users/me/calendarList", minAccessRole="reader") \
+            .get("items", [])
+        return [{"id": e["id"], "summary": e.get("summary", ""),
+                 "primary": e.get("primary", False),
+                 "accessRole": e.get("accessRole", "")} for e in items]
 
     @property
     def connected(self) -> bool:
@@ -399,9 +414,16 @@ class Gcal:
         return self._send("DELETE", path)
 
     def refresh(self) -> None:
-        """Validate the grant and load the account email and calendar timezone."""
-        self.email = self._get("/calendars/primary").get("id", "")
-        self.timezone = self._get("/users/me/settings/timezone")["value"]
+        """Validate the grant and load the default calendar's name, timezone
+        and id. The calendar's own timezone wins when it has one; the account
+        default covers calendars without one."""
+        cal = self._get(f"/calendars/{self.calendar_id}")
+        self.email = cal.get("id", "")
+        self.summary = cal.get("summary", "")
+        if cal.get("timeZone"):
+            self.timezone = cal["timeZone"]
+        else:
+            self.timezone = self._get("/users/me/settings/timezone")["value"]
 
     def events(self, day: str) -> list[dict]:
         """The day's events, in order: [{start, title, location, description}]."""
@@ -420,7 +442,8 @@ class Gcal:
         start = parse_day(day, tz) if day else \
             datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0)
         end = start + timedelta(days=1 if day else 14)
-        data = self._get("/calendars/primary/events", timeMin=start.isoformat(),
+        data = self._get(f"/calendars/{self.calendar_id}/events",
+                         timeMin=start.isoformat(),
                          timeMax=end.isoformat(), singleEvents="true",
                          orderBy="startTime", maxResults="50")
         return data.get("items", [])
@@ -452,10 +475,11 @@ class Gcal:
 
     def update_event(self, event_id: str, **body) -> dict:
         """PATCH the event: only the keys sent change (Google partial update)."""
-        return self._patch(f"/calendars/primary/events/{event_id}", body) or {}
+        return self._patch(
+            f"/calendars/{self.calendar_id}/events/{event_id}", body) or {}
 
     def delete_event(self, event_id: str) -> dict:
-        self._delete(f"/calendars/primary/events/{event_id}")
+        self._delete(f"/calendars/{self.calendar_id}/events/{event_id}")
         return {"id": event_id}
 
     def create_event(self, title: str, day: str, when: str = "",
@@ -485,7 +509,7 @@ class Gcal:
             end = start + timedelta(days=1)
             body["start"] = {"date": start.date().isoformat()}
             body["end"] = {"date": end.date().isoformat()}
-        return self._post("/calendars/primary/events", body) or body
+        return self._post(f"/calendars/{self.calendar_id}/events", body) or body
 
 
 def parse_day(day: str, tz) -> datetime:
@@ -970,7 +994,8 @@ def build_system_prompt(t: Trello | None = None,
                          if multi else f"- board '{board}': {names}")
     calendar = gcal if gcal is not None and gcal.connected else None
     if calendar:
-        lines.append(f"- calendar '{calendar.email or 'primary'}': "
+        name = calendar.summary or calendar.email or "primary"
+        lines.append(f"- calendar '{name}' (the default one): "
                      f"timezone {calendar.timezone}")
     inventory = "\n".join(lines)
     aliases = ", ".join(f'"{k}" means board "{v}"' for k, v in spoken_aliases().items())
@@ -1788,10 +1813,14 @@ def app_state(user: dict) -> dict:
     if google_configured():
         try:
             g = gcal_for(user)
-            state["calendar"] = {"connected": g.connected, "email": g.email,
-                                 "timezone": g.timezone}
+            state["calendar"] = {
+                "connected": g.connected, "email": g.email,
+                "summary": g.summary, "timezone": g.timezone,
+                "calendar_id": g.calendar_id,
+            }
         except (GcalDisconnected, requests.RequestException):
-            state["calendar"] = {"connected": False, "email": "", "timezone": ""}
+            state["calendar"] = {"connected": False, "email": "", "summary": "",
+                                 "timezone": "", "calendar_id": "primary"}
     if is_admin:
         state["users"] = [
             {"username": u["username"], "is_admin": bool(u["is_admin"]),
@@ -1842,8 +1871,9 @@ configured by the operator to decide what to do, and actions are carried out
 on the services you connected.</p>
 <p>What it never does: load remote content in your browser, track you, or
 share your data with anyone else. Google is told only that this app may read
-and add events on your primary calendar. Disconnecting a service from the
-dashboard deletes its stored token (and revokes the Google grant).</p>
+and add events on your calendars; you choose which one is the default in the
+dashboard. Disconnecting a service from the dashboard deletes its stored
+token (and revokes the Google grant).</p>
 <p>Operator contact: the person who gave you your invite code.</p>
 """ + FOOTER + """
 </body></html>"""
@@ -2036,6 +2066,66 @@ def google_disconnect(request: Request) -> dict:
     return app_state(store.get_user(user["id"]))
 
 
+# --- default-calendar picker --------------------------------------------------
+# Voice commands act on one calendar per user. Until they pick one it is
+# "primary"; the choice is stored with the grant and survives reconnects.
+
+class CalendarPickIn(BaseModel):
+    id: str
+
+
+def _live_gcal(request: Request) -> tuple[dict, Gcal]:
+    """A signed-in user with a working grant; 409 with a plain reason else."""
+    user = require_session(request)
+    try:
+        g = gcal_for(user)
+    except (GcalDisconnected, requests.RequestException):
+        g = Gcal(user["id"])  # no grant / grant died: treat as unconnected
+    if not g.connected:
+        raise HTTPException(status_code=409,
+                            detail="connect your Google Calendar first")
+    return user, g
+
+
+@app.get("/app/google/calendars")
+def google_calendars(request: Request) -> dict:
+    user, g = _live_gcal(request)
+    try:
+        items = g.calendars()
+    except (GcalDisconnected, requests.RequestException):
+        raise HTTPException(
+            status_code=409, detail="couldn't list your calendars — try again")
+    return {"current": g.calendar_id, "calendars": items}
+
+
+@app.post("/app/google/calendar")
+def choose_google_calendar(request: Request, body: CalendarPickIn) -> dict:
+    """Set the default calendar. The id must be one of the account's own
+    calendars; free/busy-only ones are refused because no event could ever
+    be read from or written to them."""
+    user, g = _live_gcal(request)
+    wanted = body.id.strip()
+    try:
+        entries = g.calendars()
+    except (GcalDisconnected, requests.RequestException):
+        raise HTTPException(
+            status_code=409, detail="couldn't check your calendars — try again")
+    entry = next((e for e in entries if e["id"] == wanted), None)
+    if entry is None:
+        raise HTTPException(
+            status_code=404, detail="that calendar is not on this Google account")
+    if entry["accessRole"] == "freeBusyReader":
+        raise HTTPException(
+            status_code=400, detail="that calendar is free/busy only — pick one with events")
+    try:
+        tz = g._get(f"/calendars/{wanted}").get("timeZone") or g.timezone
+    except (GcalDisconnected, requests.RequestException):
+        tz = g.timezone  # rare: keep the account timezone rather than failing
+    store.save_google_calendar(user["id"], wanted, tz)
+    _gcal.pop(user["id"], None)
+    return app_state(store.get_user(user["id"]))
+
+
 @app.post("/app/password")
 def change_password(request: Request, body: PasswordIn) -> dict:
     user = require_session(request)
@@ -2095,7 +2185,7 @@ STYLE = """<!doctype html>
  .card{background:rgba(31,19,53,.85);border:1px solid var(--border);border-radius:14px;padding:18px;margin:16px 0;
   box-shadow:0 0 0 1px rgba(201,160,255,.06),0 6px 24px rgba(0,0,0,.35)}
  .card b{color:var(--accent2)}
- input{width:100%;background:var(--code);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:10px 12px;font-family:var(--mono);font-size:.95rem;margin:6px 0}
+ input,select{width:100%;background:var(--code);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:10px 12px;font-family:var(--mono);font-size:.95rem;margin:6px 0}
  input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 8px rgba(201,160,255,.35)}
  button{background:linear-gradient(180deg,#c9a0ff,#a874e8);color:#1a0f30;border:1px solid var(--accent);border-radius:8px;padding:10px 22px;font-family:var(--serif);font-weight:700;cursor:pointer;margin-top:10px;letter-spacing:.03em}
  button:hover{box-shadow:0 0 14px rgba(201,160,255,.5)}
@@ -2235,6 +2325,8 @@ spoken: “Bin day is on the Chores list of Work Stuff.”</pre>
   <li>Edit or move an event — rename, new day, new time</li>
   <li>Delete an event — after the agent confirms with you</li>
   <li>Create an event, timed or all-day — your calendar's own timezone is used</li>
+  <li>All of the above happen on the default calendar you pick in the Calendar
+      section above (primary until you change it)</li>
  </ul>
  <p class="sub">Closing a card is an archive, so it can be brought back; a calendar event is
  deleted for real, which is why the agent asks before it deletes. The agent is only given
@@ -2327,9 +2419,36 @@ function calendarCard(d){
   return `<p class="sub">Connect your Google Calendar to ask “what's on today” and add events
   by voice. Google shows a consent page; only your calendar events are touched.</p>
   <a class="btn" href="/app/google/start">Connect Google Calendar</a><span id="calerr"></span>`;
- return `<p class="sub"><span class="ok">connected</span> — ${esc(d.calendar.email||'primary calendar')}
+ const name=d.calendar.summary||d.calendar.email||'primary calendar';
+ return `<p class="sub"><span class="ok">connected</span> — ${esc(name)}
   · ${esc(d.calendar.timezone)}</p>
+  <div class="kv"><span class="k">Default</span><span class="v" id="calcur">${esc(name)}</span></div>
+  <details ontoggle="loadCalendars()"><summary>Change the default calendar</summary>
+   <p class="sub">Everything the agent does on your calendar — reads, creates, edits,
+   deletes — happens on this calendar. “Primary” is the one named after your account.</p>
+   <div id="callist" class="sub">loading…</div>
+  </details>
   <button class="sec" id="caldisc">Disconnect</button><span id="calerr"></span>`;
+}
+async function loadCalendars(){
+ const box=document.getElementById('callist');
+ if(!box||box.dataset.loaded)return;
+ const r=await fetch('/app/google/calendars');
+ if(!r.ok){box.textContent='could not load your calendars — try again';return}
+ const d=await r.json();
+ if(!d.calendars.length){box.textContent='no calendars found on this account';return}
+ box.innerHTML=`<select id="calpick">${d.calendars.map(c=>
+  `<option value="${escA(c.id)}"${c.id===d.current?' selected':''}>${esc(c.summary||c.id)}${c.accessRole==='reader'?' (read-only)':''}</option>`).join('')}
+ </select><span class="sub" id="calpickerr"></span>`;
+ box.dataset.loaded='1';
+ const sel=document.getElementById('calpick'),err=document.getElementById('calpickerr');
+ sel.onchange=async()=>{
+  err.textContent='';
+  const rr=await fetch('/app/google/calendar',{method:'POST',headers:{'Content-Type':'application/json'},
+   body:JSON.stringify({id:sel.value})});
+  if(rr.ok)render(await rr.json());
+  else{const dd=await rr.json().catch(()=>({detail:'error '+rr.status}));err.textContent=dd.detail||'error '+rr.status;}
+ };
 }
 async function disconnectGoogle(){
  if(!confirm('Disconnect your Google Calendar?'))return;

@@ -7,7 +7,8 @@ from store import (accounts_for, add_account, count_users, create_user,
                    get_google_account, get_user, get_user_by_name,
                    get_user_by_token, hash_password, list_users,
                    migrate_accounts, new_api_token, save_google_account,
-                   set_admin, set_password, set_trello_token, verify_password)
+                   save_google_calendar, set_admin, set_password,
+                   set_trello_token, verify_password)
 
 
 @pytest.fixture(autouse=True)
@@ -124,3 +125,39 @@ def test_google_account_save_get_delete():
     assert delete_google_account(u["id"]) is True
     assert delete_google_account(u["id"]) is False  # already gone
     assert get_google_account(u["id"]) is None
+
+
+def test_chosen_calendar_defaults_to_primary_and_survives_reconnect():
+    u = create_user("ian", "hunter2hunter")
+    save_google_account(u["id"], "access1", "refresh1", 1234.5, "UTC")
+    acc = get_google_account(u["id"])
+    assert acc["calendar_id"] == "primary"
+    save_google_calendar(u["id"], "work@example.com", "Europe/Paris")
+    acc = get_google_account(u["id"])
+    assert acc["calendar_id"] == "work@example.com"
+    assert acc["timezone"] == "Europe/Paris"
+    # reconnecting mints fresh tokens but keeps the chosen calendar
+    save_google_account(u["id"], "access2", "refresh2", 5678.0, "UTC")
+    acc = get_google_account(u["id"])
+    assert acc["calendar_id"] == "work@example.com"
+    assert acc["timezone"] == "UTC"
+
+
+def test_legacy_google_row_migrates_to_a_primary_calendar_id(tmp_path):
+    """A DB written before the calendar_id column existed still reads, and
+    the migration backfills 'primary' without touching stored tokens."""
+    import sqlite3
+    dbfile = tmp_path / "bridge.db"
+    legacy = sqlite3.connect(dbfile)
+    legacy.executescript(
+        "CREATE TABLE google_accounts (user_id INTEGER PRIMARY KEY,"
+        " access_token TEXT NOT NULL, refresh_token TEXT NOT NULL,"
+        " expires_at REAL NOT NULL, timezone TEXT NOT NULL);"
+        "INSERT INTO google_accounts VALUES (1, 'a', 'r', 1.0, 'UTC');")
+    legacy.commit()
+    legacy.close()
+    store._conn = None
+    store.connect(str(dbfile))
+    acc = store.get_google_account(1)
+    assert acc["calendar_id"] == "primary"
+    assert acc["refresh_token"] == "r"

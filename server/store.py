@@ -39,7 +39,8 @@ CREATE TABLE IF NOT EXISTS google_accounts (
   access_token TEXT NOT NULL,
   refresh_token TEXT NOT NULL,
   expires_at REAL NOT NULL,
-  timezone TEXT NOT NULL
+  timezone TEXT NOT NULL,
+  calendar_id TEXT NOT NULL DEFAULT 'primary'
 )
 """
 
@@ -55,10 +56,14 @@ def connect(path: str | None = None) -> sqlite3.Connection:
         _conn.execute("PRAGMA journal_mode=WAL")
         _conn.executescript(SCHEMA)
         # SQLite can't add a column IF NOT EXISTS; patch live DBs created
-        # before admins existed.
+        # before admins existed, and before a default calendar was choosable.
         cols = {row[1] for row in _conn.execute("PRAGMA table_info(users)")}
         if "is_admin" not in cols:
             _conn.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0")
+        gcols = {row[1] for row in _conn.execute("PRAGMA table_info(google_accounts)")}
+        if gcols and "calendar_id" not in gcols:
+            _conn.execute("ALTER TABLE google_accounts ADD COLUMN "
+                          "calendar_id TEXT NOT NULL DEFAULT 'primary'")
         _conn.commit()
     return _conn
 
@@ -209,18 +214,31 @@ def set_password(user_id: int, password: str) -> None:
 
 # --- Google Calendar OAuth, one connection per user --------------------------
 # One row per user: the Google account is singular (unlike Trello's labelled
-# accounts). expires_at is epoch seconds for the access token.
+# accounts). expires_at is epoch seconds for the access token. calendar_id is
+# the default calendar voice commands act on; it survives reconnects, since
+# re-consenting the Google account should not reset the user's choice.
 
 def save_google_account(user_id: int, access_token: str, refresh_token: str,
                         expires_at: float, tz: str) -> None:
     with connect() as db:
         db.execute(
             "INSERT INTO google_accounts (user_id, access_token, refresh_token, "
-            "expires_at, timezone) VALUES (?, ?, ?, ?, ?) "
+            "expires_at, timezone, calendar_id) VALUES (?, ?, ?, ?, ?, 'primary') "
             "ON CONFLICT(user_id) DO UPDATE SET access_token=excluded.access_token, "
             "refresh_token=excluded.refresh_token, expires_at=excluded.expires_at, "
             "timezone=excluded.timezone",
             (user_id, access_token, refresh_token, expires_at, tz),
+        )
+
+
+def save_google_calendar(user_id: int, calendar_id: str, tz: str) -> None:
+    """Set the default calendar and adopt its timezone (timed events are
+    written in that zone)."""
+    with connect() as db:
+        db.execute(
+            "UPDATE google_accounts SET calendar_id = ?, timezone = ? "
+            "WHERE user_id = ?",
+            (calendar_id, tz, user_id),
         )
 
 
