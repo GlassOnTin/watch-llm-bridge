@@ -58,7 +58,8 @@ GOOGLE_REDIRECT_URI = os.environ.get(
 GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GCAL_API = "https://www.googleapis.com/calendar/v3"
-GCAL_SCOPE = "https://www.googleapis.com/auth/calendar.events"
+GCAL_SCOPE = ("https://www.googleapis.com/auth/calendar.events "
+              "https://www.googleapis.com/auth/calendar.readonly")
 
 TRELLO_API = "https://api.trello.com/1"
 
@@ -229,6 +230,8 @@ class Gcal:
         except requests.HTTPError as e:
             # 401/403 here means the grant died under a token we thought alive.
             if e.response is not None and e.response.status_code in (401, 403):
+                logging.getLogger("uvicorn.error").warning(
+                    "gcal %s -> %s %s", path, e.response.status_code, e.response.text[:200])
                 store.delete_google_account(self.user_id)
                 raise GcalDisconnected() from e
             raise

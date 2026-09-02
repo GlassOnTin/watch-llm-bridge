@@ -401,6 +401,7 @@ class GResp:
     def __init__(self, payload, status=200):
         self._payload = payload
         self.status_code = status
+        self.text = str(payload)
 
     def raise_for_status(self):
         if self.status_code >= 400:
