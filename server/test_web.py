@@ -557,7 +557,7 @@ def test_gcal_untouched_token_skips_the_refresh(gcal, monkeypatch):
     assert app.Gcal(uid)._token() == "live"
 
 
-def test_gcal_invalid_grant_deletes_the_row_and_raises(gcal, monkeypatch):
+def test_gcal_invalid_grant_invalidates_and_raises(gcal, monkeypatch):
     signup(gcal)
     uid = store.get_user_by_name("tester")["id"]
     store.save_google_account(uid, "old", "REF", time.time() - 10, "UTC")
@@ -565,7 +565,9 @@ def test_gcal_invalid_grant_deletes_the_row_and_raises(gcal, monkeypatch):
                         lambda *a, **kw: GResp({"error": "invalid_grant"}, status=400))
     with pytest.raises(app.GcalDisconnected):
         app.Gcal(uid)._token()
-    assert store.get_google_account(uid) is None
+    acc = store.get_google_account(uid)
+    assert acc["refresh_token"] == ""
+    assert not app.Gcal(uid).connected
 
 
 def test_gcal_events_day_window_uses_the_stored_timezone(gcal, monkeypatch):
@@ -616,15 +618,68 @@ def test_gcal_create_event_all_day_and_timed(gcal, monkeypatch):
                                  "timeZone": "Europe/London"}
 
 
-def test_gcal_api_401_deletes_the_row_and_raises(gcal, monkeypatch):
+def test_gcal_api_401_invalidates_the_grant_and_keeps_the_choice(gcal, monkeypatch):
     signup(gcal)
     uid = store.get_user_by_name("tester")["id"]
     store.save_google_account(uid, "live", "REF", time.time() + 3600, "UTC")
+    store.save_google_calendar(uid, "work@example.com", "Europe/Paris")
+    g = app.Gcal(uid)
+    app._gcal[uid] = g
     monkeypatch.setattr(app.requests, "get",
                         lambda *a, **kw: GResp({}, status=401))
     with pytest.raises(app.GcalDisconnected):
-        app.Gcal(uid).events("today")
-    assert store.get_google_account(uid) is None
+        g.events("today")
+    acc = store.get_google_account(uid)
+    assert acc is not None  # the row survives, and the choice with it
+    assert acc["refresh_token"] == "" and acc["access_token"] == ""
+    assert acc["calendar_id"] == "work@example.com"
+    assert not app.Gcal(uid).connected
+    assert app._gcal.get(uid) is None  # the cached client is dropped
+
+
+def test_reconnect_after_grant_death_keeps_the_chosen_calendar(gcal, monkeypatch):
+    signup(gcal)
+    uid = store.get_user_by_name("tester")["id"]
+    store.save_google_account(uid, "live", "REF", time.time() + 3600, "UTC")
+    store.save_google_calendar(uid, "work@example.com", "Europe/Paris")
+    store.invalidate_google_grant(uid)
+    assert not app.Gcal(uid).connected
+    _, q = google_state_of(gcal)
+    monkeypatch.setattr(app.requests, "post",
+                        lambda url, data=None, **kw:
+                        GResp({"access_token": "ACC", "refresh_token": "REF2",
+                               "expires_in": 3600}))
+    monkeypatch.setattr(app.requests, "get",
+                        lambda url, params=None, headers=None, timeout=None:
+                        GResp({"value": "Europe/London"}))
+    r = gcal.get("/app/google/callback",
+                 params={"code": "xyz", "state": q["state"][0]},
+                 follow_redirects=False)
+    assert r.status_code == 303
+    acc = store.get_google_account(uid)
+    assert acc["refresh_token"] == "REF2"
+    assert acc["calendar_id"] == "work@example.com"
+
+
+def test_refresh_falls_back_to_primary_when_the_chosen_calendar_is_gone(gcal, monkeypatch):
+    signup(gcal)
+    uid = seed_gcal_row("UTC")
+    store.save_google_calendar(uid, "gone@example.com", "Europe/Paris")
+    calls = []
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+        calls.append(url)
+        if url.endswith("/calendars/gone@example.com"):
+            return GResp({}, status=404)  # not on this account any more
+        return GResp({"id": "ian@example.com", "summary": "ian@example.com",
+                      "timeZone": "Europe/London"})
+
+    monkeypatch.setattr(app.requests, "get", fake_get)
+    g = app.Gcal(uid)
+    g.refresh()
+    assert g.calendar_id == "primary"
+    assert store.get_google_account(uid)["calendar_id"] == "primary"
+    assert calls[-1].endswith("/calendars/primary")
 
 
 # --- chosen default calendar --------------------------------------------------
@@ -930,7 +985,7 @@ def test_gcal_patch_hits_the_event_url_with_only_the_sent_keys(gcal, monkeypatch
     assert seen["json"] == {"summary": "Optician"}
 
 
-def test_gcal_401_on_patch_deletes_the_row_and_raises(gcal, monkeypatch):
+def test_gcal_401_on_patch_invalidates_and_raises(gcal, monkeypatch):
     signup(gcal)
     seed_gcal_row()
     monkeypatch.setattr(app.requests, "patch",
@@ -938,7 +993,9 @@ def test_gcal_401_on_patch_deletes_the_row_and_raises(gcal, monkeypatch):
     uid = store.get_user_by_name("tester")["id"]
     with pytest.raises(app.GcalDisconnected):
         app.Gcal(uid).update_event("e1", summary="x")
-    assert store.get_google_account(uid) is None
+    acc = store.get_google_account(uid)
+    assert acc["refresh_token"] == ""
+    assert not app.Gcal(uid).connected
 
 
 def test_gcal_create_event_rich_fields(gcal, monkeypatch):

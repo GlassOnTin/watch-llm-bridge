@@ -339,7 +339,7 @@ class Gcal:
 
     @property
     def connected(self) -> bool:
-        return bool(self.account)
+        return bool(self.account and self.account.get("refresh_token"))
 
     def calendars(self) -> list[dict]:
         """The account's calendar list, trimmed to what the picker needs."""
@@ -349,13 +349,16 @@ class Gcal:
                  "primary": e.get("primary", False),
                  "accessRole": e.get("accessRole", "")} for e in items]
 
-    @property
-    def connected(self) -> bool:
-        return bool(self.account)
+    def _grant_died(self) -> None:
+        """The OAuth grant is gone. Invalidate the stored row rather than
+        deleting it, so the chosen default calendar survives until the user
+        reconnects, and drop the cached client."""
+        store.invalidate_google_grant(self.user_id)
+        _gcal.pop(self.user_id, None)
 
     def _token(self) -> str:
         """A live access token, refreshing and persisting it near expiry."""
-        if not self.account:
+        if not self.account or not self.account.get("refresh_token"):
             raise GcalDisconnected()
         if self.account["expires_at"] - 60 < time.time():
             r = requests.post(GOOGLE_TOKEN_URL, data={
@@ -365,7 +368,7 @@ class Gcal:
                 "refresh_token": self.account["refresh_token"],
             }, timeout=15)
             if r.status_code != 200:  # invalid_grant: revoked or expired
-                store.delete_google_account(self.user_id)
+                self._grant_died()
                 raise GcalDisconnected()
             payload = r.json()
             self.account["access_token"] = payload["access_token"]
@@ -397,7 +400,7 @@ class Gcal:
             if e.response is not None and e.response.status_code in (401, 403):
                 logging.getLogger("uvicorn.error").warning(
                     "gcal %s -> %s %s", path, e.response.status_code, e.response.text[:200])
-                store.delete_google_account(self.user_id)
+                self._grant_died()
                 raise GcalDisconnected() from e
             raise
         if method == "DELETE":
@@ -417,7 +420,23 @@ class Gcal:
         """Validate the grant and load the default calendar's name, timezone
         and id. The calendar's own timezone wins when it has one; the account
         default covers calendars without one."""
-        cal = self._get(f"/calendars/{self.calendar_id}")
+        try:
+            cal = self._get(f"/calendars/{self.calendar_id}")
+        except requests.HTTPError as e:
+            # A stored default can outlive the account it belonged to (e.g.
+            # the user reconnects as a different Google account). 404 means
+            # the calendar is not on this account: fall back to primary
+            # instead of failing every calendar call forever.
+            if (e.response is not None and e.response.status_code == 404
+                    and self.calendar_id != "primary"):
+                logging.getLogger("uvicorn.error").warning(
+                    "default calendar %s not on this account; back to primary",
+                    self.calendar_id)
+                store.save_google_calendar(self.user_id, "primary", self.timezone)
+                self.calendar_id = "primary"
+                cal = self._get("/calendars/primary")
+            else:
+                raise
         self.email = cal.get("id", "")
         self.summary = cal.get("summary", "")
         if cal.get("timeZone"):

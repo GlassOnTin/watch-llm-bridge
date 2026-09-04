@@ -242,6 +242,16 @@ def save_google_calendar(user_id: int, calendar_id: str, tz: str) -> None:
         )
 
 
+def invalidate_google_grant(user_id: int) -> None:
+    """The OAuth grant died (revoked or expired server-side). Blank the
+    tokens so the account reads as disconnected, but keep the row: the
+    chosen default calendar survives until the user reconnects."""
+    with connect() as db:
+        db.execute("UPDATE google_accounts SET access_token = '', "
+                   "refresh_token = '', expires_at = 0 WHERE user_id = ?",
+                   (user_id,))
+
+
 def get_google_account(user_id: int) -> dict | None:
     row = connect().execute(
         "SELECT * FROM google_accounts WHERE user_id = ?", (user_id,)

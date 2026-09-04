@@ -5,10 +5,10 @@ import store
 from store import (accounts_for, add_account, count_users, create_user,
                    delete_account, delete_google_account, get_account,
                    get_google_account, get_user, get_user_by_name,
-                   get_user_by_token, hash_password, list_users,
-                   migrate_accounts, new_api_token, save_google_account,
-                   save_google_calendar, set_admin, set_password,
-                   set_trello_token, verify_password)
+                   get_user_by_token, hash_password, invalidate_google_grant,
+                   list_users, migrate_accounts, new_api_token,
+                   save_google_account, save_google_calendar, set_admin,
+                   set_password, set_trello_token, verify_password)
 
 
 @pytest.fixture(autouse=True)
@@ -141,6 +141,18 @@ def test_chosen_calendar_defaults_to_primary_and_survives_reconnect():
     acc = get_google_account(u["id"])
     assert acc["calendar_id"] == "work@example.com"
     assert acc["timezone"] == "UTC"
+
+
+def test_invalidate_google_grant_blanks_tokens_but_keeps_the_choice():
+    u = create_user("ian", "hunter2hunter")
+    save_google_account(u["id"], "access1", "refresh1", 1234.5, "Europe/London")
+    save_google_calendar(u["id"], "work@example.com", "Europe/Paris")
+    invalidate_google_grant(u["id"])
+    acc = get_google_account(u["id"])
+    assert acc["access_token"] == "" and acc["refresh_token"] == ""
+    assert acc["expires_at"] == 0
+    assert acc["calendar_id"] == "work@example.com"
+    assert acc["timezone"] == "Europe/Paris"
 
 
 def test_legacy_google_row_migrates_to_a_primary_calendar_id(tmp_path):
