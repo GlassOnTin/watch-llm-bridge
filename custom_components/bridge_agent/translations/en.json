@@ -1,0 +1,30 @@
+{
+  "title": "Bridge Agent",
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect the bridge",
+        "description": "Point this at your watch-llm-bridge server and paste the bearer token for the user whose calendar and boards this agent should act on.",
+        "data": {
+          "url": "Bridge URL",
+          "token": "Bearer token"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Reconnect the bridge",
+        "description": "The bridge rejected the stored token. Paste a fresh one from the bridge dashboard.",
+        "data": {
+          "token": "Bearer token"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "The bridge rejected that token (401).",
+      "cannot_connect": "Could not reach the bridge. Check the URL and that the server is up."
+    },
+    "abort": {
+      "already_configured": "This bridge URL is already configured.",
+      "reauth_successful": "Token updated."
+    }
+  }
+}

@@ -2,4 +2,5 @@
 .env/
 .env
 __pycache__/
-*.pyc
+*.pyc.venv-ha/
+tests_ha/config/custom_components/bridge_agent

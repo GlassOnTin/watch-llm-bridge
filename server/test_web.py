@@ -1534,6 +1534,24 @@ def test_rest_calendar_picker_needs_a_connection(client):
     assert client.get("/calendars").status_code == 401  # bad token too
 
 
+def test_whoami_names_the_token_owner_without_trello(client):
+    signup(client)
+    user = store.get_user_by_name("tester")
+    r = client.get("/whoami", headers=bearer(user))
+    assert r.status_code == 200
+    assert r.json() == {"username": "tester"}
+    assert client.get("/whoami").status_code == 401
+
+
+def test_command_accepts_a_source_tag(client):
+    signup(client)
+    user = store.get_user_by_name("tester")
+    r = client.post("/command", json={"text": "hello", "source": "home_assistant"},
+                    headers=bearer(user))
+    assert r.status_code == 200
+    assert r.json()["reply"]  # no-Trello users get the connect hint, not an error
+
+
 def test_rest_event_routes_refuse_bad_names(client, monkeypatch):
     user, g = rest_gcal_user(client)
     monkeypatch.setattr(app.requests, "get",

@@ -66,6 +66,9 @@ TRELLO_API = "https://api.trello.com/1"
 
 class Command(BaseModel):
     text: str
+    # Where the command came from (watch shortcut, home_assistant, ...). Only
+    # used for the request log; route logic never sees it.
+    source: str = ""
 
 
 class CardIn(BaseModel):
@@ -664,6 +667,9 @@ def health() -> dict:
 def command(cmd: Command, authorization: str = Header(default="")) -> dict:
     """The watch shortcut's single entry point."""
     user = require_user(authorization)
+    if cmd.source:
+        logging.getLogger("uvicorn.error").info("command from %s for %s",
+                                                cmd.source, user["username"])
     try:
         t = trello_for(user)
     except requests.RequestException as e:
@@ -1563,6 +1569,15 @@ def boards(authorization: str = Header(default="")) -> dict:
         }
         for name, bid in t.boards.items()
     }
+
+
+@app.get("/whoami")
+def whoami(authorization: str = Header(default="")) -> dict:
+    """Prove a bearer token maps to a user without touching Trello: unlike
+    /boards this is 200 for a valid token even when Trello is unconnected,
+    so integrations can verify credentials without a backend dependency."""
+    user = require_user(authorization)
+    return {"username": user["username"]}
 
 
 @app.get("/cards")

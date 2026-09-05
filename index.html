@@ -336,8 +336,19 @@ curl -s "https://api.trello.com/1/boards/$BOARD_ID/lists?key=$TRELLO_KEY&amp;tok
 <p>System prompt carries your board's <em>list names</em>, so "put this in the right list" resolves from a known set rather than guessing. Ambiguity ("which board?") should come back as a spoken question, not a guess.</p>
 <p class="muted">Model choice: any tool-calling endpoint works. A local ollama model is adequate for routing among a handful of well-described tools; hosted APIs are lower-latency. The tool interface is identical either way.</p>
 
+<!-- ============================ HOME ASSISTANT ============================ -->
+<h2 id="ha"><span class="stepno">06</span>Home Assistant</h2>
+<p>The bridge ships as a Home Assistant <em>conversation agent</em> (<code>custom_components/bridge_agent</code> in the repo). Once installed, every HA voice entry point — the phone app, a browser Assist panel, a Home Assistant Voice device, Nabu Casa remote access — dictates into the bridge and speaks the reply back, exactly like the watch shortcut.</p>
+<ol class="steps">
+  <li>Copy <code>custom_components/bridge_agent</code> into your HA <code>config/custom_components/</code> folder and restart Home Assistant. (HACS can install it from a GitHub release zip containing that folder.)</li>
+  <li>Settings → Devices &amp; Services → Add Integration → <strong>Bridge Agent</strong>. Give it the bridge URL and the bearer token of the user it should act as.</li>
+  <li>Open an Assist pipeline and set its <em>conversation agent</em> to <strong>Bridge Agent</strong>.</li>
+</ol>
+<div class="callout"><b>One token, one person.</b> Like a watch, one integration holds one bearer token, so commands run as that user. To act as someone else, configure a second pipeline with their token.</div>
+<p class="muted">Notes: the bridge replies in about two to three seconds, which fits a voice pipeline; the agent never controls HA devices — it only forwards text. HA offers the agent for every language, but the bridge's prompts and aliases are English-only. Google Home/Nest speakers are not supported: post-Gemini routines can't hand free-text dictation to a webhook. Requires HA 2025.9 or newer.</p>
+
 <!-- ============================ TROUBLESHOOTING ============================ -->
-<h2 id="ts"><span class="stepno">06</span>Troubleshooting</h2>
+<h2 id="ts"><span class="stepno">07</span>Troubleshooting</h2>
 <table>
   <tr><th>Symptom</th><th>Likely cause</th></tr>
   <tr><td>Shortcut hangs, then "couldn't connect"</td><td>Not HTTPS, or the server didn't reply fast enough. Add a <code>/health</code> test from this page first.</td></tr>
@@ -346,6 +357,8 @@ curl -s "https://api.trello.com/1/boards/$BOARD_ID/lists?key=$TRELLO_KEY&amp;tok
   <tr><td><code>invalid_grant</code> after ~7 days</td><td>OAuth app still in Testing status. Publish to production, re-run the consent flow.</td></tr>
   <tr><td>Trello <code>401 invalid token</code></td><td>Token expired (check the <code>expiration</code> param used at authorize) or was revoked.</td></tr>
   <tr><td>Card lands in the wrong list</td><td>List names in the system prompt don't match the board. Cache IDs by name and fail loudly on a mismatch rather than defaulting.</td></tr>
+  <tr><td>HA agent says the bridge rejected the token</td><td>The token was rotated — open the integration and re-authenticate, or paste a fresh token from the dashboard.</td></tr>
+  <tr><td>HA agent says the bridge is unreachable</td><td>Check <code>/health</code> on the bridge URL from HA's host network; tunnels or firewalls between HA and the bridge are the usual cause.</td></tr>
 </table>
 
 <footer>

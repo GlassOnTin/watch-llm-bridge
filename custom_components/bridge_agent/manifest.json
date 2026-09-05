@@ -1,0 +1,16 @@
+{
+  "domain": "bridge_agent",
+  "name": "Bridge Agent",
+  "codeowners": ["@GlassOnTin"],
+  "dependencies": ["conversation"],
+  "after_dependencies": ["assist_pipeline"],
+  "config_flow": true,
+  "integration_type": "service",
+  "iot_class": "cloud_polling",
+  "requirements": [],
+  "single_config_entry": true,
+  "documentation": "https://github.com/GlassOnTin/watch-llm-bridge",
+  "issue_tracker": "https://github.com/GlassOnTin/watch-llm-bridge/issues",
+  "version": "1.0.0",
+  "homeassistant": "2025.9.0"
+}
