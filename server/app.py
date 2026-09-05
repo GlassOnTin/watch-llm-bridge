@@ -2589,22 +2589,27 @@ def rate_limited(ip: str, max_per_min: int = 6) -> bool:
 
 
 @app.get("/provision", response_class=HTMLResponse)
-def provision_page() -> str:
+def provision_page(request: Request):
     if not TOTP_SECRET:
         raise HTTPException(status_code=404, detail="provisioning disabled")
-    return PROVISION_HTML
+    if not session_user(request):
+        return RedirectResponse("/login", status_code=303)
+    return HTMLResponse(PROVISION_HTML)
 
 
 @app.post("/provision/verify")
 def provision_verify(req: Request, body: TotpIn) -> dict:
+    """TOTP-gated reveal of the signed-in user's own watch recipe. The code
+    proves physical presence; the session decides whose token is revealed."""
     if not TOTP_SECRET:
         raise HTTPException(status_code=404, detail="provisioning disabled")
+    user = require_session(req)
     if rate_limited(req.client.host):
         raise HTTPException(status_code=429, detail="too many attempts")
     ok = pyotp.TOTP(TOTP_SECRET).verify(body.code.strip().replace(" ", ""), valid_window=1)
     if not ok:
         raise HTTPException(status_code=401, detail="bad code")
-    return {"command_url": COMMAND_URL, "token": BRIDGE_TOKEN}
+    return {"command_url": COMMAND_URL, "token": user["api_token"]}
 
 PROVISION_HTML = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -2630,7 +2635,9 @@ PROVISION_HTML = """<!doctype html>
  .head b{font-size:.95rem}
 </style></head><body><main>
 <h1>Watch Bridge provisioning</h1>
-<p class="sub">Enter the 6-digit code from Haven on your phone. The page then shows the shortcut recipe and the bearer token.</p>
+<p class="sub">Enter the 6-digit code from Haven on your phone. The page then shows your
+shortcut recipe and your own bearer token — pair each person's watch from their
+own sign-in, so commands land on their calendar and boards.</p>
 <div class="card">
  <input id="code" inputmode="numeric" pattern="[0-9 ]*" maxlength="7" placeholder="000000" autocomplete="one-time-code">
  <button onclick="go()">Unlock</button>

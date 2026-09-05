@@ -3,6 +3,8 @@ Trello paste-connect flow. All network is faked; the DB is a tmp file."""
 
 
 import time
+from types import SimpleNamespace
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -1550,3 +1552,41 @@ def test_rest_event_routes_refuse_bad_names(client, monkeypatch):
     r = client.patch("/event", json={"day": "2030-01-15", "name": "Dentist"},
                      headers=bearer(user))
     assert r.status_code == 400  # a match, but nothing to change
+
+
+# --- provisioning reveals the signed-in user's own token, not the owner's ---
+
+def test_provision_hands_out_the_signed_in_users_token(client, monkeypatch):
+    signup(client)
+    user = store.get_user_by_name("tester")
+    monkeypatch.setattr(app, "TOTP_SECRET", "JBSWY3DPEHPK3PXP")
+    assert client.get("/provision").status_code == 200
+    monkeypatch.setattr(app.pyotp, "TOTP",
+                        lambda *a, **kw: SimpleNamespace(
+                            verify=lambda code, valid_window=1: True))
+    r = client.post("/provision/verify", json={"code": "123456"})
+    assert r.status_code == 200
+    assert r.json() == {"command_url": app.COMMAND_URL,
+                        "token": user["api_token"]}
+
+
+def test_provision_needs_a_session(client, monkeypatch):
+    monkeypatch.setattr(app, "TOTP_SECRET", "JBSWY3DPEHPK3PXP")
+    r = client.get("/provision", follow_redirects=False)
+    assert r.status_code == 303 and r.headers["location"] == "/login"
+    assert client.post("/provision/verify",
+                       json={"code": "123456"}).status_code == 401
+
+
+def test_provision_rejects_bad_codes_and_can_be_disabled(client, monkeypatch):
+    signup(client)
+    monkeypatch.setattr(app, "TOTP_SECRET", "JBSWY3DPEHPK3PXP")
+    monkeypatch.setattr(app.pyotp, "TOTP",
+                        lambda *a, **kw: SimpleNamespace(
+                            verify=lambda code, valid_window=1: False))
+    assert client.post("/provision/verify",
+                       json={"code": "000000"}).status_code == 401
+    monkeypatch.setattr(app, "TOTP_SECRET", "")
+    assert client.get("/provision").status_code == 404
+    assert client.post("/provision/verify",
+                       json={"code": "123456"}).status_code == 404
