@@ -41,6 +41,13 @@ CREATE TABLE IF NOT EXISTS google_accounts (
   expires_at REAL NOT NULL,
   timezone TEXT NOT NULL,
   calendar_id TEXT NOT NULL DEFAULT 'primary'
+);
+
+CREATE TABLE IF NOT EXISTS ha_instances (
+  user_id INTEGER PRIMARY KEY,
+  url TEXT NOT NULL,
+  token TEXT NOT NULL,
+  created_at TEXT NOT NULL
 )
 """
 
@@ -262,4 +269,34 @@ def get_google_account(user_id: int) -> dict | None:
 def delete_google_account(user_id: int) -> bool:
     with connect() as db:
         cur = db.execute("DELETE FROM google_accounts WHERE user_id = ?", (user_id,))
+    return cur.rowcount > 0
+
+
+# --- Home Assistant, one connection per user ---------------------------------
+# Like Google's single row: the home is singular. The token is a long-lived
+# access token pasted from the user's HA profile; it never refreshes, so a 401
+# means it was revoked and the user must paste a new one (re-saving replaces).
+
+def save_ha_instance(user_id: int, url: str, token: str) -> None:
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with connect() as db:
+        db.execute(
+            "INSERT INTO ha_instances (user_id, url, token, created_at) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET url=excluded.url, "
+            "token=excluded.token, created_at=excluded.created_at",
+            (user_id, url, token, now),
+        )
+
+
+def get_ha_instance(user_id: int) -> dict | None:
+    row = connect().execute(
+        "SELECT * FROM ha_instances WHERE user_id = ?", (user_id,)
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def delete_ha_instance(user_id: int) -> bool:
+    with connect() as db:
+        cur = db.execute("DELETE FROM ha_instances WHERE user_id = ?", (user_id,))
     return cur.rowcount > 0

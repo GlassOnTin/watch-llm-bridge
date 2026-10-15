@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Watch → LLM Bridge · self-hosted voice hub for Trello &amp; Google Calendar</title>
-<meta name="description" content="Build a self-hosted bridge: an Apple Watch shortcut routes dictated voice commands to your own endpoint, an LLM routes them into Trello and Google Calendar. No Zapier.">
+<title>Watch → LLM Bridge · self-hosted voice hub for Trello, Google Calendar &amp; Home Assistant</title>
+<meta name="description" content="Build a self-hosted bridge: an Apple Watch shortcut routes dictated voice commands to your own endpoint, an LLM routes them into Trello, Google Calendar and Home Assistant. No Zapier.">
 <style>
   :root {
     --bg: #0d1117;
@@ -127,7 +127,7 @@
 
 <header class="hero">
   <h1>Watch <span class="arrow">→</span> LLM Bridge</h1>
-  <p class="tagline">A self-hosted voice hub: an Apple Watch shortcut dictates a command and POSTs it to <em>your</em> endpoint. An LLM with tool-calling routes it into Trello and Google Calendar. No Zapier, no subscription glue.</p>
+  <p class="tagline">A self-hosted voice hub: an Apple Watch shortcut dictates a command and POSTs it to <em>your</em> endpoint. An LLM with tool-calling routes it into Trello, Google Calendar and Home Assistant. No Zapier, no subscription glue.</p>
   <p class="muted">The watch side never changes: <strong>Dictate Text → Get Contents of URL (POST) → Speak Text</strong>. All intelligence lives on the server, so you iterate there without touching the shortcut.</p>
 </header>
 
@@ -149,26 +149,32 @@
     <text x="390" y="108" text-anchor="middle" fill="#8b949e">auth + LLM tool-calling</text>
   </g>
   <g>
-    <rect x="580" y="15" width="170" height="54" rx="10" fill="#161b22" stroke="#2d333b"/>
-    <text x="665" y="38" text-anchor="middle" fill="#e6edf3">Trello REST</text>
-    <text x="665" y="56" text-anchor="middle" fill="#8b949e">key + token</text>
+    <rect x="580" y="5" width="170" height="54" rx="10" fill="#161b22" stroke="#2d333b"/>
+    <text x="665" y="28" text-anchor="middle" fill="#e6edf3">Trello REST</text>
+    <text x="665" y="46" text-anchor="middle" fill="#8b949e">key + token</text>
   </g>
   <g>
-    <rect x="580" y="120" width="170" height="54" rx="10" fill="#161b22" stroke="#2d333b"/>
-    <text x="665" y="143" text-anchor="middle" fill="#e6edf3">Google Calendar</text>
-    <text x="665" y="161" text-anchor="middle" fill="#8b949e">OAuth refresh token</text>
+    <rect x="580" y="68" width="170" height="54" rx="10" fill="#161b22" stroke="#2d333b"/>
+    <text x="665" y="91" text-anchor="middle" fill="#e6edf3">Google Calendar</text>
+    <text x="665" y="109" text-anchor="middle" fill="#8b949e">OAuth refresh token</text>
+  </g>
+  <g>
+    <rect x="580" y="131" width="170" height="54" rx="10" fill="#161b22" stroke="#2d333b"/>
+    <text x="665" y="154" text-anchor="middle" fill="#e6edf3">Home Assistant</text>
+    <text x="665" y="172" text-anchor="middle" fill="#8b949e">URL + long-lived token</text>
   </g>
   <line x1="180" y1="95" x2="288" y2="95" stroke="#4fb3ff" stroke-width="1.6" marker-end="url(#ah)"/>
   <text x="234" y="86" text-anchor="middle" fill="#8b949e" font-size="11">POST /command</text>
-  <line x1="490" y1="82" x2="578" y2="46" stroke="#4fb3ff" stroke-width="1.6" marker-end="url(#ah)"/>
-  <line x1="490" y1="108" x2="578" y2="144" stroke="#4fb3ff" stroke-width="1.6" marker-end="url(#ah)"/>
+  <line x1="490" y1="75" x2="578" y2="35" stroke="#4fb3ff" stroke-width="1.6" marker-end="url(#ah)"/>
+  <line x1="490" y1="95" x2="578" y2="95" stroke="#4fb3ff" stroke-width="1.6" marker-end="url(#ah)"/>
+  <line x1="490" y1="115" x2="578" y2="155" stroke="#4fb3ff" stroke-width="1.6" marker-end="url(#ah)"/>
 </svg>
 </div>
 
 <section class="checklist-panel">
   <div class="progress-wrap">
     <div class="progress-track"><div class="progress-fill" id="pfill"></div></div>
-    <span class="progress-label" id="plabel">0 / 10</span>
+    <span class="progress-label" id="plabel">0 / 11</span>
   </div>
   <ul class="checklist" id="checklist">
     <li><input type="checkbox" id="c1"><label for="c1">Watch shortcut built: Dictate Text → POST → Speak Text <a class="ref" href="#watch">#watch</a></label></li>
@@ -181,6 +187,7 @@
     <li><input type="checkbox" id="c8"><label for="c8">OAuth app published to production; refresh token stored <a class="ref" href="#gcal">#gcal</a></label></li>
     <li><input type="checkbox" id="c9"><label for="c9">Calendar events read out by voice <a class="ref" href="#gcal">#gcal</a></label></li>
     <li><input type="checkbox" id="c10"><label for="c10">Echo replaced by LLM tool-calling (list routing works) <a class="ref" href="#llm">#llm</a></label></li>
+    <li><input type="checkbox" id="c11"><label for="c11">Home Assistant connected; a light responds to voice <a class="ref" href="#haout">#haout</a></label></li>
   </ul>
   <p class="muted" style="font-size:0.82rem; margin: 10px 0 0;">Progress is saved in this browser (localStorage). Nothing is sent anywhere.</p>
 </section>
@@ -322,8 +329,20 @@ curl -s "https://api.trello.com/1/boards/$BOARD_ID/lists?key=$TRELLO_KEY&amp;tok
 <div class="callout warn"><b>The 7-day trap.</b> With the consent screen in <em>Testing</em> status, Google expires your refresh token after exactly 7 days (<code>invalid_grant</code>). Publishing to <em>In production</em> without completing verification removes the expiry — you'll just see a "Google hasn't verified this app" warning once during the consent flow. The change is not retroactive: re-run the OAuth flow after publishing, and check for an absent <code>refresh_token_expires_in</code> field to confirm.</div>
 <p class="muted">Other things that kill a refresh token: six months of disuse (only a token exchange counts), revoking access, changing scopes, or password changes on Gmail-scoped apps.</p>
 
+<!-- ====================== HOME ASSISTANT (OUTBOUND) ====================== -->
+<h2 id="haout"><span class="stepno">05</span>Home Assistant</h2>
+<p>The bridge can also drive your house. Each user connects their own Home Assistant from the dashboard with the instance URL and a <strong>long-lived access token</strong> — pasted, like the Trello token, no OAuth dance. The token never expires and never refreshes; if it's revoked, the bridge says so and you paste a new one.</p>
+<ol class="steps">
+  <li>In Home Assistant: click your profile → <strong>Security</strong> → <em>Long-lived access tokens</em> → <strong>Create a Token</strong>.</li>
+  <li>On the bridge dashboard, paste the instance URL (e.g. <code>http://homeassistant.local:8123</code>) and the token, then <strong>Connect</strong>. The bridge probes <code>GET /api/config</code> before storing anything — a bad URL or token is rejected on the spot, nothing half-saved.</li>
+  <li>Talk to it: "turn on the dining light", "set the kettle timer" is a switch, "play Spotify in the living room", "what's the front door battery".</li>
+</ol>
+<p>Scope is deliberately narrow: lights, switches, fans and scenes on/off/toggle, media players play/pause/volume/source, and <em>read</em> access to any entity (sensors, weather, binary sensors). Locks, covers, climate setpoints and scripts are not exposed to voice.</p>
+<div class="callout"><b>The bridge never guesses which device you meant.</b> Spoken names are matched against your home's real inventory — exact name, then substring, then all words present. Anything ambiguous comes back as a question ("which one — the dining table light or the desk lamp?"), never a coin flip.</div>
+<p class="muted">This is the bridge talking <em>out</em> to Home Assistant. The reverse direction — Home Assistant's own voice entry points talking <em>back</em> into the bridge as a conversation agent — is a separate integration, documented below.</p>
+
 <!-- ============================ LLM ============================ -->
-<h2 id="llm"><span class="stepno">05</span>The LLM layer</h2>
+<h2 id="llm"><span class="stepno">06</span>The LLM layer</h2>
 <p>Replace <code>route()</code> with an LLM call that exposes a small, fixed tool set. The tools map 1:1 onto the real APIs; the model never invents endpoints.</p>
 <table>
   <tr><th>Tool</th><th>Maps to</th><th>Used for</th></tr>
@@ -332,13 +351,17 @@ curl -s "https://api.trello.com/1/boards/$BOARD_ID/lists?key=$TRELLO_KEY&amp;tok
   <tr><td><code>trello_move_card(card, to_list)</code></td><td><code>PUT /1/cards/{id}</code></td><td>"move that to Done"</td></tr>
   <tr><td><code>gcal_list_events(day)</code></td><td><code>events.list</code></td><td>"what's on tomorrow"</td></tr>
   <tr><td><code>gcal_create_event(summary, start, end)</code></td><td><code>events.insert</code></td><td>"book the dentist Tuesday 2pm"</td></tr>
+  <tr><td><code>ha_turn_on / ha_turn_off / ha_toggle(entity)</code></td><td><code>POST /api/services/&lt;domain&gt;/…</code></td><td>"turn off the dining light"</td></tr>
+  <tr><td><code>ha_apply_scene(scene)</code></td><td><code>scene.turn_on</code></td><td>"movie scene"</td></tr>
+  <tr><td><code>ha_media(entity, action, volume?, source?)</code></td><td><code>media_player.*</code></td><td>"pause the living room speaker"</td></tr>
+  <tr><td><code>ha_get_state(entity)</code> · <code>ha_list_entities(domain?, search?)</code></td><td><code>GET /api/states</code></td><td>"what's the front door battery"</td></tr>
 </table>
 <p>System prompt carries your board's <em>list names</em>, so "put this in the right list" resolves from a known set rather than guessing. Ambiguity ("which board?") should come back as a spoken question, not a guess.</p>
 <p class="muted">Model choice: any tool-calling endpoint works. A local ollama model is adequate for routing among a handful of well-described tools; hosted APIs are lower-latency. The tool interface is identical either way.</p>
 
-<!-- ============================ HOME ASSISTANT ============================ -->
-<h2 id="ha"><span class="stepno">06</span>Home Assistant</h2>
-<p>The bridge ships as a Home Assistant <em>conversation agent</em> (<code>custom_components/bridge_agent</code> in the repo). Once installed, every HA voice entry point — the phone app, a browser Assist panel, a Home Assistant Voice device, Nabu Casa remote access — dictates into the bridge and speaks the reply back, exactly like the watch shortcut.</p>
+<!-- ==================== HOME ASSISTANT (INBOUND) ==================== -->
+<h2 id="ha"><span class="stepno">07</span>Home Assistant as a voice input</h2>
+<p>The other direction: the bridge ships as a Home Assistant <em>conversation agent</em> (<code>custom_components/bridge_agent</code> in the repo). Once installed, every HA voice entry point — the phone app, a browser Assist panel, a Home Assistant Voice device, Nabu Casa remote access — dictates into the bridge and speaks the reply back, exactly like the watch shortcut.</p>
 <ol class="steps">
   <li>Copy <code>custom_components/bridge_agent</code> into your HA <code>config/custom_components/</code> folder and restart Home Assistant. (HACS can install it from a GitHub release zip containing that folder.)</li>
   <li>Settings → Devices &amp; Services → Add Integration → <strong>Bridge Agent</strong>. Give it the bridge URL and the bearer token of the user it should act as.</li>
@@ -348,7 +371,7 @@ curl -s "https://api.trello.com/1/boards/$BOARD_ID/lists?key=$TRELLO_KEY&amp;tok
 <p class="muted">Notes: the bridge replies in about two to three seconds, which fits a voice pipeline; the agent never controls HA devices — it only forwards text. HA offers the agent for every language, but the bridge's prompts and aliases are English-only. Google Home/Nest speakers are not supported: post-Gemini routines can't hand free-text dictation to a webhook. Requires HA 2025.9 or newer.</p>
 
 <!-- ============================ TROUBLESHOOTING ============================ -->
-<h2 id="ts"><span class="stepno">07</span>Troubleshooting</h2>
+<h2 id="ts"><span class="stepno">08</span>Troubleshooting</h2>
 <table>
   <tr><th>Symptom</th><th>Likely cause</th></tr>
   <tr><td>Shortcut hangs, then "couldn't connect"</td><td>Not HTTPS, or the server didn't reply fast enough. Add a <code>/health</code> test from this page first.</td></tr>
@@ -358,6 +381,7 @@ curl -s "https://api.trello.com/1/boards/$BOARD_ID/lists?key=$TRELLO_KEY&amp;tok
   <tr><td>Trello <code>401 invalid token</code></td><td>Token expired (check the <code>expiration</code> param used at authorize) or was revoked.</td></tr>
   <tr><td>Card lands in the wrong list</td><td>List names in the system prompt don't match the board. Cache IDs by name and fail loudly on a mismatch rather than defaulting.</td></tr>
   <tr><td>HA agent says the bridge rejected the token</td><td>The token was rotated — open the integration and re-authenticate, or paste a fresh token from the dashboard.</td></tr>
+  <tr><td>"Home Assistant rejected that token" on the dashboard</td><td>The long-lived token was revoked or deleted in HA. Create a fresh one on your profile → Security and re-paste; the bridge stores the replacement.</td></tr>
   <tr><td>HA agent says the bridge is unreachable</td><td>Check <code>/health</code> on the bridge URL from HA's host network; tunnels or firewalls between HA and the bridge are the usual cause.</td></tr>
 </table>
 
@@ -367,6 +391,7 @@ curl -s "https://api.trello.com/1/boards/$BOARD_ID/lists?key=$TRELLO_KEY&amp;tok
   <a href="https://developer.atlassian.com/cloud/trello/guides/rest-api/authorization/" target="_blank" rel="noopener">Trello authorization</a> ·
   <a href="https://developers.google.com/calendar/api/guides/overview" target="_blank" rel="noopener">Google Calendar API</a> ·
   <a href="https://stackoverflow.com/questions/71451250/google-calendar-api-token-expires-in-7-days" target="_blank" rel="noopener">refresh-token 7-day expiry</a> ·
+  <a href="https://developers.home-assistant.io/docs/api/rest/" target="_blank" rel="noopener">Home Assistant REST API</a> ·
   <a href="https://sosumi.ai/documentation/speech/sfspeechrecognizer" target="_blank" rel="noopener">why SFSpeechRecognizer isn't on watchOS</a></p>
 </footer>
 

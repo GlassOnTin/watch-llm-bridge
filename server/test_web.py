@@ -1608,3 +1608,217 @@ def test_provision_rejects_bad_codes_and_can_be_disabled(client, monkeypatch):
     assert client.get("/provision").status_code == 404
     assert client.post("/provision/verify",
                        json={"code": "123456"}).status_code == 404
+
+
+# --- Home Assistant: paste-a-token connect, bearer control + read surface ---
+
+HA_ENTITIES = [
+    {"entity_id": "light.dining_table_light", "friendly_name": "Dining Table Light",
+     "state": "off"},
+    {"entity_id": "switch.kettle", "friendly_name": "Kettle", "state": "off"},
+    {"entity_id": "sensor.front_door_battery", "friendly_name": "Front Door Battery",
+     "state": "87"},
+]
+
+
+class WebFakeHa:
+    """Connected stub: the same find_entity rules as Ha, call_service
+    recorded, plus the two attributes the dashboard card renders."""
+
+    connected = True
+    url = "http://ha.test:8123"
+    location_name = "Home"
+
+    def __init__(self):
+        self.calls = []
+
+    def states(self):
+        return HA_ENTITIES
+
+    def entity(self, entity_id):
+        return next((e for e in HA_ENTITIES
+                     if e["entity_id"] == entity_id), None)
+
+    def call_service(self, domain, service, data):
+        self.calls.append((domain, service, data))
+
+    def find_entity(self, name):
+        low = name.lower().strip()
+        pool = [e for e in HA_ENTITIES
+                if e["entity_id"].split(".", 1)[0] in app.HA_CONTROLLABLE]
+        hits = ([e for e in pool if e["entity_id"] == low
+                 or e["friendly_name"].lower() == low]
+                or [e for e in pool
+                    if low in e["friendly_name"].lower() or low in e["entity_id"]]
+                or [e for e in pool
+                    if all(w in e["friendly_name"].lower()
+                           or w in e["entity_id"] for w in low.split())])
+        if len(hits) != 1:
+            known = ", ".join(sorted(e["friendly_name"] for e in pool))
+            raise KeyError(f"entity '{name}' matches {len(hits) or 'nothing'} "
+                           f"in the home (known: {known})")
+        return hits[0]
+
+
+def rest_ha_user(client):
+    signup(client)
+    user = store.get_user_by_name("tester")
+    store.add_account(user["id"], "trello", "ATTArest")  # /command needs Trello up
+    store.save_ha_instance(user["id"], "http://ha.test:8123", "HATOK")
+    h = WebFakeHa()
+    app._ha[user["id"]] = h
+    return user, h
+
+
+def test_connect_ha_probes_stores_and_normalises(client, monkeypatch):
+    signup(client)
+    user = store.get_user_by_name("tester")
+    seen = {}
+
+    def fake_get(url, headers=None, timeout=None):
+        seen.update(url=url, headers=headers)
+        return FakeResp({"location_name": "Home"})
+
+    monkeypatch.setattr(app.requests, "get", fake_get)
+    r = client.post("/app/ha", json={"url": "http://ha.test:8123/ ",
+                                     "token": "  HATOK  "})
+    assert r.status_code == 200
+    assert seen["url"] == "http://ha.test:8123/api/config"
+    assert seen["headers"]["Authorization"] == "Bearer HATOK"
+    row = store.get_ha_instance(user["id"])
+    assert row is not None and row["url"] == "http://ha.test:8123"
+    assert row["token"] == "HATOK"
+    assert user["id"] not in app._ha  # stale cache dropped; next use rebuilds
+    assert r.json()["home_assistant"] == {"connected": True,
+                                          "url": "http://ha.test:8123",
+                                          "location_name": "Home"}
+
+
+def test_connect_ha_rejects_bad_token_without_storing(client, monkeypatch):
+    signup(client)
+    user = store.get_user_by_name("tester")
+
+    def bad_get(url, headers=None, timeout=None):
+        raise app.requests.HTTPError("401")
+
+    monkeypatch.setattr(app.requests, "get", bad_get)
+    r = client.post("/app/ha", json={"url": "http://ha.test:8123",
+                                     "token": "BAD"})
+    assert r.status_code == 401
+    assert store.get_ha_instance(user["id"]) is None
+
+
+def test_connect_ha_unreachable_is_502(client, monkeypatch):
+    signup(client)
+    user = store.get_user_by_name("tester")
+
+    def down(url, headers=None, timeout=None):
+        raise app.requests.ConnectionError("no route")
+
+    monkeypatch.setattr(app.requests, "get", down)
+    r = client.post("/app/ha", json={"url": "http://ha.offline:8123",
+                                     "token": "HATOK"})
+    assert r.status_code == 502
+    assert store.get_ha_instance(user["id"]) is None
+
+
+def test_connect_ha_needs_a_real_url_and_token(client):
+    signup(client)
+    user = store.get_user_by_name("tester")
+    assert client.post("/app/ha", json={"url": "ha.test:8123",
+                                        "token": "HATOK"}).status_code == 400
+    assert client.post("/app/ha", json={"url": "http://ha.test:8123",
+                                        "token": "  "}).status_code == 400
+    assert store.get_ha_instance(user["id"]) is None
+
+
+def test_disconnect_ha_deletes_the_row(client):
+    user, h = rest_ha_user(client)
+    r = client.post("/app/ha/disconnect")
+    assert r.status_code == 200
+    assert store.get_ha_instance(user["id"]) is None
+    assert user["id"] not in app._ha
+    assert r.json()["home_assistant"]["connected"] is False
+
+
+def test_app_state_reports_ha_connected(client):
+    user, h = rest_ha_user(client)
+    state = client.get("/app/state").json()
+    assert state["home_assistant"] == {"connected": True,
+                                       "url": "http://ha.test:8123",
+                                       "location_name": "Home"}
+
+
+def test_app_state_reports_ha_disconnected(client):
+    signup(client)
+    user = store.get_user_by_name("tester")
+    app._ha.pop(user["id"], None)
+    state = client.get("/app/state").json()
+    assert state["home_assistant"]["connected"] is False
+
+
+def test_rest_ha_entities_and_state(client):
+    user, h = rest_ha_user(client)
+    r = client.get("/ha/entities", headers=bearer(user))
+    assert r.status_code == 200
+    assert [e["entity_id"] for e in r.json()["entities"]] == [
+        e["entity_id"] for e in HA_ENTITIES]
+    r = client.get("/ha/entities", params={"domain": "light"},
+                   headers=bearer(user))
+    assert [e["entity_id"] for e in r.json()["entities"]] == [
+        "light.dining_table_light"]
+    r = client.get("/ha/state", params={"entity": "kettle"},
+                   headers=bearer(user))
+    assert r.status_code == 200
+    assert r.json() == {"ok": True, "entity": "switch.kettle",
+                        "name": "Kettle", "state": "off"}
+    r = client.get("/ha/state", params={"entity": "sensor.ghost"},
+                   headers=bearer(user))
+    assert r.status_code == 404
+
+
+def test_rest_ha_action_round_trip(client):
+    user, h = rest_ha_user(client)
+    r = client.post("/ha/action", json={"entity": "kettle", "action": "on"},
+                    headers=bearer(user))
+    assert r.status_code == 200
+    assert r.json()["ok"] is True
+    assert h.calls == [("switch", "turn_on", {"entity_id": "switch.kettle"})]
+    r = client.post("/ha/action", json={"entity": "kettle", "action": "wiggle"},
+                    headers=bearer(user))
+    assert r.status_code == 400
+    r = client.post("/ha/action", json={"entity": "gym light",
+                                        "action": "toggle"},
+                    headers=bearer(user))
+    assert r.status_code == 404
+
+
+def test_rest_ha_routes_need_a_connection(client):
+    signup(client)
+    user = store.get_user_by_name("tester")
+    app._ha.pop(user["id"], None)  # stale cache from another test's DB
+    r = client.get("/ha/entities", headers=bearer(user))
+    assert r.status_code == 409
+    r = client.get("/ha/state", params={"entity": "kettle"},
+                   headers=bearer(user))
+    assert r.status_code == 409
+    r = client.post("/ha/action", json={"entity": "kettle", "action": "on"},
+                    headers=bearer(user))
+    assert r.status_code == 409
+
+
+def test_command_survives_a_dead_ha_token(client, monkeypatch):
+    user, h = rest_ha_user(client)
+    app._ha.pop(user["id"], None)
+    monkeypatch.setattr(app, "LLM_BASE_URL", "")  # route() echoes, no LLM
+
+    def dead(url, headers=None, timeout=None):
+        e = app.requests.HTTPError("401")
+        e.response = SimpleNamespace(status_code=401, text="")
+        raise e
+
+    monkeypatch.setattr(app.requests, "get", dead)
+    r = client.post("/command", json={"text": "turn on the kettle"},
+                    headers=bearer(user))
+    assert r.status_code == 200
+    assert r.json()["reply"] == "echo: turn on the kettle"

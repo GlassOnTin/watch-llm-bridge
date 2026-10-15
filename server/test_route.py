@@ -470,3 +470,176 @@ def test_calendar_delete_removes_the_matched_event(stocked_trello):
                            {"day": "tomorrow", "name": "Dentist"}, gcal=g)
     assert out == {"ok": True, "deleted": "Dentist"}
     assert g.deleted == "e1"
+
+
+# --- Home Assistant tools ---
+
+class FakeHa:
+    """Connected stub: real find_entity rules, call_service recorded."""
+
+    connected = True
+    url = "http://ha.test:8123"
+    location_name = "Home"
+
+    def __init__(self):
+        self.calls = []
+
+    def states(self):
+        return [
+            {"entity_id": "light.dining_table_light",
+             "friendly_name": "Dining Table Light", "state": "off"},
+            {"entity_id": "light.ian_s_office_bulb",
+             "friendly_name": "Ian's Office Bulb", "state": "on"},
+            {"entity_id": "switch.kettle", "friendly_name": "Kettle",
+             "state": "off"},
+            {"entity_id": "scene.livingroomlightsfull",
+             "friendly_name": "Living room lights full", "state": "scening"},
+            {"entity_id": "media_player.living_room_speaker",
+             "friendly_name": "Living Room Speaker", "state": "playing"},
+            {"entity_id": "sensor.front_door_battery",
+             "friendly_name": "Front Door Battery", "state": "87"},
+            {"entity_id": "binary_sensor.front_door",
+             "friendly_name": "Front Door", "state": "off"},
+        ]
+
+    def entity(self, entity_id):
+        return next((e for e in self.states()
+                     if e["entity_id"] == entity_id), None)
+
+    def call_service(self, domain, service, data):
+        self.calls.append((domain, service, data))
+
+    def find_entity(self, name):
+        low = name.lower().strip()
+        pool = [e for e in self.states()
+                if e["entity_id"].split(".", 1)[0] in app.HA_CONTROLLABLE]
+        hits = ([e for e in pool if e["entity_id"] == low
+                 or e["friendly_name"].lower() == low]
+                or [e for e in pool
+                    if low in e["friendly_name"].lower()
+                    or low in e["entity_id"]]
+                or [e for e in pool
+                    if all(w in e["friendly_name"].lower()
+                           or w in e["entity_id"] for w in low.split())])
+        if len(hits) != 1:  # faithful to Ha.find_entity: ask, don't guess
+            known = ", ".join(sorted(e["friendly_name"] for e in pool))
+            raise KeyError(f"entity '{name}' matches {len(hits) or 'nothing'} "
+                           f"in the home (known: {known})")
+        return hits[0]
+
+
+def test_ha_tools_absent_without_a_connection(stocked_trello):
+    names = [t["function"]["name"] for t in app.tools_for(None, None)]
+    assert "ha_turn_on" not in names
+    names = [t["function"]["name"] for t in app.tools_for(None, FakeHa())]
+    assert "ha_turn_on" in names and "ha_media" in names
+
+
+def test_ha_tool_without_a_connection_says_disconnected(stocked_trello):
+    out = app.execute_tool("ha_turn_on", {"entity": "kettle"})
+    assert out == {"ok": False, "error": "ha_disconnected"}
+    out = app.execute_tool("ha_get_state",
+                           {"entity": "sensor.front_door_battery"})
+    assert out == {"ok": False, "error": "ha_disconnected"}
+
+
+def test_ha_turn_on_resolves_a_friendly_name(stocked_trello):
+    h = FakeHa()
+    out = app.execute_tool("ha_turn_on", {"entity": "dining light"}, ha=h)
+    assert out["ok"] is True
+    assert out["entity"] == "Dining Table Light"
+    assert h.calls == [("light", "turn_on",
+                        {"entity_id": "light.dining_table_light"})]
+
+
+def test_ha_turn_off_and_toggle(stocked_trello):
+    h = FakeHa()
+    out = app.execute_tool("ha_toggle", {"entity": "switch.kettle"}, ha=h)
+    assert out["ok"] is True
+    assert h.calls[-1] == ("switch", "toggle",
+                           {"entity_id": "switch.kettle"})
+    out = app.execute_tool("ha_turn_off", {"entity": "kettle"}, ha=h)
+    assert out["ok"] is True
+    assert h.calls[-1] == ("switch", "turn_off",
+                           {"entity_id": "switch.kettle"})
+
+
+def test_ha_apply_scene(stocked_trello):
+    h = FakeHa()
+    out = app.execute_tool("ha_apply_scene",
+                           {"scene": "living room lights full"}, ha=h)
+    assert out["ok"] is True
+    assert h.calls == [("scene", "turn_on",
+                        {"entity_id": "scene.livingroomlightsfull"})]
+
+
+def test_ha_media_actions(stocked_trello):
+    h = FakeHa()
+    out = app.execute_tool("ha_media",
+                           {"entity": "living room speaker",
+                            "action": "pause"}, ha=h)
+    assert out["ok"] is True
+    assert h.calls[-1] == ("media_player", "media_pause",
+                           {"entity_id": "media_player.living_room_speaker"})
+    out = app.execute_tool("ha_media",
+                           {"entity": "living room speaker",
+                            "action": "volume", "volume": 0.4}, ha=h)
+    assert out["ok"] is True
+    assert h.calls[-1] == ("media_player", "volume_set",
+                           {"entity_id": "media_player.living_room_speaker",
+                            "volume_level": 0.4})
+    out = app.execute_tool("ha_media",
+                           {"entity": "living room speaker",
+                            "action": "source", "source": "Spotify"}, ha=h)
+    assert out["ok"] is True
+    assert h.calls[-1] == ("media_player", "select_source",
+                           {"entity_id": "media_player.living_room_speaker",
+                            "source": "Spotify"})
+    out = app.execute_tool("ha_media",
+                           {"entity": "living room speaker",
+                            "action": "wiggle"}, ha=h)
+    assert out["ok"] is False and out["error"] == "bad_media_action"
+
+
+def test_ha_get_state_reads_any_entity(stocked_trello):
+    h = FakeHa()
+    out = app.execute_tool("ha_get_state",
+                           {"entity": "sensor.front_door_battery"}, ha=h)
+    assert out == {"ok": True, "entity": "sensor.front_door_battery",
+                   "name": "Front Door Battery", "state": "87"}
+    out = app.execute_tool("ha_get_state", {"entity": "sensor.ghost"}, ha=h)
+    assert out["ok"] is False and out["error"] == "no_entity"
+
+
+def test_ha_list_entities_filters_by_domain_and_search(stocked_trello):
+    h = FakeHa()
+    out = app.execute_tool("ha_list_entities", {"domain": "light"}, ha=h)
+    assert out["ok"] is True
+    assert [e["entity_id"] for e in out["entities"]] == [
+        "light.dining_table_light", "light.ian_s_office_bulb"]
+    out = app.execute_tool("ha_list_entities", {"search": "door"}, ha=h)
+    assert [e["entity_id"] for e in out["entities"]] == [
+        "sensor.front_door_battery", "binary_sensor.front_door"]
+
+
+def test_ha_report_no_entity_and_ambiguity(stocked_trello):
+    h = FakeHa()
+    out = app.execute_tool("ha_turn_on", {"entity": "gym light"}, ha=h)
+    assert out["ok"] is False and out["error"] == "no_entity"
+    assert "Kettle" in out["candidates"]
+    out = app.execute_tool("ha_turn_on", {"entity": "light"}, ha=h)
+    assert out["ok"] is False and out["error"] == "ambiguous_entity"
+    assert "Dining Table Light" in out["candidates"]
+
+
+def test_ha_prompt_section_appears_only_when_connected(stocked_trello):
+    no_ha = app.build_system_prompt(t=app.Trello("k", "t"))
+    assert "ha_turn_on" not in no_ha
+    assert "Home Assistant isn't set up yet" in no_ha
+    with_ha = app.build_system_prompt(t=app.Trello("k", "t"), ha=FakeHa())
+    for tool in ("ha_list_entities", "ha_get_state", "ha_turn_on",
+                 "ha_turn_off", "ha_toggle", "ha_apply_scene", "ha_media"):
+        assert tool in with_ha
+    assert "Dining Table Light (light.dining_table_light)" in with_ha
+    assert "Front Door Battery" not in with_ha  # sensors stay out of the inventory
+    assert "Home Assistant isn't set up yet" not in with_ha

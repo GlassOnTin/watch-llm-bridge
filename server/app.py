@@ -63,6 +63,12 @@ GCAL_SCOPE = ("https://www.googleapis.com/auth/calendar.events "
 
 TRELLO_API = "https://api.trello.com/1"
 
+# Home Assistant: one instance per user, pasted URL + long-lived access token
+# (no env config — unlike Google there is nothing shared between users). The
+# controllable domains the voice tools act on; every entity stays readable
+# through ha_get_state / ha_list_entities.
+HA_CONTROLLABLE = {"light", "switch", "fan", "scene", "media_player"}
+
 
 class Command(BaseModel):
     text: str
@@ -577,6 +583,131 @@ def gcal_for(user: dict) -> Gcal:
     return g
 
 
+# --- Home Assistant: pasted URL + long-lived token, one instance per user ----
+# No OAuth dance like Google's: the user mints a token on their own HA profile
+# and pastes it here. Long-lived tokens never refresh, so a 401 means revoked
+# and the only repair is pasting a new one (re-connecting replaces the row).
+
+class HaDisconnected(Exception):
+    """Home Assistant rejected the stored token (401) — revoked or expired."""
+
+
+class Ha:
+    """Minimal Home Assistant REST client on a stored long-lived token."""
+
+    def __init__(self, user_id: int, url: str, token: str):
+        self.user_id = user_id
+        self.url = url.rstrip("/")
+        self.token = token
+        self.location_name = ""
+
+    @property
+    def connected(self) -> bool:
+        return bool(self.token)
+
+    def _headers(self) -> dict:
+        return {"Authorization": f"Bearer {self.token}"}
+
+    def _checked(self, r) -> dict | list:
+        """401 is the one failure the user can act on: the token is gone."""
+        if getattr(r, "status_code", None) == 401:
+            raise HaDisconnected()
+        r.raise_for_status()
+        return r.json()
+
+    def config(self) -> dict:
+        """The /api/config probe: proves the token, names the home."""
+        return self._checked(
+            requests.get(f"{self.url}/api/config",
+                         headers=self._headers(), timeout=15))
+
+    def refresh(self) -> None:
+        """Load the location name the dashboard card shows."""
+        self.location_name = self.config().get("location_name", "")
+
+    def states(self) -> list[dict]:
+        """Every entity, flattened to what matching and prompts need: the
+        HA API nests the display name under attributes."""
+        raw = self._checked(
+            requests.get(f"{self.url}/api/states",
+                         headers=self._headers(), timeout=15))
+        return [{"entity_id": e["entity_id"], "state": e.get("state", ""),
+                 "friendly_name": e.get("attributes", {})
+                 .get("friendly_name", e["entity_id"])}
+                for e in raw]
+
+    def entity(self, entity_id: str) -> dict | None:
+        r = requests.get(f"{self.url}/api/states/{entity_id}",
+                         headers=self._headers(), timeout=15)
+        if r.status_code == 404:
+            return None
+        if r.status_code == 401:
+            raise HaDisconnected()
+        r.raise_for_status()
+        attrs = r.json().get("attributes", {})
+        return {"entity_id": entity_id, "state": r.json().get("state", ""),
+                "friendly_name": attrs.get("friendly_name", entity_id)}
+
+    def call_service(self, domain: str, service: str, data: dict) -> None:
+        self._checked(
+            requests.post(f"{self.url}/api/services/{domain}/{service}",
+                          headers=self._headers(), json=data, timeout=15))
+
+    def find_entity(self, name: str) -> dict:
+        """A spoken name -> one controllable entity. Exact (case-insensitive)
+        first, then substring, then every word appearing somewhere; a miss or
+        several hits raise KeyError with the candidates so the agent offers
+        them instead of guessing, like find_card."""
+        low = name.lower().strip()
+        pool = [e for e in self.states()
+                if e["entity_id"].split(".", 1)[0] in HA_CONTROLLABLE]
+        hits = ([e for e in pool if e["entity_id"] == low
+                 or e["friendly_name"].lower() == low]
+                or [e for e in pool
+                    if low in e["friendly_name"].lower() or low in e["entity_id"]]
+                or [e for e in pool
+                    if all(w in e["friendly_name"].lower()
+                           or w in e["entity_id"] for w in low.split())])
+        if len(hits) != 1:
+            known = ", ".join(sorted(e["friendly_name"] for e in pool))
+            raise KeyError(f"entity '{name}' matches {len(hits) or 'nothing'} "
+                           f"in the home (known: {known})")
+        return hits[0]
+
+
+_ha: dict[int, Ha] = {}
+
+
+def ha_preview(user: dict) -> Ha | None:
+    """The user's Home Assistant client for the dashboard card, without
+    seeding the cache: the card re-reads the home's name on every fetch, but
+    a connect response must leave the cache empty until the next real use
+    (which rebuilds and caches). Raises like ha_for on a dead token."""
+    h = _ha.get(user["id"])
+    if h is not None:
+        return h
+    row = store.get_ha_instance(user["id"])
+    if not row:
+        return None
+    h = Ha(user["id"], row["url"], row["token"])
+    h.refresh()
+    return h
+
+
+def ha_for(user: dict) -> Ha | None:
+    """The user's Home Assistant client, or None while they haven't connected.
+    First use after a restart loads the home's name for the dashboard."""
+    h = _ha.get(user["id"])
+    if h is None:
+        row = store.get_ha_instance(user["id"])
+        if not row:
+            return None
+        h = Ha(user["id"], row["url"], row["token"])
+        h.refresh()
+        _ha[user["id"]] = h
+    return h
+
+
 def require_user(authorization: str) -> dict:
     """Resolve the Authorization header to a user row; 401 on anything else."""
     token = authorization.removeprefix("Bearer ").strip()
@@ -688,7 +819,15 @@ def command(cmd: Command, authorization: str = Header(default="")) -> dict:
             logging.getLogger("uvicorn.error").warning(
                 "Calendar for %s failed: %s", user["username"], e)
             g = None
-    return {"reply": route(cmd.text, clients=clients_for(user), gcal=g)}
+    h = None
+    try:
+        h = ha_for(user)
+    except (HaDisconnected, requests.RequestException) as e:
+        # A revoked token or an offline home shouldn't break Trello/Calendar.
+        logging.getLogger("uvicorn.error").warning(
+            "Home Assistant for %s failed: %s", user["username"], e)
+        h = None
+    return {"reply": route(cmd.text, clients=clients_for(user), gcal=g, ha=h)}
 
 
 def route(text: str) -> str:
@@ -1001,14 +1140,79 @@ GCAL_TOOLS = [
 ]
 
 
-def tools_for(gcal: Gcal | None = None) -> list[dict]:
-    """The tools this user's agent gets: calendar tools only once connected."""
-    return TOOLS + (GCAL_TOOLS if gcal is not None and gcal.connected else [])
+HA_TOOLS = [
+    {"type": "function", "function": {
+        "name": "ha_list_entities",
+        "description": "List the home's entities, optionally filtered by "
+                       "domain (light, switch, sensor, ...) or a search word",
+        "parameters": {"type": "object", "properties": {
+            "domain": {"type": "string", "description": "entity domain, e.g. light"},
+            "search": {"type": "string", "description": "word in the name or id"},
+        }}}},
+    {"type": "function", "function": {
+        "name": "ha_get_state",
+        "description": "Read one entity's current state — works for any "
+                       "entity, including sensors and weather",
+        "parameters": {"type": "object", "properties": {
+            "entity": {"type": "string",
+                       "description": "friendly name or entity_id"}},
+            "required": ["entity"]}}},
+    {"type": "function", "function": {
+        "name": "ha_turn_on",
+        "description": "Turn on a light, switch or fan",
+        "parameters": {"type": "object", "properties": {
+            "entity": {"type": "string",
+                       "description": "friendly name or entity_id"}},
+            "required": ["entity"]}}},
+    {"type": "function", "function": {
+        "name": "ha_turn_off",
+        "description": "Turn off a light, switch or fan",
+        "parameters": {"type": "object", "properties": {
+            "entity": {"type": "string",
+                       "description": "friendly name or entity_id"}},
+            "required": ["entity"]}}},
+    {"type": "function", "function": {
+        "name": "ha_toggle",
+        "description": "Toggle a light, switch or fan",
+        "parameters": {"type": "object", "properties": {
+            "entity": {"type": "string",
+                       "description": "friendly name or entity_id"}},
+            "required": ["entity"]}}},
+    {"type": "function", "function": {
+        "name": "ha_apply_scene",
+        "description": "Apply a scene by name",
+        "parameters": {"type": "object", "properties": {
+            "scene": {"type": "string",
+                      "description": "scene name or entity_id"}},
+            "required": ["scene"]}}},
+    {"type": "function", "function": {
+        "name": "ha_media",
+        "description": "Control a media player: action play, pause, volume "
+                       "(with volume 0-1), or source (with source name)",
+        "parameters": {"type": "object", "properties": {
+            "entity": {"type": "string",
+                       "description": "player name or entity_id"},
+            "action": {"type": "string",
+                       "enum": ["play", "pause", "volume", "source"]},
+            "volume": {"type": "number", "description": "0 to 1, for volume"},
+            "source": {"type": "string", "description": "input name, for source"}},
+            "required": ["entity", "action"]}}},
+]
+
+
+def tools_for(gcal: Gcal | None = None,
+              ha: Ha | None = None) -> list[dict]:
+    """The tools this user's agent gets: calendar and home tools only once
+    the matching connection is live."""
+    return (TOOLS
+            + (GCAL_TOOLS if gcal is not None and gcal.connected else [])
+            + (HA_TOOLS if ha is not None and ha.connected else []))
 
 
 def build_system_prompt(t: Trello | None = None,
                         clients: list[tuple[str, Trello]] | None = None,
-                        gcal: Gcal | None = None) -> str:
+                        gcal: Gcal | None = None,
+                        ha: Ha | None = None) -> str:
     clients = clients if clients is not None else [(None, t or trello)]
     multi = len(clients) > 1
     lines = []
@@ -1022,12 +1226,22 @@ def build_system_prompt(t: Trello | None = None,
         name = calendar.summary or calendar.email or "primary"
         lines.append(f"- calendar '{name}' (the default one): "
                      f"timezone {calendar.timezone}")
+    home = ha if ha is not None and ha.connected else None
+    home_inventory = ""
+    if home:
+        # Only controllable, reachable entities: an unavailable light is one
+        # the agent must not offer to switch on.
+        pool = [e for e in home.states()
+                if e["entity_id"].split(".", 1)[0] in HA_CONTROLLABLE
+                and e["state"] != "unavailable"]
+        home_inventory = "\n".join(
+            f"- {e['friendly_name']} ({e['entity_id']})" for e in pool[:80])
     inventory = "\n".join(lines)
     aliases = ", ".join(f'"{k}" means board "{v}"' for k, v in spoken_aliases().items())
     today = datetime.now(timezone.utc).strftime("%A %d %B %Y")
     account_rules = ""
     if multi:
-        account_rules = """9. The user has several Trello accounts. When they name one ("on my work
+        account_rules = """10. The user has several Trello accounts. When they name one ("on my work
    trello"), pass its label as the account argument; when the tool result has
    pairs, ask which account and board, e.g. "that Food list is on work / Home
    and personal / Plans — which one?". Never guess an account."""
@@ -1053,6 +1267,14 @@ def build_system_prompt(t: Trello | None = None,
             "- gcal_edit_event(day, name, new_title, new_day, new_time, duration, location, description) — edit or move an event",
             "- gcal_delete_event(day, name) — delete an event",
         ]
+    if home:
+        tool_lines += [
+            "- ha_list_entities(domain, search) — list the home's entities",
+            "- ha_get_state(entity) — read any entity's state, sensors included",
+            "- ha_turn_on(entity) / ha_turn_off(entity) / ha_toggle(entity) — lights, switches, fans",
+            "- ha_apply_scene(scene) — apply a scene",
+            "- ha_media(entity, action, volume, source) — play, pause, volume 0-1, or input source on a media player",
+        ]
     calendar_rule = (
         """7. Calendar: the user's Google Calendar is connected. "day" is today,
    tomorrow, yesterday, or YYYY-MM-DD in the user's timezone. Convert spoken
@@ -1066,6 +1288,24 @@ def build_system_prompt(t: Trello | None = None,
         if calendar else
         """7. Google Calendar is not connected yet. Any calendar or events request gets
    a brief "calendar isn't set up yet" reply.""")
+    home_section = (
+        f"""
+Exact inventory of controllable devices in the home:
+
+{home_inventory}
+""" if home else "")
+    home_rule = (
+        """8. Home Assistant: the user's home is connected. Devices are picked by
+   the name the user said, from the device inventory. On a no_entity or
+   ambiguous_entity result, offer the closest candidates and ask; never
+   guess which light or switch they meant. ha_get_state and
+   ha_list_entities read anything, sensors and weather included. On an
+   ha_disconnected result, say their home needs reconnecting from the
+   bridge dashboard."""
+        if home else
+        """8. Home Assistant isn't set up yet. Any request about the home, lights,
+   switches, scenes or devices gets a brief "Home Assistant isn't set up
+   yet" reply.""")
     return f"""You are the brain of a voice assistant driven from an Apple Watch. Each
 user message is one spoken sentence. Your reply is read aloud, so keep it to
 one or two short sentences of plain words; never mention IDs, JSON, or URLs.
@@ -1078,7 +1318,7 @@ Tools:
 Exact inventory of boards and lists:
 
 {inventory}
-
+{home_section}
 Rules:
 1. Match the spoken words to this inventory case-insensitively and fuzzily.
    Ignore emoji and punctuation in list names, and treat near-misses ("huge"
@@ -1103,7 +1343,8 @@ Rules:
    today, tomorrow, or YYYY-MM-DD, and spoken times become 24-hour HH:MM;
    when the user gives no time, omit it.
 {calendar_rule}
-8. If the request matches no tool, answer helpfully in a sentence or two.
+{home_rule}
+9. If the request matches no tool, answer helpfully in a sentence or two.
 {account_rules}"""
 
 
@@ -1126,6 +1367,11 @@ def card_error(e: KeyError) -> dict:
 def event_error(e: KeyError) -> dict:
     """A find_events KeyError as an ask-the-user tool result."""
     return _match_error(e, "no_event", "ambiguous_event")
+
+
+def entity_error(e: KeyError) -> dict:
+    """A find_entity KeyError as an ask-the-user tool result."""
+    return _match_error(e, "no_entity", "ambiguous_entity")
 
 
 def _match_error(e: KeyError, none_name: str, ambiguous_name: str) -> dict:
@@ -1198,7 +1444,7 @@ def resolve_board(args: dict, list_name: str, t: Trello | None = None,
 
 def execute_tool(name: str, args: dict, t: Trello | None = None,
                  clients: list[tuple[str, Trello]] | None = None,
-                 gcal: Gcal | None = None) -> dict:
+                 gcal: Gcal | None = None, ha: Ha | None = None) -> dict:
     """Dispatch one tool call. KeyError from resolve_target = mismatch."""
     clients = clients if clients is not None else [(None, t or trello)]
     multi = len(clients) > 1
@@ -1429,6 +1675,79 @@ def execute_tool(name: str, args: dict, t: Trello | None = None,
             return out
         gcal.delete_event(hit["id"])
         return {"ok": True, "deleted": hit.get("summary", "(untitled)")}
+    if name.startswith("ha_"):
+        if ha is None or not ha.connected:
+            return {"ok": False, "error": "ha_disconnected"}
+        if name in ("ha_turn_on", "ha_turn_off", "ha_toggle"):
+            service = {"ha_turn_on": "turn_on", "ha_turn_off": "turn_off",
+                       "ha_toggle": "toggle"}[name]
+            try:
+                hit = ha.find_entity(args["entity"])
+            except KeyError as e:
+                return entity_error(e)
+            domain = hit["entity_id"].split(".", 1)[0]
+            ha.call_service(domain, service, {"entity_id": hit["entity_id"]})
+            return {"ok": True, "entity": hit["friendly_name"],
+                    "action": service}
+        if name == "ha_apply_scene":
+            try:
+                hit = ha.find_entity(args["scene"])
+            except KeyError as e:
+                return entity_error(e)
+            ha.call_service("scene", "turn_on", {"entity_id": hit["entity_id"]})
+            return {"ok": True, "entity": hit["friendly_name"],
+                    "action": "scene applied"}
+        if name == "ha_media":
+            try:
+                hit = ha.find_entity(args["entity"])
+            except KeyError as e:
+                return entity_error(e)
+            action = args.get("action")
+            eid = hit["entity_id"]
+            if action == "play":
+                ha.call_service("media_player", "media_play", {"entity_id": eid})
+            elif action == "pause":
+                ha.call_service("media_player", "media_pause", {"entity_id": eid})
+            elif action == "volume":
+                ha.call_service("media_player", "volume_set",
+                                {"entity_id": eid,
+                                 "volume_level": args.get("volume")})
+            elif action == "source":
+                ha.call_service("media_player", "select_source",
+                                {"entity_id": eid, "source": args.get("source")})
+            else:
+                return {"ok": False, "error": "bad_media_action"}
+            return {"ok": True, "entity": hit["friendly_name"],
+                    "action": action}
+        if name == "ha_get_state":
+            # Reads reach past the controllable pool: sensors, weather, binary
+            # sensors. An entity_id (has a dot) is looked up directly; a
+            # spoken name goes through find_entity, which only knows the
+            # controllable domains — a miss there is still just no_entity.
+            want = args["entity"].strip()
+            hit = ha.entity(want) if "." in want else None
+            if hit is None:
+                try:
+                    hit = ha.find_entity(want)
+                except KeyError:
+                    return {"ok": False, "error": "no_entity"}
+            return {"ok": True, "entity": hit["entity_id"],
+                    "name": hit["friendly_name"], "state": hit["state"]}
+        if name == "ha_list_entities":
+            domain = (args.get("domain") or "").strip().lower()
+            search = (args.get("search") or "").strip().lower()
+            ents = ha.states()
+            if domain:
+                ents = [e for e in ents
+                        if e["entity_id"].split(".", 1)[0] == domain]
+            if search:
+                ents = [e for e in ents
+                        if search in e["friendly_name"].lower()
+                        or search in e["entity_id"]]
+            return {"ok": True,
+                    "entities": [{"entity_id": e["entity_id"],
+                                  "name": e["friendly_name"],
+                                  "state": e["state"]} for e in ents]}
     raise NotImplementedError(f"unknown tool '{name}'")
 
 
@@ -1493,7 +1812,8 @@ def spoken_error(message: str, max_candidates: int = 5) -> str:
 
 def route(text: str, t: Trello | None = None,
           clients: list[tuple[str, Trello]] | None = None,
-          gcal: Gcal | None = None) -> str:
+          gcal: Gcal | None = None,
+          ha: Ha | None = None) -> str:
     """Send the sentence to the LLM; the LLM picks tools, the server keeps
     resolve_target as the fail-loud authority on where cards go. Echoes only
     while no LLM backend is configured (Phase 1 fallback)."""
@@ -1502,7 +1822,7 @@ def route(text: str, t: Trello | None = None,
         return f"echo: {text}"
     messages = [
         {"role": "system",
-         "content": build_system_prompt(clients=clients, gcal=gcal)},
+         "content": build_system_prompt(clients=clients, gcal=gcal, ha=ha)},
         {"role": "user", "content": text},
     ]
     for _ in range(3):
@@ -1513,7 +1833,7 @@ def route(text: str, t: Trello | None = None,
                 json={
                     "model": LLM_MODEL,
                     "messages": messages,
-                    "tools": tools_for(gcal),
+                    "tools": tools_for(gcal, ha),
                     "tool_choice": "auto",
                     "temperature": 0.1,
                     "max_tokens": 300,
@@ -1533,7 +1853,7 @@ def route(text: str, t: Trello | None = None,
             args = json.loads(call["function"]["arguments"] or "{}")
             try:
                 result = execute_tool(call["function"]["name"], args,
-                                      clients=clients, gcal=gcal)
+                                      clients=clients, gcal=gcal, ha=ha)
             except KeyError as e:
                 return spoken_error(e.args[0])
             messages.append({
@@ -1822,6 +2142,96 @@ def api_choose_calendar(pick: CalendarPickIn,
     return {"current": acc["calendar_id"], "timezone": acc["timezone"] or tz}
 
 
+# --- Home Assistant REST: the same tools the LLM gets, over bearer ----------
+
+def _ha_or_409(authorization: str) -> tuple[dict, Ha]:
+    user = require_user(authorization)
+    try:
+        h = ha_for(user)
+    except HaDisconnected:
+        raise HTTPException(
+            status_code=409,
+            detail="home assistant token was rejected — paste a new one on the dashboard")
+    except requests.RequestException:
+        raise HTTPException(status_code=502, detail="home assistant unreachable")
+    if h is None or not h.connected:
+        raise HTTPException(status_code=409,
+                            detail="home assistant not connected for this user")
+    return user, h
+
+
+@app.get("/ha/entities")
+def ha_entities(domain: str = "", authorization: str = Header(default="")) -> dict:
+    _, h = _ha_or_409(authorization)
+    try:
+        return execute_tool("ha_list_entities",
+                            {"domain": domain, "search": ""}, ha=h)
+    except HaDisconnected:
+        raise HTTPException(
+            status_code=409,
+            detail="home assistant token was rejected — paste a new one on the dashboard")
+    except requests.RequestException:
+        raise HTTPException(status_code=502, detail="home assistant unreachable")
+
+
+@app.get("/ha/state")
+def ha_state(entity: str = "", authorization: str = Header(default="")) -> dict:
+    _, h = _ha_or_409(authorization)
+    if not entity:
+        raise HTTPException(status_code=422, detail="entity is required")
+    try:
+        out = execute_tool("ha_get_state", {"entity": entity}, ha=h)
+    except HaDisconnected:
+        raise HTTPException(
+            status_code=409,
+            detail="home assistant token was rejected — paste a new one on the dashboard")
+    except requests.RequestException:
+        raise HTTPException(status_code=502, detail="home assistant unreachable")
+    if not out.get("ok"):
+        raise HTTPException(status_code=404, detail=out.get("error", "no_entity"))
+    return out
+
+
+class HaActionIn(BaseModel):
+    entity: str
+    action: str  # on | off | toggle | play | pause | volume | source
+    volume: float | None = None
+    source: str = ""
+
+
+@app.post("/ha/action")
+def ha_action(body: HaActionIn, authorization: str = Header(default="")) -> dict:
+    """One control action. `entity` is a friendly name or an entity_id."""
+    _, h = _ha_or_409(authorization)
+    action = body.action.strip().lower()
+    tool = {"on": "ha_turn_on", "off": "ha_turn_off",
+            "toggle": "ha_toggle"}.get(action)
+    args: dict = {"entity": body.entity}
+    if tool is None:
+        if action not in ("play", "pause", "volume", "source"):
+            raise HTTPException(status_code=400,
+                                detail="action must be on, off, toggle, play, "
+                                       "pause, volume or source")
+        tool = "ha_media"
+        args["action"] = action
+        if action == "volume":
+            args["volume"] = body.volume
+        if action == "source":
+            args["source"] = body.source
+    try:
+        out = execute_tool(tool, args, ha=h)
+    except HaDisconnected:
+        raise HTTPException(
+            status_code=409,
+            detail="home assistant token was rejected — paste a new one on the dashboard")
+    except requests.RequestException:
+        raise HTTPException(status_code=502, detail="home assistant unreachable")
+    if not out.get("ok"):
+        code = 400 if out.get("error") == "bad_media_action" else 404
+        raise HTTPException(status_code=code, detail=out.get("error", "failed"))
+    return out
+
+
 # --- multi-user web front end: signup, login, dashboard, Trello onboarding ---
 
 import sqlite3
@@ -1843,6 +2253,11 @@ class LoginIn(BaseModel):
 class TrelloTokenIn(BaseModel):
     token: str
     label: str = ""  # account name; empty means the user's first account
+
+
+class HaConnectIn(BaseModel):
+    url: str
+    token: str  # a long-lived access token from the HA profile page
 
 
 ACCOUNT_LABEL_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
@@ -1894,7 +2309,7 @@ def app_state(user: dict) -> dict:
         "invite_code": INVITE_CODE if is_admin else "",
         "google_configured": google_configured(),
         "authorize_url": (
-            "https://trello.com/1/authorize?expiration=30days&name=Watch+Bridge"
+            "https://trello.com/1/authorize?expiration=never&name=Watch+Bridge"
             f"&scope=read,write&response_type=token&key={TRELLO_KEY}"
         ),
     }
@@ -1909,6 +2324,18 @@ def app_state(user: dict) -> dict:
         except (GcalDisconnected, requests.RequestException):
             state["calendar"] = {"connected": False, "email": "", "summary": "",
                                  "timezone": "", "calendar_id": "primary"}
+    # The HA card always renders (no server-side config gate), so the key is
+    # always present — disconnected is the shape when there is nothing.
+    try:
+        h = ha_preview(user)
+        state["home_assistant"] = (
+            {"connected": h.connected, "url": h.url,
+             "location_name": h.location_name}
+            if h is not None and h.connected else
+            {"connected": False, "url": "", "location_name": ""})
+    except (HaDisconnected, requests.RequestException):
+        state["home_assistant"] = {"connected": False, "url": "",
+                                   "location_name": ""}
     if is_admin:
         state["users"] = [
             {"username": u["username"], "is_admin": bool(u["is_admin"]),
@@ -1953,7 +2380,8 @@ padding:0 1rem;line-height:1.6}h1{font-size:1.4rem}
 <p>This is a private, personal voice-assistant bridge. It is not a commercial
 product and has no analytics or advertising.</p>
 <p>What it stores: your username and a salted hash of your password, the
-tokens you connect (Trello, Google Calendar), your calendar's timezone, and
+tokens you connect (Trello, Google Calendar, Home Assistant — the latter
+sent only to your own Home Assistant instance), your calendar's timezone, and
 a log of the commands you send. Commands are relayed to the LLM backend
 configured by the operator to decide what to do, and actions are carried out
 on the services you connected.</p>
@@ -2154,6 +2582,56 @@ def google_disconnect(request: Request) -> dict:
     return app_state(store.get_user(user["id"]))
 
 
+# --- Home Assistant: paste-URL-and-token connect, like Trello's token -------
+
+@app.post("/app/ha")
+def connect_ha(request: Request, body: HaConnectIn) -> dict:
+    """Probe GET /api/config with the pasted token before storing it, so a
+    typo fails here rather than at the first voice command."""
+    user = require_session(request)
+    url = body.url.strip().rstrip("/")
+    token = body.token.strip()
+    if not url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400,
+                            detail="the URL must start with http:// or https://")
+    if not token:
+        raise HTTPException(status_code=400,
+                            detail="paste a long-lived access token from your "
+                                    "HA profile page first")
+    try:
+        probe = requests.get(f"{url}/api/config",
+                             headers={"Authorization": f"Bearer {token}"},
+                             timeout=15)
+        probe.raise_for_status()
+        location = probe.json().get("location_name", "")
+    except requests.HTTPError as e:
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        if status is None:  # an HTTPError raised without a response attached
+            head = str(e).strip().split(" ", 1)[0]
+            status = int(head) if head.isdigit() else None
+        if status == 401:
+            raise HTTPException(
+                status_code=401,
+                detail="Home Assistant rejected that token — create a fresh "
+                       "long-lived token on your profile page")
+        raise HTTPException(status_code=502,
+                            detail=f"Home Assistant answered {status or 'an error'}")
+    except (requests.RequestException, ValueError):
+        raise HTTPException(status_code=502,
+                            detail="couldn't reach Home Assistant at that URL")
+    store.save_ha_instance(user["id"], url, token)
+    _ha.pop(user["id"], None)  # next use rebuilds and re-reads the home name
+    return app_state(store.get_user(user["id"]))
+
+
+@app.post("/app/ha/disconnect")
+def disconnect_ha(request: Request) -> dict:
+    user = require_session(request)
+    store.delete_ha_instance(user["id"])
+    _ha.pop(user["id"], None)
+    return app_state(store.get_user(user["id"]))
+
+
 # --- default-calendar picker --------------------------------------------------
 # Voice commands act on one calendar per user. Until they pick one it is
 # "primary"; the choice is stored with the grant and survives reconnects.
@@ -2347,6 +2825,7 @@ document.querySelectorAll('input').forEach(i=>i.addEventListener('keydown',e=>{i
 DASHBOARD_HTML = STYLE + """<div class="top"><h1>Watch Bridge</h1><span><span id="who" class="sub"></span> · <button class="gear" id="gearbtn" title="Settings">⚙</button> · <a href="/logout">log out</a></span></div>
 <details id="trello" class="dcard"><summary id="trellos"></summary><div class="inner" id="trellobody"></div></details>
 <details id="cald" class="dcard"><summary id="cals"></summary><div class="inner" id="calbody"></div></details>
+<details id="had" class="dcard"><summary id="has"></summary><div class="inner" id="habody"></div></details>
 <details id="watchd" class="dcard"><summary>⌚ Your watch shortcut</summary><div class="inner" id="watch"></div></details>
 <details id="talkd" class="dcard"><summary>☾ How to talk to it</summary><div class="inner">
  <p class="sub">Speak one sentence. It goes to the LLM agent together with the exact inventory
@@ -2364,6 +2843,10 @@ DASHBOARD_HTML = STYLE + """<div class="top"><h1>Watch Bridge</h1><span><span id
   <li>With more than one account connected: “add milk to shopping on my work trello”</li>
   <li>Once your calendar is connected: “what's on my calendar today” and “put
       dentists appointment in the calendar tomorrow at 3”</li>
+  <li>Once Home Assistant is connected: “turn on the dining light”, “toggle the
+      kettle”, “living room lights full”, “pause the living room speaker”</li>
+  <li>Also from Home Assistant: “what's the front door battery”, “is the front
+      door open”, “what will the weather be”</li>
  </ul>
  <p><b>One exchange, up close</b></p>
  <pre>you:    add bin day to chores on my work trello
@@ -2393,6 +2876,14 @@ spoken: “Bin day is on the Chores list of Work Stuff.”</pre>
   <li>Create an event, timed or all-day — your calendar's own timezone is used</li>
   <li>All of the above happen on the default calendar you pick in the Calendar
       section above (primary until you change it)</li>
+ </ul>
+ <p><b>What Home Assistant supports today</b></p>
+ <ul>
+  <li>Turn lights, switches and fans on, off or toggle — by spoken name</li>
+  <li>Apply a scene</li>
+  <li>Media players: play, pause, set volume, switch source</li>
+  <li>Read any entity's state — sensors, weather, binary sensors included</li>
+  <li>List entities, optionally filtered by domain</li>
  </ul>
  <p class="sub">Closing a card is an archive, so it can be brought back; a calendar event is
  deleted for real, which is why the agent asks before it deletes. The agent is only given
@@ -2521,6 +3012,37 @@ async function disconnectGoogle(){
  const r=await fetch('/app/google/disconnect',{method:'POST'});
  if(r.ok)render(await r.json());
 }
+function haCard(d){
+ const h=d.home_assistant;
+ if(!h||!h.connected)
+  return `<p class="sub">Connect your Home Assistant to control lights, switches, scenes and
+  media players by voice, and to read sensors. On your HA profile page create a
+  <b>long-lived access token</b>, then paste the URL and token below — the bridge
+  checks them against your instance before saving.</p>
+  <input id="haurl" placeholder="http://homeassistant.local:8123" autocomplete="off">
+  <input id="hatok" type="password" placeholder="Long-lived access token" autocomplete="off">
+  <button onclick="connectHa()">Connect</button> <span id="haerr"></span>`;
+ return `<p class="sub"><span class="ok">connected</span> — ${esc(h.location_name||'your home')}
+  · <span class="sub">${esc(h.url)}</span></p>
+  <p class="sub">Say “turn on the dining light”, “living room lights full”, “pause the
+  speaker”, or “what's the front door battery”. If a name matches more than one
+  device it asks which one instead of guessing.</p>
+  <button class="sec" id="hadisc">Disconnect</button><span id="haerr"></span>`;
+}
+async function connectHa(){
+ const err=document.getElementById('haerr'); err.textContent='';
+ const r=await fetch('/app/ha',{method:'POST',headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({url:document.getElementById('haurl').value,
+                       token:document.getElementById('hatok').value})});
+ if(!r.ok){const d=await r.json().catch(()=>({detail:'error '+r.status}));
+  err.textContent=d.detail||'error '+r.status;return}
+ render(await r.json());
+}
+async function disconnectHa(){
+ if(!confirm('Disconnect Home Assistant?'))return;
+ const r=await fetch('/app/ha/disconnect',{method:'POST'});
+ if(r.ok)render(await r.json());
+}
 async function removeAccount(label){
  if(!confirm('Remove the Trello account "'+label+'"?'))return;
  const r=await fetch('/app/trello?label='+encodeURIComponent(label),{method:'DELETE'});
@@ -2565,6 +3087,14 @@ function render(d){
  if(ce&&q.get('google_err'))ce.textContent=q.get('google_err');
  if(ce&&q.get('google')==='connected'){ce.className='ok';ce.textContent='calendar connected'}
  if(q.get('google')||q.get('google_err'))history.replaceState(null,'','/app');
+ const ha=d.home_assistant||{};
+ document.getElementById('has').textContent=ha.connected
+  ?`🏠 Home Assistant — ${ha.location_name||'connected'}`
+  :'🏠 Home Assistant — connect your instance';
+ document.getElementById('habody').innerHTML=haCard(d);
+ document.getElementById('had').open=!ha.connected;
+ const hd=document.getElementById('hadisc');
+ if(hd)hd.onclick=disconnectHa;
  document.getElementById('watch').innerHTML=recipe(d);
  document.getElementById('invite').innerHTML=inviteCard(d);
  document.getElementById('invited').style.display=d.invite_code?'':'none';
