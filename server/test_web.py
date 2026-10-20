@@ -169,6 +169,53 @@ def test_connect_trello_rejects_bad_token_without_storing(client, monkeypatch):
     assert user["id"] not in app._clients
 
 
+def test_connect_trello_repaste_replaces_expired_token(client, monkeypatch):
+    # Trello tokens expire (30-day) or get revoked; the dashboard's
+    # first-account form sends no label, which resolves to the existing
+    # account. Re-pasting must rotate that account's token, not 409.
+    signup(client)
+    user = store.get_user_by_name("tester")
+    monkeypatch.setattr(app.requests, "get",
+                        lambda url, params=None, timeout=None: FakeResp({"id": "me"}))
+    assert client.post("/app/trello", json={"token": "ATTAtok1"}).status_code == 200
+    with store.connect() as db:  # make preservation of created_at visible
+        db.execute("UPDATE trello_accounts SET created_at = '2020-01-01 00:00:00' "
+                   "WHERE user_id = ?", (user["id"],))
+    r = client.post("/app/trello", json={"token": "ATTAtok2"})
+    assert r.status_code == 200
+    accounts = store.accounts_for(user["id"])
+    assert len(accounts) == 1
+    assert accounts[0]["token"] == "ATTAtok2"
+    assert accounts[0]["created_at"] == "2020-01-01 00:00:00"
+    assert user["id"] in app._clients  # boards re-fetched under the new token
+
+
+def test_connect_trello_existing_label_updates_token(client, monkeypatch):
+    signup(client)
+    user = store.get_user_by_name("tester")
+    monkeypatch.setattr(app.requests, "get",
+                        lambda url, params=None, timeout=None: FakeResp({"id": "me"}))
+    assert client.post("/app/trello",
+                       json={"token": "ATTAw1", "label": "work"}).status_code == 200
+    assert client.post("/app/trello",
+                       json={"token": "ATTAw2", "label": "work"}).status_code == 200
+    accounts = store.accounts_for(user["id"])
+    assert len(accounts) == 1 and accounts[0]["token"] == "ATTAw2"
+
+
+def test_connect_trello_existing_label_updates_token(client, monkeypatch):
+    signup(client)
+    user = store.get_user_by_name("tester")
+    monkeypatch.setattr(app.requests, "get",
+                        lambda url, params=None, timeout=None: FakeResp({"id": "me"}))
+    assert client.post("/app/trello",
+                       json={"token": "ATTAw1", "label": "work"}).status_code == 200
+    assert client.post("/app/trello",
+                       json={"token": "ATTAw2", "label": "work"}).status_code == 200
+    accounts = store.accounts_for(user["id"])
+    assert len(accounts) == 1 and accounts[0]["token"] == "ATTAw2"
+
+
 def test_password_change(client):
     signup(client)
     assert client.post("/app/password", json={
@@ -286,18 +333,15 @@ def test_second_account_adds_and_routes_by_label(client, monkeypatch):
 
 
 def test_duplicate_account_label_conflicts(client, monkeypatch):
+    # Labels are case-insensitive: "WORK" must hit the stored "work" and
+    # rotate its token rather than create a second account.
     signup(client)
     assert connect_as(client, monkeypatch, "ATTAone", "work").status_code == 200
     r = connect_as(client, monkeypatch, "ATTAtwo", "WORK")
-    assert r.status_code == 409
-    assert "work" in r.json()["detail"]
-
-
-def test_second_account_requires_a_name(client, monkeypatch):
-    signup(client)
-    assert connect_as(client, monkeypatch, "ATTAone", "").status_code == 200
-    r = connect_as(client, monkeypatch, "ATTAtwo", "")
-    assert r.status_code == 409  # empty label resolves to the existing "trello"
+    assert r.status_code == 200
+    accounts = store.accounts_for(store.get_user_by_name("tester")["id"])
+    assert len(accounts) == 1
+    assert accounts[0]["label"] == "work" and accounts[0]["token"] == "ATTAtwo"
 
 
 def test_invalid_account_label_rejected(client, monkeypatch):

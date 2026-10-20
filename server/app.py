@@ -2457,7 +2457,9 @@ def dashboard_state(request: Request) -> dict:
 @app.post("/app/trello")
 def connect_trello(request: Request, body: TrelloTokenIn) -> dict:
     """Verify the pasted token against Trello, store it as an account,
-    refresh boards. An empty label names the user's first account."""
+    refresh boards. An empty label names the user's first account.
+    Re-pasting under a name that already exists rotates that account's
+    token (Trello tokens expire), it does not create a second row."""
     user = require_session(request)
     token = body.token.strip()
     if not token:
@@ -2477,9 +2479,9 @@ def connect_trello(request: Request, body: TrelloTokenIn) -> dict:
         raise HTTPException(status_code=401,
                             detail="Trello rejected that token — copy it again from the authorize page")
     if store.get_account(user["id"], label):
-        raise HTTPException(status_code=409,
-                            detail=f"you already have an account named '{label}' — pick another name")
-    store.add_account(user["id"], label, token)
+        store.set_account_token(user["id"], label, token)
+    else:
+        store.add_account(user["id"], label, token)
     _clients.pop(user["id"], None)
     return app_state(store.get_user(user["id"]))
 
@@ -2954,7 +2956,7 @@ function trelloCard(d){
  }
  const blocks=d.accounts.map((a,i)=>accountBlock(a,i,d)).join('<hr>');
  const addForm=`<details><summary>Add another Trello account</summary>
-  <p class="sub">Open the authorize link, copy the token, paste it below. Name it so you can say “on my work trello”.</p>
+  <p class="sub">Open the authorize link, copy the token, paste it below. Name it so you can say “on my work trello”. Reusing a name you already have replaces that account's token.</p>
   <p><a class="btn" href="${d.authorize_url}" target="_blank" rel="noopener">Authorize on Trello</a></p>
   <input id="lbl" placeholder="Account name, e.g. work" autocomplete="off">
   <input id="tok" placeholder="Paste your Trello token" autocomplete="off">

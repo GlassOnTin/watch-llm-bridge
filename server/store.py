@@ -194,6 +194,18 @@ def delete_account(user_id: int, label: str) -> bool:
     return cur.rowcount > 0
 
 
+def set_account_token(user_id: int, label: str, token: str) -> bool:
+    """Rotate an existing account's token (a re-paste onto a name that
+    already exists). created_at is kept: the account, and its role in the
+    system prompt, survive; only the credential changes."""
+    with connect() as db:
+        cur = db.execute(
+            "UPDATE trello_accounts SET token = ? WHERE user_id = ? AND label = ?",
+            (token, user_id, label),
+        )
+    return cur.rowcount > 0
+
+
 def migrate_accounts() -> None:
     """Copy each legacy users.trello_token into an account row labelled
     'trello'. Idempotent: users that already have account rows are skipped."""
