@@ -801,14 +801,14 @@ def command(cmd: Command, authorization: str = Header(default="")) -> dict:
     if cmd.source:
         logging.getLogger("uvicorn.error").info("command from %s for %s",
                                                 cmd.source, user["username"])
+    trello_err = None
     try:
-        t = trello_for(user)
+        clients = clients_for(user)
     except requests.RequestException as e:
         logging.getLogger("uvicorn.error").warning("Trello refresh for %s failed: %s",
                                                    user["username"], e)
-        return {"reply": "Trello is unreachable right now."}
-    if t is None:
-        return {"reply": "Your Trello isn't connected yet. Open the bridge dashboard to connect it."}
+        clients = []
+        trello_err = e
     g = None
     if google_configured():
         try:
@@ -827,7 +827,14 @@ def command(cmd: Command, authorization: str = Header(default="")) -> dict:
         logging.getLogger("uvicorn.error").warning(
             "Home Assistant for %s failed: %s", user["username"], e)
         h = None
-    return {"reply": route(cmd.text, clients=clients_for(user), gcal=g, ha=h)}
+    if not clients and g is None and h is None:
+        if trello_err is not None:
+            status = getattr(getattr(trello_err, "response", None), "status_code", None)
+            if status == 401:
+                return {"reply": "Your Trello token has expired. Open the bridge dashboard to reconnect it."}
+            return {"reply": "Trello is unreachable right now."}
+        return {"reply": "Your Trello isn't connected yet. Open the bridge dashboard to connect it."}
+    return {"reply": route(cmd.text, clients=clients, gcal=g, ha=h)}
 
 
 def route(text: str) -> str:
@@ -1216,6 +1223,10 @@ def build_system_prompt(t: Trello | None = None,
     clients = clients if clients is not None else [(None, t or trello)]
     multi = len(clients) > 1
     lines = []
+    if not clients:
+        lines.append("- Trello is disconnected (token expired or not connected); "
+                     "on a trello_disconnected result or any Trello request, say "
+                     "their Trello needs reconnecting from the bridge dashboard.")
     for label, c in clients:
         for board, bid in c.boards.items():
             names = " | ".join(n for n, _ in c.lists_by_board.get(bid, []))
@@ -1447,6 +1458,8 @@ def execute_tool(name: str, args: dict, t: Trello | None = None,
                  gcal: Gcal | None = None, ha: Ha | None = None) -> dict:
     """Dispatch one tool call. KeyError from resolve_target = mismatch."""
     clients = clients if clients is not None else [(None, t or trello)]
+    if name.startswith("trello_") and not clients:
+        return {"ok": False, "error": "trello_disconnected"}
     multi = len(clients) > 1
 
     def client_for(picked: dict) -> Trello:
@@ -2472,12 +2485,18 @@ def connect_trello(request: Request, body: TrelloTokenIn) -> dict:
         raise HTTPException(status_code=400,
                             detail="account name is 1-32 characters: a-z, 0-9, '-' or '_'")
     try:
-        probe = requests.get(f"{TRELLO_API}/members/me",
+        probe = requests.get(f"{TRELLO_API}/tokens/{token}",
                              params={"key": TRELLO_KEY, "token": token}, timeout=15)
         probe.raise_for_status()
+        meta = probe.json()
     except requests.RequestException:
         raise HTTPException(status_code=401,
                             detail="Trello rejected that token — copy it again from the authorize page")
+    if isinstance(meta, dict) and meta.get("dateExpires") is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="that token has an expiry date — use the authorize link on this page (expiration=never) so it doesn't expire in 30 days",
+        )
     if store.get_account(user["id"], label):
         store.set_account_token(user["id"], label, token)
     else:

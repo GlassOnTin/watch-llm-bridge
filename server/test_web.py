@@ -203,17 +203,19 @@ def test_connect_trello_existing_label_updates_token(client, monkeypatch):
     assert len(accounts) == 1 and accounts[0]["token"] == "ATTAw2"
 
 
-def test_connect_trello_existing_label_updates_token(client, monkeypatch):
+def test_connect_trello_rejects_expiring_token(client, monkeypatch):
     signup(client)
     user = store.get_user_by_name("tester")
-    monkeypatch.setattr(app.requests, "get",
-                        lambda url, params=None, timeout=None: FakeResp({"id": "me"}))
-    assert client.post("/app/trello",
-                       json={"token": "ATTAw1", "label": "work"}).status_code == 200
-    assert client.post("/app/trello",
-                       json={"token": "ATTAw2", "label": "work"}).status_code == 200
-    accounts = store.accounts_for(user["id"])
-    assert len(accounts) == 1 and accounts[0]["token"] == "ATTAw2"
+    monkeypatch.setattr(
+        app.requests, "get",
+        lambda url, params=None, timeout=None: FakeResp(
+            {"id": "tok1", "dateExpires": "2026-12-09T00:00:00.000Z"}
+        ),
+    )
+    r = client.post("/app/trello", json={"token": "ATTA30days"})
+    assert r.status_code == 400
+    assert "expiry" in r.json()["detail"].lower() or "expire" in r.json()["detail"].lower()
+    assert store.get_account(user["id"], "trello") is None
 
 
 def test_password_change(client):
@@ -1866,3 +1868,47 @@ def test_command_survives_a_dead_ha_token(client, monkeypatch):
                     headers=bearer(user))
     assert r.status_code == 200
     assert r.json()["reply"] == "echo: turn on the kettle"
+
+
+def test_command_survives_dead_trello_token_when_gcal_connected(client, monkeypatch):
+    signup(client)
+    user = store.get_user_by_name("tester")
+    store.add_account(user["id"], "trello", "ATTAexpired")
+    store.save_google_account(user["id"], "g-acc", "g-ref", 9999999999.0, "Europe/London")
+    app._clients.pop(user["id"], None)
+    monkeypatch.setattr(app, "GOOGLE_CLIENT_ID", "cid")
+    monkeypatch.setattr(app, "GOOGLE_CLIENT_SECRET", "csec")
+    monkeypatch.setattr(app, "LLM_BASE_URL", "")  # echo mode
+
+    def dead_refresh(self):
+        e = app.requests.HTTPError("401 Client Error: Unauthorized")
+        e.response = SimpleNamespace(status_code=401, text="invalid key")
+        raise e
+
+    monkeypatch.setattr(app.Trello, "refresh", dead_refresh)
+    r = client.post("/command", json={"text": "what is on my calendar today"},
+                    headers=bearer(user))
+    assert r.status_code == 200
+    assert r.json()["reply"] == "echo: what is on my calendar today"
+    assert app.execute_tool("trello_list_boards", {}, clients=[]) == {
+        "ok": False, "error": "trello_disconnected"
+    }
+
+
+def test_command_reports_expired_trello_token_when_alone(client, monkeypatch):
+    signup(client)
+    user = store.get_user_by_name("tester")
+    store.add_account(user["id"], "trello", "ATTAexpired")
+    app._clients.pop(user["id"], None)
+    monkeypatch.setattr(app, "LLM_BASE_URL", "")
+
+    def dead_refresh(self):
+        e = app.requests.HTTPError("401 Client Error: Unauthorized")
+        e.response = SimpleNamespace(status_code=401, text="invalid key")
+        raise e
+
+    monkeypatch.setattr(app.Trello, "refresh", dead_refresh)
+    r = client.post("/command", json={"text": "add milk"}, headers=bearer(user))
+    assert r.status_code == 200
+    assert "expired" in r.json()["reply"].lower()
+    assert "dashboard" in r.json()["reply"].lower()
