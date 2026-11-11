@@ -2070,3 +2070,50 @@ def test_dev_projects_start_list_and_switch_over_watch_bridge(client):
     assert "Solar Logger" in miss["candidates"]
 
 
+def test_dev_propose_project_waits_for_confirmation_before_creating(client):
+    owner = store.get_user_by_name(app.OWNER_USERNAME)
+    prop = app.execute_tool(
+        "dev_propose_project",
+        {
+            "name": "OctoPrint Poller",
+            "summary": "Polls OctoPrint temperatures",
+            "initial_task": "Build a Python CLI that polls OctoPrint temperatures.",
+        },
+        dev_user=owner,
+    )
+    assert prop == {
+        "ok": True,
+        "status": "confirm_needed",
+        "proposed_slug": "octoprint-poller",
+        "proposed_name": "OctoPrint Poller",
+        "active_project": "watch-llm-bridge",
+    }
+    # Nothing created yet in dev_projects!
+    assert store.list_dev_projects(owner["id"], watch_only=True) == []
+
+    # Stateless Turn 2 prompt carries the pending proposal so "Yes" works!
+    prompt = app.build_system_prompt(t=app.Trello("k", "t"), dev=True, dev_user=owner)
+    assert "octoprint-poller" in prompt
+    assert "Build a Python CLI that polls OctoPrint temperatures." in prompt
+
+    # User says "Yes" -> router calls dev_start_project -> project created & proposal cleared
+    started = app.execute_tool(
+        "dev_start_project",
+        {
+            "name": "octoprint-poller",
+            "summary": "Polls OctoPrint temperatures",
+            "initial_task": "Build a Python CLI that polls OctoPrint temperatures.",
+        },
+        dev_user=owner,
+    )
+    assert started["ok"] is True
+    assert [p["slug"] for p in store.list_dev_projects(owner["id"], watch_only=True)] == [
+        "octoprint-poller"
+    ]
+    assert store.get_dev_proposal(owner["id"]) is None
+    assert app.execute_tool("dev_cancel_proposal", {}, dev_user=owner) == {
+        "ok": True, "status": "proposal_cleared"
+    }
+
+
+

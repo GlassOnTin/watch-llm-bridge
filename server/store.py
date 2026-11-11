@@ -76,6 +76,15 @@ CREATE TABLE IF NOT EXISTS dev_projects (
   UNIQUE(user_id, slug)
 );
 
+CREATE TABLE IF NOT EXISTS dev_proposals (
+  user_id INTEGER PRIMARY KEY,
+  slug TEXT NOT NULL,
+  name TEXT NOT NULL,
+  summary TEXT NOT NULL DEFAULT '',
+  initial_task TEXT NOT NULL DEFAULT '',
+  created_at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS dev_turns (
   id INTEGER PRIMARY KEY,
   user_id INTEGER NOT NULL,
@@ -388,12 +397,18 @@ def slugify_project(name: str) -> str:
 
 def _ensure_default_project(db: sqlite3.Connection, user_id: int) -> None:
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    default_summary = (
+        "Apple Watch voice assistant bridge (Trello, Google Calendar, "
+        "Home Assistant, dashboard, voice tools)"
+    )
     db.execute(
         "INSERT INTO dev_projects (user_id, slug, name, summary, conversation_id, "
         "started_via_watch, created_at, updated_at) "
-        "VALUES (?, ?, 'Watch LLM Bridge', 'Watch voice bridge codebase', '', 0, ?, ?) "
-        "ON CONFLICT(user_id, slug) DO NOTHING",
-        (user_id, DEFAULT_DEV_PROJECT, now, now),
+        "VALUES (?, ?, 'Watch LLM Bridge', ?, '', 0, ?, ?) "
+        "ON CONFLICT(user_id, slug) DO UPDATE SET "
+        "summary = CASE WHEN dev_projects.summary = '' THEN excluded.summary "
+        "ELSE dev_projects.summary END",
+        (user_id, DEFAULT_DEV_PROJECT, default_summary, now, now),
     )
 
 
@@ -421,6 +436,7 @@ def create_dev_project(user_id: int, name: str, summary: str = "",
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     with _dev_lock, connect() as db:
         _ensure_default_project(db, user_id)
+        db.execute("DELETE FROM dev_proposals WHERE user_id = ?", (user_id,))
         db.execute(
             "INSERT INTO dev_projects (user_id, slug, name, summary, conversation_id, "
             "started_via_watch, created_at, updated_at) "
@@ -435,6 +451,46 @@ def create_dev_project(user_id: int, name: str, summary: str = "",
             (user_id, slug),
         ).fetchone()
     return dict(row)
+
+
+def save_dev_proposal(user_id: int, name: str, summary: str = "",
+                      initial_task: str = "", now: float | None = None) -> dict:
+    slug = slugify_project(name)
+    display = name.strip() or slug
+    ts = time.time() if now is None else now
+    with _dev_lock, connect() as db:
+        db.execute(
+            "INSERT INTO dev_proposals (user_id, slug, name, summary, initial_task, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET slug=excluded.slug, name=excluded.name, "
+            "summary=excluded.summary, initial_task=excluded.initial_task, "
+            "created_at=excluded.created_at",
+            (user_id, slug, display, summary.strip(), initial_task.strip(), ts),
+        )
+        row = db.execute(
+            "SELECT * FROM dev_proposals WHERE user_id = ?", (user_id,)
+        ).fetchone()
+    return dict(row)
+
+
+def get_dev_proposal(user_id: int, now: float | None = None,
+                     ttl: float = 900.0) -> dict | None:
+    ts = time.time() if now is None else now
+    with _dev_lock, connect() as db:
+        row = db.execute(
+            "SELECT * FROM dev_proposals WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        if not row:
+            return None
+        if ts - row["created_at"] > ttl:
+            db.execute("DELETE FROM dev_proposals WHERE user_id = ?", (user_id,))
+            return None
+    return dict(row)
+
+
+def clear_dev_proposal(user_id: int) -> None:
+    with _dev_lock, connect() as db:
+        db.execute("DELETE FROM dev_proposals WHERE user_id = ?", (user_id,))
 
 
 def find_dev_project(user_id: int, query: str) -> dict:
@@ -556,6 +612,7 @@ def enqueue_dev_turn(user_id: int, prompt: str, new_thread: bool = False,
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     with _dev_lock, connect() as db:
         _ensure_default_project(db, user_id)
+        db.execute("DELETE FROM dev_proposals WHERE user_id = ?", (user_id,))
         srow = db.execute(
             "SELECT active_project FROM dev_state WHERE user_id = ?", (user_id,)
         ).fetchone()

@@ -646,24 +646,52 @@ def test_ha_prompt_section_appears_only_when_connected(stocked_trello):
 
 
 def test_dev_tools_and_prompt_appear_only_for_dev_user(stocked_trello):
+    all_dev = {"dev_send", "dev_status", "dev_new_thread",
+               "dev_list_projects", "dev_propose_project", "dev_cancel_proposal",
+               "dev_start_project", "dev_switch_project"}
     normal_names = {t["function"]["name"] for t in app.tools_for()}
-    assert not (normal_names & {"dev_send", "dev_status", "dev_new_thread",
-                                "dev_list_projects", "dev_start_project", "dev_switch_project"})
+    assert not (normal_names & all_dev)
     dev_names = {t["function"]["name"] for t in app.tools_for(dev=True)}
-    assert {"dev_send", "dev_status", "dev_new_thread",
-            "dev_list_projects", "dev_start_project", "dev_switch_project"} <= dev_names
+    assert all_dev <= dev_names
 
     no_dev = app.build_system_prompt(t=app.Trello("k", "t"))
     assert "dev_send" not in no_dev
     with_dev = app.build_system_prompt(t=app.Trello("k", "t"), dev=True)
-    for tool in ("dev_send", "dev_status", "dev_new_thread",
-                 "dev_list_projects", "dev_start_project", "dev_switch_project"):
+    for tool in all_dev:
         assert tool in with_dev
 
     assert app.execute_tool("dev_send", {"message": "hi"}) == {
         "ok": False, "error": "dev_forbidden"
     }
+    assert app.execute_tool("dev_propose_project", {"name": "foo", "initial_task": "bar"}) == {
+        "ok": False, "error": "dev_forbidden"
+    }
     assert app.execute_tool("dev_list_projects", {}) == {
         "ok": False, "error": "dev_forbidden"
     }
+
+
+def test_dev_prompt_includes_project_inventory_and_pending_proposal(tmp_path, monkeypatch, stocked_trello):
+    import store
+    store._conn = None
+    monkeypatch.setattr(store, "DB_PATH", str(tmp_path / "route_dev.db"))
+    try:
+        ian = store.create_user("ian", "password8", is_admin=True)
+        store.create_dev_project(ian["id"], "Solar Logger", summary="Victron MQTT stats",
+                                 started_via_watch=True)
+        store.save_dev_proposal(
+            ian["id"],
+            name="OctoPrint Poller",
+            summary="3D printer temp logger",
+            initial_task="Build OctoPrint temperature logger CLI",
+        )
+        prompt = app.build_system_prompt(t=app.Trello("k", "t"), dev=True, dev_user=ian)
+        assert "dev_propose_project" in prompt
+        assert "active project: 'watch-llm-bridge'" in prompt
+        assert "Solar Logger" in prompt and "Victron MQTT stats" in prompt
+        assert "octoprint-poller" in prompt
+        assert "Build OctoPrint temperature logger CLI" in prompt
+    finally:
+        store._conn = None
+
 

@@ -299,3 +299,30 @@ def test_legacy_dev_tables_migrate_project_columns(tmp_path):
     assert st["active_project"] == "watch-llm-bridge"
     assert st["conversation_id"] == "conv-existing"
 
+
+def test_dev_pending_proposal_round_trip_expiry_and_auto_clear():
+    u = create_user("ian", "hunter2hunter", is_admin=True)
+    assert store.get_dev_proposal(u["id"], now=1000.0) is None
+
+    prop = store.save_dev_proposal(
+        u["id"],
+        name="OctoPrint Logger",
+        summary="Polls OctoPrint temps",
+        initial_task="Build a CLI that polls OctoPrint temperatures into SQLite",
+        now=1000.0,
+    )
+    assert prop["slug"] == "octoprint-logger"
+    assert prop["name"] == "OctoPrint Logger"
+    live = store.get_dev_proposal(u["id"], now=1500.0, ttl=900.0)
+    assert live is not None
+    assert live["initial_task"].startswith("Build a CLI")
+
+    # Expired after TTL
+    assert store.get_dev_proposal(u["id"], now=2000.0, ttl=900.0) is None
+
+    # Creating the project clears any active proposal
+    store.save_dev_proposal(u["id"], "OctoPrint Logger", "Polls", "Build CLI", now=2100.0)
+    store.create_dev_project(u["id"], "octoprint-logger", summary="Polls", started_via_watch=True)
+    assert store.get_dev_proposal(u["id"], now=2105.0, ttl=900.0) is None
+
+

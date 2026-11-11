@@ -73,6 +73,7 @@ HA_CONTROLLABLE = {"light", "switch", "fan", "scene", "media_player"}
 # Workstation Carbon dev-agent queue (admin/owner only).
 DEV_SYNC_WAIT = float(os.environ.get("DEV_SYNC_WAIT", "10.0"))
 DEV_WORKER_TTL = float(os.environ.get("DEV_WORKER_TTL", "45.0"))
+DEV_PROPOSAL_TTL = float(os.environ.get("DEV_PROPOSAL_TTL", "900.0"))
 DEV_NOTIFY_TARGET = os.environ.get("DEV_NOTIFY_TARGET", "mobile_app_ian_sphone")
 _dev_cond = threading.Condition()
 
@@ -1265,6 +1266,27 @@ DEV_TOOLS = [
                              "description": "Optional first coding/scaffolding instruction for Carbon"}},
             "required": ["name"]}}},
     {"type": "function", "function": {
+        "name": "dev_propose_project",
+        "description": (
+            "Propose starting a new project repo when a coding request is for a "
+            "standalone tool/script/app that does not belong to any existing Carbon "
+            "project and the user did not explicitly ask to start a new project yet. "
+            "Saves a pending proposal and waits for user confirmation before creating "
+            "anything in ~/Code."
+        ),
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string",
+                     "description": "Proposed short project name or kebab-case slug"},
+            "summary": {"type": "string",
+                        "description": "Short one-line description of the proposed project"},
+            "initial_task": {"type": "string",
+                             "description": "The coding instruction to run once the user confirms"}},
+            "required": ["name", "initial_task"]}}},
+    {"type": "function", "function": {
+        "name": "dev_cancel_proposal",
+        "description": "Cancel and clear a pending new-project proposal when the user declines.",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
         "name": "dev_switch_project",
         "description": "Switch Carbon's active project (resuming that project's conversation thread). Set attach_existing=true only when attaching an existing repo in ~/Code.",
         "parameters": {"type": "object", "properties": {
@@ -1290,7 +1312,8 @@ def build_system_prompt(t: Trello | None = None,
                         clients: list[tuple[str, Trello]] | None = None,
                         gcal: Gcal | None = None,
                         ha: Ha | None = None,
-                        dev: bool = False) -> str:
+                        dev: bool = False,
+                        dev_user: dict | None = None) -> str:
     clients = clients if clients is not None else [(None, t or trello)]
     multi = len(clients) > 1
     lines = []
@@ -1363,20 +1386,68 @@ def build_system_prompt(t: Trello | None = None,
             "- dev_status() — check whether Carbon is still working, active project, or read its latest reply",
             "- dev_new_thread() — start a fresh conversation thread on the active project",
             "- dev_list_projects(watch_only) — list projects started over the watch bridge (or all Carbon projects)",
-            "- dev_start_project(name, summary, initial_task) — start a new project repo on the workstation",
+            "- dev_propose_project(name, summary, initial_task) — propose a new project and ask confirmation before creating a repo",
+            "- dev_cancel_proposal() — clear a pending new-project proposal if the user declines",
+            "- dev_start_project(name, summary, initial_task) — start a new project repo once explicitly requested or confirmed",
             "- dev_switch_project(name, attach_existing) — switch Carbon between projects",
         ]
+    dev_section = ""
+    if dev and dev_user:
+        uid = dev_user["id"]
+        dstate = store.get_dev_state(uid)
+        dprojects = store.list_dev_projects(uid, watch_only=False)
+        proj_lines = []
+        for p in dprojects:
+            tags = []
+            if p["slug"] == dstate["active_project"]:
+                tags.append("active")
+            if p["started_via_watch"]:
+                tags.append("watch-started")
+            tag_str = f", {', '.join(tags)}" if tags else ""
+            desc = f": {p['summary']}" if p["summary"] else ""
+            proj_lines.append(f"- {p['name']} (slug: {p['slug']}{tag_str}){desc}")
+        proposal = store.get_dev_proposal(uid, ttl=DEV_PROPOSAL_TTL)
+        prop_block = ""
+        if proposal:
+            prop_block = (
+                f"\nPending new-project proposal awaiting confirmation:\n"
+                f"- proposed_slug: {proposal['slug']} (name: '{proposal['name']}')\n"
+                f"- summary: {proposal['summary']}\n"
+                f"- initial_task: {proposal['initial_task']}\n"
+            )
+        dev_section = (
+            f"\nCarbon coding projects (active project: '{dstate['active_project']}'):\n\n"
+            + "\n".join(proj_lines)
+            + "\n"
+            + prop_block
+        )
     dev_rule = (
         """\n11. Dev agent (Carbon): when the user mentions Carbon, coding projects, or asks
-    to inspect, debug, test, change, or deploy the watch bridge or another
-    project, use the dev_* tools:
+    to inspect, debug, test, build, change, or deploy software, use the dev_* tools:
     - dev_list_projects(watch_only=true) when asked what projects they started
       over the watch bridge (pass watch_only=false only when asked for all
       projects including existing repos).
-    - dev_start_project(name, summary, initial_task) when asked to create/start
-      a brand-new project; dev_switch_project(name) to switch projects.
-    - dev_send(message, project, new_thread) to talk to Carbon; dev_status() to
-      check progress or read Carbon's latest reply; dev_new_thread() to reset.
+    - Project routing: check the Carbon coding projects inventory above. If the
+      request matches an existing project (by name, slug, or summary), pass
+      project=<slug> to dev_send (or call dev_switch_project). If it is about
+      the active project or continues the current thread, call dev_send(message).
+    - New project detection (confirm first): if the user explicitly asks to
+      start/create a new project and names it, call dev_start_project(name,
+      summary, initial_task) directly. Otherwise, if they ask Carbon to build a
+      standalone tool, script, or app that clearly does NOT belong in any
+      existing project in the inventory, NEVER dump unrelated code into
+      watch-llm-bridge and NEVER create a repo unconfirmed — call
+      dev_propose_project(name, summary, initial_task) with a short name and ask
+      in one short sentence: "Should I start a new project called <proposed_slug>
+      for that?"
+    - Pending proposal follow-up: when a pending new-project proposal is shown
+      above and the user confirms ("yes", "go ahead", or "yes, call it X"), call
+      dev_start_project with the pending summary and initial_task (using the new
+      name if they renamed it). If they say to put it in an existing project
+      instead, call dev_send on that project with initial_task. If they decline
+      or cancel, call dev_cancel_proposal().
+    - dev_status() checks progress or reads Carbon's latest reply; dev_new_thread()
+      resets the active project's conversation thread.
     When status is "done", read Carbon's reply aloud concisely. When status is
     "running" or "queued_offline", say so in one short sentence."""
         if dev else ""
@@ -1424,7 +1495,7 @@ Tools:
 Exact inventory of boards and lists:
 
 {inventory}
-{home_section}
+{home_section}{dev_section}
 Rules:
 1. Match the spoken words to this inventory case-insensitively and fuzzily.
    Ignore emoji and punctuation in list names, and treat near-misses ("huge"
@@ -1914,6 +1985,30 @@ def execute_tool(name: str, args: dict, t: Trello | None = None,
                     for p in rows
                 ],
             }
+        if name == "dev_propose_project":
+            raw_name = (args.get("name") or "").strip()
+            if not raw_name:
+                return {"ok": False, "error": "empty_project_name"}
+            try:
+                prop = store.save_dev_proposal(
+                    uid,
+                    raw_name,
+                    summary=(args.get("summary") or "").strip(),
+                    initial_task=(args.get("initial_task") or "").strip(),
+                )
+            except ValueError as e:
+                return {"ok": False, "error": "bad_project_name", "detail": str(e)}
+            state = store.get_dev_state(uid)
+            return {
+                "ok": True,
+                "status": "confirm_needed",
+                "proposed_slug": prop["slug"],
+                "proposed_name": prop["name"],
+                "active_project": state["active_project"],
+            }
+        if name == "dev_cancel_proposal":
+            store.clear_dev_proposal(uid)
+            return {"ok": True, "status": "proposal_cleared"}
         if name == "dev_start_project":
             raw_name = (args.get("name") or "").strip()
             if not raw_name:
@@ -1949,6 +2044,7 @@ def execute_tool(name: str, args: dict, t: Trello | None = None,
                     hit = store.find_dev_project(uid, raw_name)
                 except KeyError as e:
                     return _match_error(e, "no_project", "ambiguous_project")
+            store.clear_dev_proposal(uid)
             store.set_active_dev_project(uid, hit["slug"])
             return {"ok": True, "active_project": hit["slug"], "name": hit["name"],
                     "has_thread": bool(hit["conversation_id"])}
@@ -2059,7 +2155,8 @@ def route(text: str, t: Trello | None = None,
     dev = is_dev_user(dev_user)
     messages = [
         {"role": "system",
-         "content": build_system_prompt(clients=clients, gcal=gcal, ha=ha, dev=dev)},
+         "content": build_system_prompt(clients=clients, gcal=gcal, ha=ha,
+                                        dev=dev, dev_user=dev_user)},
         {"role": "user", "content": text},
     ]
     for _ in range(3):
