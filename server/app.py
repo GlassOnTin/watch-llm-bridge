@@ -1242,8 +1242,10 @@ DEV_TOOLS = [
             "required": ["message"]}}},
     {"type": "function", "function": {
         "name": "dev_status",
-        "description": "Check whether Carbon is still working, which project is active, or read its latest reply.",
-        "parameters": {"type": "object", "properties": {}}}},
+        "description": "Check whether Carbon is still working, which project is active, or read its latest spoken reply (set detail=true only when asked for exact commands, filenames, or technical details).",
+        "parameters": {"type": "object", "properties": {
+            "detail": {"type": "boolean",
+                       "description": "true only when the user asks for full technical details or commands from Carbon's last run"}}}}},
     {"type": "function", "function": {
         "name": "dev_new_thread",
         "description": "Reset and start a fresh conversation thread with Carbon on the active project.",
@@ -1383,7 +1385,7 @@ def build_system_prompt(t: Trello | None = None,
     if dev:
         tool_lines += [
             "- dev_send(message, project, new_thread) — talk to Carbon, the coding agent on the workstation",
-            "- dev_status() — check whether Carbon is still working, active project, or read its latest reply",
+            "- dev_status(detail) — check whether Carbon is still working, active project, or read its latest spoken summary (detail=true for full output)",
             "- dev_new_thread() — start a fresh conversation thread on the active project",
             "- dev_list_projects(watch_only) — list projects started over the watch bridge (or all Carbon projects)",
             "- dev_propose_project(name, summary, initial_task) — propose a new project and ask confirmation before creating a repo",
@@ -1446,8 +1448,9 @@ def build_system_prompt(t: Trello | None = None,
       name if they renamed it). If they say to put it in an existing project
       instead, call dev_send on that project with initial_task. If they decline
       or cancel, call dev_cancel_proposal().
-    - dev_status() checks progress or reads Carbon's latest reply; dev_new_thread()
-      resets the active project's conversation thread.
+    - dev_status(detail) checks progress or reads Carbon's latest spoken summary
+      (pass detail=true only when the user asks for technical details or exact
+      commands); dev_new_thread() resets the active project's conversation thread.
     When status is "done", read Carbon's reply aloud concisely. When status is
     "running" or "queued_offline", say so in one short sentence."""
         if dev else ""
@@ -2057,12 +2060,15 @@ def execute_tool(name: str, args: dict, t: Trello | None = None,
                 return {"ok": True, "status": "idle", "worker_online": online,
                         "active_project": state["active_project"],
                         "conversation_id": state["conversation_id"]}
-            return {"ok": True, "status": latest["status"], "turn_id": latest["id"],
-                    "project": latest.get("project_slug") or state["active_project"],
-                    "active_project": state["active_project"],
-                    "reply": latest["reply"],
-                    "conversation_id": latest["conversation_id"] or state["conversation_id"],
-                    "worker_online": online}
+            out = {"ok": True, "status": latest["status"], "turn_id": latest["id"],
+                   "project": latest.get("project_slug") or state["active_project"],
+                   "active_project": state["active_project"],
+                   "reply": latest["reply"],
+                   "conversation_id": latest["conversation_id"] or state["conversation_id"],
+                   "worker_online": online}
+            if args.get("detail"):
+                out["raw_reply"] = latest.get("raw_reply") or latest["reply"]
+            return out
         if name == "dev_send":
             msg = (args.get("message") or "").strip()
             if not msg:
@@ -2576,8 +2582,66 @@ class DevPollIn(BaseModel):
 
 class DevCompleteIn(BaseModel):
     reply: str
+    raw_reply: str = ""
     conversation_id: str = ""
     error: bool = False
+
+
+def _strip_markdown_for_speech(text: str) -> str:
+    out = re.sub(r"```.*?```", " ", text, flags=re.DOTALL)
+    out = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", out)
+    out = out.replace("`", "").replace("**", "").replace("__", "")
+    out = re.sub(r"(?m)^\s*[-*#>]+\s*", "", out)
+    out = re.sub(r"\s+", " ", out).strip()
+    return out or "Done."
+
+
+def summarize_for_watch(raw_text: str, user_prompt: str = "",
+                        error: bool = False) -> str:
+    """Distil raw coding-agent output into 1-2 short spoken sentences for Watch TTS."""
+    cleaned = _strip_markdown_for_speech(raw_text)
+    words = cleaned.split()
+    if len(words) <= 20 and len(cleaned) <= 140:
+        return cleaned
+    if LLM_BASE_URL and LLM_API_KEY and LLM_MODEL:
+        sys_msg = (
+            "Rewrite the coding agent's output as one or two short, natural "
+            "spoken sentences (under 30 words total) to be read aloud on an "
+            "Apple Watch. State what was done and whether tests passed or user "
+            "action is needed. Omit file paths, URLs, CLI flags, exact "
+            "constants, commit hashes, and shell commands."
+        )
+        if error:
+            sys_msg += " Mention the failure reason plainly in one short sentence."
+        user_msg = (
+            f"User asked: {user_prompt}\n\nAgent output:\n{raw_text[:4000]}"
+            if user_prompt else raw_text[:4000]
+        )
+        try:
+            r = requests.post(
+                f"{LLM_BASE_URL}/chat/completions",
+                headers={"Authorization": f"Bearer {LLM_API_KEY}"},
+                json={
+                    "model": LLM_MODEL,
+                    "messages": [
+                        {"role": "system", "content": sys_msg},
+                        {"role": "user", "content": user_msg},
+                    ],
+                    "temperature": 0.1,
+                    "max_tokens": 90,
+                },
+                timeout=8,
+            )
+            r.raise_for_status()
+            content = (r.json()["choices"][0]["message"].get("content") or "").strip()
+            if content:
+                return _strip_markdown_for_speech(content)
+        except Exception as e:
+            logging.getLogger("uvicorn.error").warning("summarize_for_watch fallback: %s", e)
+    if len(cleaned) <= 200:
+        return cleaned
+    clipped = cleaned[:197].rsplit(" ", 1)[0]
+    return clipped.rstrip(".,;:") + "..."
 
 
 def require_dev_user(authorization: str) -> dict:
@@ -2626,8 +2690,14 @@ def dev_complete(turn_id: int, body: DevCompleteIn,
     existing = store.get_dev_turn(turn_id)
     if not existing or existing["user_id"] != user["id"]:
         raise HTTPException(status_code=404, detail="turn not found")
+    raw = (body.raw_reply or body.reply).strip()
+    spoken = summarize_for_watch(raw, user_prompt=existing["prompt"], error=body.error)
     done = store.complete_dev_turn(
-        turn_id, body.reply, conversation_id=body.conversation_id, error=body.error
+        turn_id,
+        spoken,
+        conversation_id=body.conversation_id,
+        error=body.error,
+        raw_reply=raw,
     )
     with _dev_cond:
         _dev_cond.notify_all()

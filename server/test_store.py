@@ -326,3 +326,23 @@ def test_dev_pending_proposal_round_trip_expiry_and_auto_clear():
     assert store.get_dev_proposal(u["id"], now=2105.0, ttl=900.0) is None
 
 
+def test_complete_dev_turn_stores_spoken_reply_and_raw_reply():
+    u = create_user("ian", "hunter2hunter", is_admin=True)
+    t1 = store.enqueue_dev_turn(u["id"], "build converter")
+    store.claim_next_dev_turn(u["id"], host="ws", now=100.0)
+    done = store.complete_dev_turn(
+        t1["id"],
+        "Built the miles-to-km converter and all tests passed.",
+        conversation_id="conv-raw",
+        raw_reply="## Summary\n- Built `miles_to_km.py` with factor `1.609344`.\n- 13 pytest cases passed.",
+    )
+    assert done["reply"] == "Built the miles-to-km converter and all tests passed."
+    assert "1.609344" in done["raw_reply"]
+    # When raw_reply is omitted, it defaults to reply.
+    t2 = store.enqueue_dev_turn(u["id"], "ping")
+    store.claim_next_dev_turn(u["id"], host="ws", now=110.0)
+    done2 = store.complete_dev_turn(t2["id"], "Pong.", conversation_id="conv-raw")
+    assert done2["raw_reply"] == "Pong."
+
+
+

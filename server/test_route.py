@@ -695,3 +695,56 @@ def test_dev_prompt_includes_project_inventory_and_pending_proposal(tmp_path, mo
         store._conn = None
 
 
+def test_summarize_for_watch_short_passthrough_and_llm_rewrite(monkeypatch):
+    calls = []
+
+    class FakeResp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {
+                "choices": [{
+                    "message": {
+                        "content": "I built and tested the miles-to-kilometres CLI, and all thirteen tests passed."
+                    }
+                }]
+            }
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        calls.append((url, json))
+        return FakeResp()
+
+    monkeypatch.setattr(app, "LLM_BASE_URL", "https://fake.llm/v1")
+    monkeypatch.setattr(app, "LLM_API_KEY", "sk-test")
+    monkeypatch.setattr(app, "LLM_MODEL", "fake-fast")
+    monkeypatch.setattr(app.requests, "post", fake_post)
+
+    # Short spoken replies skip the LLM call completely.
+    short = app.summarize_for_watch("Got it, `[remembered](file:///x)` **orbital**.")
+    assert short == "Got it, remembered orbital."
+    assert calls == []
+
+    # Verbose raw AGY output with flags/paths/code blocks gets summarized via LLM.
+    verbose = (
+        "### Changes\n"
+        "- Created [miles_to_km.py](file:///home/ian/Code/miles-to-km/miles_to_km.py) "
+        "using factor `1.609344` and `argparse` flags `--miles 10` / `--km 16`.\n"
+        "```bash\npipx install /home/ian/Code/miles-to-km\n```\n"
+        "- Ran `pytest -q` in `/tmp`: 13 passed in 0.14s.\n"
+        "- Committed `a1b2c3d` without pushing."
+    )
+    spoken = app.summarize_for_watch(verbose, user_prompt="build miles to km cli")
+    assert spoken == "I built and tested the miles-to-kilometres CLI, and all thirteen tests passed."
+    assert len(calls) == 1
+    assert "Apple Watch" in calls[0][1]["messages"][0]["content"]
+
+    # Fallback when LLM errors or is unconfigured: strips markdown/code and truncates cleanly.
+    monkeypatch.setattr(app, "LLM_BASE_URL", "")
+    fallback = app.summarize_for_watch(verbose, user_prompt="build miles to km cli")
+    assert "```" not in fallback
+    assert "file://" not in fallback
+    assert len(fallback) <= 220
+
+
+

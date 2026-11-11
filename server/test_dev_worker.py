@@ -66,6 +66,20 @@ def test_run_agy_turn_passes_conversation_id_and_parses_json(tmp_path, monkeypat
     assert seen["stdin"] == subprocess.DEVNULL
     assert seen["env"]["HOME"] == str(tmp_path / "agy_home")
 
+    reply2, raw2, conv2, err2 = agy_worker.run_agy_turn(
+        prompt="now check health",
+        conversation_id="conv-999",
+        repo_root=tmp_path,
+        agy_home=tmp_path / "agy_home",
+        agy_bin="/usr/local/bin/agy",
+        model="gemini-4-carbon-medium",
+        include_raw=True,
+    )
+    assert err2 is False
+    assert conv2 == "conv-999"
+    assert reply2 == "Checked health: all good."
+    assert "file:///opt/bridge/app.py" in raw2
+
 
 def test_ensure_project_dir_creates_git_repo_and_rejects_traversal(tmp_path):
     projects_root = tmp_path / "Code"

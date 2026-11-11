@@ -2116,4 +2116,50 @@ def test_dev_propose_project_waits_for_confirmation_before_creating(client):
     }
 
 
+def test_dev_complete_summarizes_verbose_agy_output_for_watch_and_keeps_raw(client, monkeypatch):
+    monkeypatch.setattr(app, "DEV_NOTIFY_TARGET", "mobile_app_ian_sphone")
+    monkeypatch.setattr(
+        app,
+        "summarize_for_watch",
+        lambda raw, user_prompt="", error=False: "Built the miles-to-km converter and thirteen tests passed.",
+    )
+    owner = store.get_user_by_name(app.OWNER_USERNAME)
+    owner_hdr = {"Authorization": f"Bearer {app.BRIDGE_TOKEN}"}
+    h = WebFakeHa()
+    app._ha[owner["id"]] = h
+
+    turn = store.enqueue_dev_turn(owner["id"], "build miles converter")
+    store.claim_next_dev_turn(owner["id"], host="ws", now=time.time())
+    store.mark_dev_turn_timed_out(turn["id"])
+
+    raw_agy = (
+        "## Implementation\n"
+        "- Wrote `miles_to_km.py` with `1.609344` conversion factor and `--miles` / `--km` flags.\n"
+        "- Ran 13 pytest cases in `/tmp`: all passed.\n"
+        "- Run `pipx install .` when ready."
+    )
+    comp = client.post(
+        f"/dev/turns/{turn['id']}/complete",
+        json={"reply": raw_agy, "conversation_id": "conv-sum"},
+        headers=owner_hdr,
+    )
+    assert comp.status_code == 200
+    done = comp.json()["turn"]
+    assert done["reply"] == "Built the miles-to-km converter and thirteen tests passed."
+    assert "1.609344" in done["raw_reply"]
+
+    # HA notification got the short spoken summary, not the raw AGY markdown!
+    assert len(h.calls) == 1
+    assert h.calls[0][2]["message"] == "Built the miles-to-km converter and thirteen tests passed."
+
+    # Default dev_status returns the short spoken summary; detail=True includes raw_reply.
+    brief = app.execute_tool("dev_status", {}, dev_user=owner)
+    assert brief["reply"] == "Built the miles-to-km converter and thirteen tests passed."
+    assert "raw_reply" not in brief
+
+    detailed = app.execute_tool("dev_status", {"detail": True}, dev_user=owner)
+    assert "1.609344" in detailed["raw_reply"]
+
+
+
 

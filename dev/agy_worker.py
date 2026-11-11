@@ -143,8 +143,13 @@ def run_agy_turn(
     model: str = DEFAULT_MODEL,
     timeout: int = 600,
     project_slug: str = DEFAULT_PROJECT_SLUG,
-) -> tuple[str, str, bool]:
-    """Run one turn of `agy` and return (spoken_reply, conversation_id, is_error)."""
+    include_raw: bool = False,
+):
+    """Run one turn of `agy` and return (spoken_reply, conversation_id, is_error)
+    or (spoken_reply, raw_reply, conversation_id, is_error) when include_raw=True."""
+    def _ret(spoken: str, raw: str, conv: str, err: bool):
+        return (spoken, raw, conv, err) if include_raw else (spoken, conv, err)
+
     framed = format_prompt(prompt, conversation_id, repo_root, project_slug=project_slug)
     cmd = [
         agy_bin,
@@ -172,7 +177,8 @@ def run_agy_turn(
             timeout=timeout,
         )
     except subprocess.TimeoutExpired:
-        return ("Carbon timed out after ten minutes on that task.", conversation_id, True)
+        msg = "Carbon timed out after ten minutes on that task."
+        return _ret(msg, msg, conversation_id, True)
 
     stdout = (proc.stdout or "").strip()
     if stdout:
@@ -184,16 +190,18 @@ def run_agy_turn(
                     data = json.loads(line)
                     new_conv = data.get("conversation_id") or conversation_id
                     status = data.get("status", "")
-                    resp = clean_for_speech(data.get("response") or "")
+                    raw_resp = (data.get("response") or "").strip()
+                    resp = clean_for_speech(raw_resp)
                     is_err = proc.returncode != 0 or status not in ("SUCCESS", "")
-                    return (resp, new_conv, is_err)
+                    return _ret(resp, raw_resp or resp, new_conv, is_err)
                 except json.JSONDecodeError:
                     break
 
     if proc.returncode != 0:
-        err_tail = clean_for_speech((proc.stderr or stdout or "unknown error")[-300:])
-        return (f"Carbon hit an error: {err_tail}", conversation_id, True)
-    return (clean_for_speech(stdout), conversation_id, False)
+        raw_err = (proc.stderr or stdout or "unknown error").strip()
+        err_tail = clean_for_speech(raw_err[-300:])
+        return _ret(f"Carbon hit an error: {err_tail}", raw_err, conversation_id, True)
+    return _ret(clean_for_speech(stdout), stdout, conversation_id, False)
 
 
 def post_complete_with_retry(
@@ -204,10 +212,12 @@ def post_complete_with_retry(
     reply: str,
     conversation_id: str,
     is_err: bool,
+    raw_reply: str = "",
 ) -> None:
     url = f"{base_url}/dev/turns/{turn_id}/complete"
     payload = {
         "reply": reply,
+        "raw_reply": raw_reply or reply,
         "conversation_id": conversation_id,
         "error": is_err,
     }
@@ -313,7 +323,7 @@ def main() -> int:
 
         prepare_agy_home(real_home, agy_home)
         t0 = time.monotonic()
-        reply, new_conv, is_err = run_agy_turn(
+        reply, raw_reply, new_conv, is_err = run_agy_turn(
             prompt=turn["prompt"],
             conversation_id=conv_id,
             repo_root=proj_dir,
@@ -321,12 +331,14 @@ def main() -> int:
             agy_bin=agy_bin,
             model=model,
             project_slug=proj_slug,
+            include_raw=True,
         )
         elapsed = time.monotonic() - t0
         logging.info("finished turn id=%s in %.1fs err=%s conv=%s reply=%r",
                      turn_id, elapsed, is_err, new_conv, reply[:160])
         post_complete_with_retry(
-            session, base_url, headers, turn_id, reply, new_conv, is_err
+            session, base_url, headers, turn_id, reply, new_conv, is_err,
+            raw_reply=raw_reply,
         )
         if args.once:
             return 0

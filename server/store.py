@@ -95,6 +95,7 @@ CREATE TABLE IF NOT EXISTS dev_turns (
   conversation_id TEXT NOT NULL DEFAULT '',
   status TEXT NOT NULL,
   reply TEXT NOT NULL DEFAULT '',
+  raw_reply TEXT NOT NULL DEFAULT '',
   timed_out INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   completed_at TEXT NOT NULL DEFAULT ''
@@ -142,6 +143,9 @@ def connect(path: str | None = None) -> sqlite3.Connection:
         if tcols and "init_project" not in tcols:
             _conn.execute("ALTER TABLE dev_turns ADD COLUMN "
                           "init_project INTEGER NOT NULL DEFAULT 0")
+        if tcols and "raw_reply" not in tcols:
+            _conn.execute("ALTER TABLE dev_turns ADD COLUMN "
+                          "raw_reply TEXT NOT NULL DEFAULT ''")
         _conn.commit()
     return _conn
 
@@ -683,9 +687,10 @@ def mark_dev_turn_timed_out(turn_id: int) -> dict | None:
 
 
 def complete_dev_turn(turn_id: int, reply: str, conversation_id: str = "",
-                      error: bool = False) -> dict | None:
+                      error: bool = False, raw_reply: str = "") -> dict | None:
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     status = "error" if error else "done"
+    full_raw = raw_reply if raw_reply else reply
     with _dev_lock, connect() as db:
         existing = db.execute("SELECT * FROM dev_turns WHERE id = ?", (turn_id,)).fetchone()
         if not existing:
@@ -695,9 +700,9 @@ def complete_dev_turn(turn_id: int, reply: str, conversation_id: str = "",
         _ensure_default_project(db, uid)
         conv = conversation_id or existing["conversation_id"]
         db.execute(
-            "UPDATE dev_turns SET status = ?, reply = ?, conversation_id = ?, "
-            "completed_at = ? WHERE id = ?",
-            (status, reply, conv, now, turn_id),
+            "UPDATE dev_turns SET status = ?, reply = ?, raw_reply = ?, "
+            "conversation_id = ?, completed_at = ? WHERE id = ?",
+            (status, reply, full_raw, conv, now, turn_id),
         )
         if not error and conv:
             db.execute(
