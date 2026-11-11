@@ -11,8 +11,10 @@ Run:
     uvicorn app:app --host 0.0.0.0 --port 8000
 """
 import asyncio
+import base64
 import hashlib
 import hmac
+import io
 import json
 import logging
 import os
@@ -20,6 +22,7 @@ import re
 import secrets
 import threading
 import time
+import wave
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote, urlencode
 from zoneinfo import ZoneInfo
@@ -2188,7 +2191,8 @@ def route(text: str, t: Trello | None = None,
           clients: list[tuple[str, Trello]] | None = None,
           gcal: Gcal | None = None,
           ha: Ha | None = None,
-          dev_user: dict | None = None) -> str:
+          dev_user: dict | None = None,
+          history: list[dict] | None = None) -> str:
     """Send the sentence to the LLM; the LLM picks tools, the server keeps
     resolve_target as the fail-loud authority on where cards go. Echoes only
     while no LLM backend is configured (Phase 1 fallback)."""
@@ -2200,6 +2204,7 @@ def route(text: str, t: Trello | None = None,
         {"role": "system",
          "content": build_system_prompt(clients=clients, gcal=gcal, ha=ha,
                                         dev=dev, dev_user=dev_user)},
+        *(history or []),
         {"role": "user", "content": text},
     ]
     for _ in range(3):
@@ -3262,6 +3267,7 @@ async def connect_gemini(request: Request, body: GeminiKeyIn) -> dict:
 def disconnect_gemini(request: Request) -> dict:
     user = require_session(request)
     store.delete_gemini_key(user["id"])
+    _evict_converse_session(user["id"])
     return app_state(store.get_user(user["id"]))
 
 
@@ -3738,6 +3744,8 @@ function render(d){
  if(gd)gd.onclick=disconnectGemini;
  const gc=document.getElementById('gemcopy');
  if(gc)gc.onclick=e=>copy(e.target,gm.live_url);
+ const gcc=document.getElementById('gemconvcopy');
+ if(gcc)gcc.onclick=e=>copy(e.target,d.command_url.replace(/\\/command$/,'/converse/audio'));
  document.getElementById('watch').innerHTML=recipe(d);
  document.getElementById('invite').innerHTML=inviteCard(d);
  document.getElementById('invited').style.display=d.invite_code?'':'none';
@@ -3863,6 +3871,349 @@ document.getElementById('code').addEventListener('keydown',e=>{if(e.key==='Enter
 
 
 # --- Gemini Live full-duplex voice page + WebSocket tool bridge --------------
+
+CONVERSE_STOP_PHRASES = frozenset({
+    "stop",
+    "stop listening",
+    "stop conversation",
+    "end conversation",
+    "end call",
+    "hang up",
+    "goodbye",
+    "good bye",
+    "bye",
+    "thats all",
+    "that is all",
+    "nothing else",
+    "thanks bye",
+    "thank you bye",
+    "thanks goodbye",
+    "thank you goodbye",
+    "no thanks bye",
+    "all done",
+    "done for now",
+})
+
+
+def is_converse_stop_phrase(text: str) -> bool:
+    norm = re.sub(r"[^a-z0-9\s]+", " ", (text or "").lower())
+    norm = re.sub(r"\s+", " ", norm).strip()
+    return norm in CONVERSE_STOP_PHRASES
+
+
+def pcm24k_to_wav_bytes(pcm_bytes: bytes, sample_rate: int = 24000) -> bytes:
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm_bytes)
+    return buf.getvalue()
+
+
+async def _connect_gemini_ws_raw(api_key: str):
+    return await websockets.connect(
+        f"{GEMINI_WS_ENDPOINT}?key={quote(api_key, safe='')}",
+        close_timeout=5,
+        max_size=4 * 1024 * 1024,
+    )
+
+
+class ConverseIn(BaseModel):
+    text: str
+    audio: bool = True
+    new_session: bool = False
+    source: str = "shortcut"
+
+
+class _ConverseLiveSession:
+    """Keeps a warm upstream Gemini BidiGenerateContent WebSocket open across
+    sequential screen-free iOS Shortcut HTTP turns (with no turn cap), closing
+    automatically after LIVE_IDLE_SECONDS of silence."""
+
+    def __init__(self, user_id: int):
+        self.user_id = user_id
+        self.lock = asyncio.Lock()
+        self.ws = None
+        self.api_key = ""
+        self.model = ""
+        self.voice = ""
+        self._idle_task: asyncio.Task | None = None
+
+    def _reset_idle_timer(self) -> None:
+        if self._idle_task and not self._idle_task.done():
+            self._idle_task.cancel()
+        try:
+            loop = asyncio.get_running_loop()
+            self._idle_task = loop.create_task(self._reap_after_idle())
+        except RuntimeError:
+            pass
+
+    async def _reap_after_idle(self) -> None:
+        try:
+            await asyncio.sleep(LIVE_IDLE_SECONDS)
+            async with self.lock:
+                await self._close_unlocked()
+        except asyncio.CancelledError:
+            pass
+
+    async def _close_unlocked(self) -> None:
+        ws, self.ws = self.ws, None
+        if ws is not None:
+            try:
+                await ws.close()
+            except Exception:
+                pass
+
+    async def close(self) -> None:
+        if self._idle_task and not self._idle_task.done():
+            self._idle_task.cancel()
+        async with self.lock:
+            await self._close_unlocked()
+
+    async def _ensure_open(self, gkey: dict, sys_prompt: str, decls: list[dict],
+                           prior_history: list[dict]) -> None:
+        want_key = gkey["api_key"]
+        want_model = gkey["model"] or GEMINI_LIVE_MODEL
+        want_voice = gkey["voice"] or "Puck"
+        if (self.ws is not None
+                and self.api_key == want_key
+                and self.model == want_model
+                and self.voice == want_voice):
+            return
+        await self._close_unlocked()
+        full_sys = sys_prompt
+        if prior_history:
+            recap = "\n".join(
+                f"{m['role']}: {m['content']}" for m in prior_history[-12:]
+            )
+            full_sys += f"\n\nRecent conversation context before reconnect:\n{recap}"
+        ws = await _connect_gemini_ws_raw(want_key)
+        setup_msg = {
+            "setup": {
+                "model": want_model,
+                "generationConfig": {
+                    "responseModalities": ["AUDIO"],
+                    "speechConfig": {
+                        "voiceConfig": {
+                            "prebuiltVoiceConfig": {"voiceName": want_voice}
+                        }
+                    },
+                },
+                "contextWindowCompression": {"slidingWindow": {}},
+                "outputAudioTranscription": {},
+                "systemInstruction": {"parts": [{"text": full_sys}]},
+                "tools": [{"functionDeclarations": decls}],
+            }
+        }
+        await ws.send(json.dumps(setup_msg))
+        ack = json.loads(await asyncio.wait_for(ws.recv(), timeout=12.0))
+        if "setupComplete" not in ack:
+            await ws.close()
+            raise RuntimeError("Gemini Live session did not complete setup")
+        self.ws = ws
+        self.api_key = want_key
+        self.model = want_model
+        self.voice = want_voice
+
+    async def _run_turn_once(self, text: str, clients: list, gcal: Gcal | None,
+                             ha: Ha | None, dev_u: dict | None) -> tuple[str, bytes]:
+        await self.ws.send(json.dumps({
+            "clientContent": {
+                "turns": [{"role": "user", "parts": [{"text": text}]}],
+                "turnComplete": True,
+            }
+        }))
+        pcm_chunks: list[bytes] = []
+        transcripts: list[str] = []
+        while True:
+            raw = await asyncio.wait_for(self.ws.recv(), timeout=25.0)
+            data = json.loads(raw)
+            sc = data.get("serverContent")
+            if sc:
+                out_tr = (sc.get("outputTranscription") or {}).get("text")
+                if out_tr:
+                    transcripts.append(out_tr)
+                mt = sc.get("modelTurn") or {}
+                for part in mt.get("parts") or []:
+                    if part.get("text"):
+                        transcripts.append(part["text"])
+                    inl = part.get("inlineData")
+                    if inl and inl.get("data"):
+                        pcm_chunks.append(base64.b64decode(inl["data"]))
+                if sc.get("turnComplete"):
+                    break
+            tc = data.get("toolCall")
+            if tc and tc.get("functionCalls"):
+                f_resps = []
+                for fc in tc["functionCalls"]:
+                    fname = fc["name"]
+                    fargs = fc.get("args") or {}
+                    try:
+                        res = await asyncio.to_thread(
+                            execute_tool,
+                            fname,
+                            fargs,
+                            clients=clients,
+                            gcal=gcal,
+                            ha=ha,
+                            dev_user=dev_u,
+                        )
+                    except Exception as exc:
+                        res = {"ok": False, "error": str(exc)}
+                    f_resps.append({
+                        "id": fc.get("id", ""),
+                        "name": fname,
+                        "response": {"result": res},
+                    })
+                await self.ws.send(json.dumps({
+                    "toolResponse": {"functionResponses": f_resps}
+                }))
+        reply_text = re.sub(r"\s+", " ", "".join(transcripts)).strip()
+        pcm = b"".join(pcm_chunks)
+        wav = pcm24k_to_wav_bytes(pcm) if pcm else b""
+        return reply_text, wav
+
+    async def ask(self, text: str, gkey: dict, sys_prompt: str, decls: list[dict],
+                  prior_history: list[dict], clients: list, gcal: Gcal | None,
+                  ha: Ha | None, dev_u: dict | None) -> tuple[str, bytes]:
+        async with self.lock:
+            for attempt in range(2):
+                try:
+                    await self._ensure_open(gkey, sys_prompt, decls, prior_history)
+                    reply_text, wav = await self._run_turn_once(
+                        text, clients, gcal, ha, dev_u
+                    )
+                    self._reset_idle_timer()
+                    return reply_text, wav
+                except Exception:
+                    await self._close_unlocked()
+                    if attempt == 1:
+                        raise
+        return "", b""
+
+
+_converse_sessions: dict[int, _ConverseLiveSession] = {}
+
+
+def _get_converse_session(user_id: int) -> _ConverseLiveSession:
+    with _live_lock:
+        sess = _converse_sessions.get(user_id)
+        if sess is None:
+            sess = _ConverseLiveSession(user_id)
+            _converse_sessions[user_id] = sess
+        return sess
+
+
+def _evict_converse_session(user_id: int) -> None:
+    with _live_lock:
+        sess = _converse_sessions.pop(user_id, None)
+    if sess is not None and sess.ws is not None:
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(sess.close())
+        except RuntimeError:
+            pass
+
+
+def _close_all_converse_sessions() -> None:
+    with _live_lock:
+        sessions = list(_converse_sessions.values())
+        _converse_sessions.clear()
+    for s in sessions:
+        if s._idle_task and not s._idle_task.done():
+            s._idle_task.cancel()
+        s.ws = None
+
+
+async def _handle_converse_turn(user: dict, body: ConverseIn) -> tuple[str, bytes, bool]:
+    uid = user["id"]
+    if body.new_session:
+        sess = _get_converse_session(uid)
+        await sess.close()
+        store.clear_converse_history(uid)
+
+    text = (body.text or "").strip()
+    if not text or is_converse_stop_phrase(text):
+        sess = _get_converse_session(uid)
+        await sess.close()
+        store.clear_converse_history(uid)
+        return "", b"", True
+
+    if body.source:
+        logging.getLogger("uvicorn.error").info(
+            "converse from %s for %s", body.source, user["username"]
+        )
+
+    clients, gcal, ha = await asyncio.to_thread(_user_integrations_safe, user)
+    dev = is_dev_user(user)
+    dev_u = user if dev else None
+    hist = await asyncio.to_thread(store.get_converse_history, uid, 24)
+    gkey = gemini_key_for(user) if body.audio else None
+
+    if gkey:
+        base_prompt = await asyncio.to_thread(
+            build_system_prompt, clients=clients, gcal=gcal, ha=ha, dev=dev, dev_user=dev_u
+        )
+        sys_prompt = (
+            base_prompt
+            + "\n\n[Headless Voice Conversation]\nYou are in an ongoing multi-turn "
+              "voice conversation with the user via an iPhone Shortcut. Keep replies "
+              "natural, warm, and concise (one or two short sentences unless asked "
+              "for detail)."
+        )
+        decls = tools_to_gemini_declarations(tools_for(gcal=gcal, ha=ha, dev=dev))
+        sess = _get_converse_session(uid)
+        reply_text, wav_bytes = await sess.ask(
+            text, gkey, sys_prompt, decls, hist, clients, gcal, ha, dev_u
+        )
+        await asyncio.to_thread(
+            store.append_converse_turn, uid, text, reply_text or "(spoken audio)"
+        )
+        return reply_text, wav_bytes, False
+
+    reply_text = await asyncio.to_thread(
+        route, text, clients=clients, gcal=gcal, ha=ha, dev_user=dev_u, history=hist
+    )
+    await asyncio.to_thread(store.append_converse_turn, uid, text, reply_text)
+    return reply_text, b"", False
+
+
+@app.post("/converse")
+async def converse_endpoint(body: ConverseIn,
+                            authorization: str = Header(default="")) -> dict:
+    user = require_user(authorization)
+    reply_text, wav_bytes, ended = await _handle_converse_turn(user, body)
+    return {
+        "reply": reply_text,
+        "audio_b64": base64.b64encode(wav_bytes).decode() if wav_bytes else "",
+        "end_session": ended,
+    }
+
+
+@app.post("/converse/audio")
+async def converse_audio_endpoint(body: ConverseIn,
+                                  authorization: str = Header(default="")) -> Response:
+    user = require_user(authorization)
+    body_audio = ConverseIn(
+        text=body.text, audio=True, new_session=body.new_session, source=body.source
+    )
+    reply_text, wav_bytes, ended = await _handle_converse_turn(user, body_audio)
+    if ended or not wav_bytes:
+        return Response(
+            status_code=204,
+            headers={"X-Bridge-End-Session": "1" if ended else "0"},
+        )
+    return Response(
+        content=wav_bytes,
+        media_type="audio/wav",
+        headers={
+            "Content-Disposition": 'inline; filename="reply.wav"',
+            "X-Bridge-Reply": quote(reply_text[:200]),
+            "X-Bridge-End-Session": "0",
+        },
+    )
+
 
 @app.get("/live", response_class=HTMLResponse)
 def live_page() -> HTMLResponse:

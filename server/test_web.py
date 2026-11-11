@@ -2291,6 +2291,104 @@ def test_live_page_and_websocket_audio_and_tool_round_trip(client, monkeypatch):
         ws.send_json({"type": "stop"})
 
 
+def test_converse_uncapped_multi_turn_warm_gemini_session_and_audio_endpoint(client, monkeypatch):
+    import asyncio
+    import base64
+    import io
+    import json
+    import wave
+
+    owner = store.get_user_by_name(app.OWNER_USERNAME)
+    owner_hdr = {"Authorization": f"Bearer {app.BRIDGE_TOKEN}"}
+    store.save_gemini_key(owner["id"], "AIza-converse-key", voice="Puck")
+
+    open_count = 0
+    closed_count = 0
+    sent_frames = []
+
+    class WarmFakeGeminiWS:
+        def __init__(self):
+            nonlocal open_count
+            open_count += 1
+            self._q = asyncio.Queue()
+            self.turn_num = 0
+
+        async def send(self, raw: str):
+            msg = json.loads(raw)
+            sent_frames.append(msg)
+            if "setup" in msg:
+                await self._q.put(json.dumps({"setupComplete": {}}))
+            elif "clientContent" in msg:
+                self.turn_num += 1
+                if self.turn_num == 1:
+                    await self._q.put(json.dumps({
+                        "toolCall": {
+                            "functionCalls": [{"id": "c1", "name": "trello_list_boards", "args": {}}]
+                        }
+                    }))
+                else:
+                    pcm_b64 = base64.b64encode(b"\x10\x00" * 240).decode()
+                    await self._q.put(json.dumps({
+                        "serverContent": {
+                            "outputTranscription": {"text": f"Turn {self.turn_num} answer."},
+                            "modelTurn": {"parts": [{"inlineData": {"mimeType": "audio/pcm;rate=24000", "data": pcm_b64}}]},
+                            "turnComplete": True,
+                        }
+                    }))
+            elif "toolResponse" in msg:
+                pcm_b64 = base64.b64encode(b"\x20\x00" * 240).decode()
+                await self._q.put(json.dumps({
+                    "serverContent": {
+                        "outputTranscription": {"text": "You have Home and Work boards."},
+                        "modelTurn": {"parts": [{"inlineData": {"mimeType": "audio/pcm;rate=24000", "data": pcm_b64}}]},
+                        "turnComplete": True,
+                    }
+                }))
+
+        async def recv(self) -> str:
+            return await self._q.get()
+
+        async def close(self):
+            nonlocal closed_count
+            closed_count += 1
+
+    async def fake_connect(api_key: str):
+        return WarmFakeGeminiWS()
+
+    monkeypatch.setattr(app, "_connect_gemini_ws_raw", fake_connect)
+
+    try:
+        # Turn 1 via JSON /converse (triggers tool call + returns WAV audio_b64)
+        r1 = client.post("/converse", json={"text": "what boards do I have"}, headers=owner_hdr)
+        assert r1.status_code == 200
+        d1 = r1.json()
+        assert d1["end_session"] is False
+        assert "Home and Work" in d1["reply"]
+        wav1 = base64.b64decode(d1["audio_b64"])
+        with wave.open(io.BytesIO(wav1), "rb") as wf:
+            assert wf.getframerate() == 24000
+
+        # Turn 2 + Turn 3 via binary /converse/audio (Shortcut Play Sound path):
+        # reuses the SAME warm upstream Gemini Live WebSocket (open_count == 1)!
+        r2 = client.post("/converse/audio", json={"text": "what about the second one"}, headers=owner_hdr)
+        assert r2.status_code == 200
+        assert r2.headers["content-type"].startswith("audio/wav")
+        assert r2.content[:4] == b"RIFF"
+
+        r3 = client.post("/converse/audio", json={"text": "and one more follow up"}, headers=owner_hdr)
+        assert r3.status_code == 200
+        assert open_count == 1
+
+        # Saying "thanks, bye" closes the warm session and returns 204 No Content on /converse/audio
+        # so the recursive iPhone Shortcut exits cleanly without playing empty audio!
+        r_stop = client.post("/converse/audio", json={"text": "thanks, bye"}, headers=owner_hdr)
+        assert r_stop.status_code == 204
+        assert closed_count >= 1
+    finally:
+        app._close_all_converse_sessions()
+
+
+
 
 
 

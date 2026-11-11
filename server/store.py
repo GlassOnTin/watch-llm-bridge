@@ -64,6 +64,14 @@ CREATE TABLE IF NOT EXISTS gemini_keys (
   created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS converse_turns (
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER NOT NULL,
+  role TEXT NOT NULL,
+  content TEXT NOT NULL,
+  created_at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS dev_state (
   user_id INTEGER PRIMARY KEY,
   active_project TEXT NOT NULL DEFAULT 'watch-llm-bridge',
@@ -426,6 +434,56 @@ def delete_gemini_key(user_id: int) -> bool:
     with connect() as db:
         cur = db.execute("DELETE FROM gemini_keys WHERE user_id = ?", (user_id,))
     return cur.rowcount > 0
+
+
+# --- Multi-turn headless voice conversation history (uncapped turns) ---------
+
+def append_converse_turn(user_id: int, user_text: str, assistant_text: str,
+                         now: float | None = None) -> None:
+    ts = time.time() if now is None else now
+    with _dev_lock, connect() as db:
+        db.execute(
+            "INSERT INTO converse_turns (user_id, role, content, created_at) VALUES (?, 'user', ?, ?)",
+            (user_id, user_text, ts),
+        )
+        db.execute(
+            "INSERT INTO converse_turns (user_id, role, content, created_at) VALUES (?, 'assistant', ?, ?)",
+            (user_id, assistant_text, ts),
+        )
+        # Keep SQLite lean over multi-hour sessions while never capping turns.
+        db.execute(
+            "DELETE FROM converse_turns WHERE user_id = ? AND id NOT IN ("
+            "  SELECT id FROM converse_turns WHERE user_id = ? ORDER BY id DESC LIMIT 200"
+            ")",
+            (user_id, user_id),
+        )
+
+
+def get_converse_history(user_id: int, limit: int = 24,
+                         now: float | None = None,
+                         idle_ttl: float = 900.0) -> list[dict]:
+    ts = time.time() if now is None else now
+    with _dev_lock, connect() as db:
+        last = db.execute(
+            "SELECT created_at FROM converse_turns WHERE user_id = ? ORDER BY id DESC LIMIT 1",
+            (user_id,),
+        ).fetchone()
+        if not last:
+            return []
+        if ts - last["created_at"] > idle_ttl:
+            db.execute("DELETE FROM converse_turns WHERE user_id = ?", (user_id,))
+            return []
+        rows = db.execute(
+            "SELECT role, content FROM converse_turns WHERE user_id = ? "
+            "ORDER BY id DESC LIMIT ?",
+            (user_id, limit),
+        ).fetchall()
+    return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
+
+
+def clear_converse_history(user_id: int) -> None:
+    with _dev_lock, connect() as db:
+        db.execute("DELETE FROM converse_turns WHERE user_id = ?", (user_id,))
 
 
 # --- Workstation dev worker queue (AGY / Carbon multi-turn conversation) -----

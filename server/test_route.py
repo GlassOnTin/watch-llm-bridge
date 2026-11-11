@@ -760,5 +760,56 @@ def test_tools_to_gemini_declarations_converts_all_bridge_tools():
     assert by_name["trello_create_card"]["parameters"]["required"] == ["list", "name"]
 
 
+def test_route_includes_multi_turn_history_and_pcm24k_to_wav_header(monkeypatch, stocked_trello):
+    import io
+    import wave
+
+    # Stop phrase detection: exact farewells stop, media/card commands do NOT!
+    assert app.is_converse_stop_phrase("Stop.") is True
+    assert app.is_converse_stop_phrase("Thanks, bye!") is True
+    assert app.is_converse_stop_phrase("end conversation") is True
+    assert app.is_converse_stop_phrase("stop the living room speaker") is False
+    assert app.is_converse_stop_phrase("add bus stop to chores") is False
+
+    # Valid 24 kHz 16-bit mono RIFF WAV container
+    pcm = b"\x00\x01" * 480
+    wav_bytes = app.pcm24k_to_wav_bytes(pcm)
+    with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+        assert wf.getnchannels() == 1
+        assert wf.getsampwidth() == 2
+        assert wf.getframerate() == 24000
+        assert wf.readframes(480) == pcm
+
+    # Multi-turn history passed into route()
+    seen_msgs = []
+
+    class FakeResp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"choices": [{"message": {"content": "Moved Eggs to Done."}}]}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        seen_msgs.extend(json["messages"])
+        return FakeResp()
+
+    monkeypatch.setattr(app, "LLM_BASE_URL", "https://fake.llm/v1")
+    monkeypatch.setattr(app, "LLM_API_KEY", "sk-test")
+    monkeypatch.setattr(app, "LLM_MODEL", "fake-fast")
+    monkeypatch.setattr(app.requests, "post", fake_post)
+
+    prior = [
+        {"role": "user", "content": "what's on shopping"},
+        {"role": "assistant", "content": "Milk and Eggs."},
+    ]
+    out = app.route("move the second one to done", t=app.Trello("k", "t"), history=prior)
+    assert out == "Moved Eggs to Done."
+    assert [m["role"] for m in seen_msgs] == ["system", "user", "assistant", "user"]
+    assert seen_msgs[1]["content"] == "what's on shopping"
+    assert seen_msgs[3]["content"] == "move the second one to done"
+
+
+
 
 

@@ -364,5 +364,28 @@ def test_gemini_key_save_get_overwrite_and_delete():
     assert store.delete_gemini_key(u["id"]) is False
 
 
+def test_converse_history_sliding_window_idle_reset_and_clear():
+    u = create_user("ian", "hunter2hunter", is_admin=True)
+    assert store.get_converse_history(u["id"], now=1000.0) == []
+
+    # Append 30 turns (60 messages) with no hard cap on conversation length.
+    for i in range(30):
+        store.append_converse_turn(u["id"], f"user-{i}", f"assistant-{i}", now=1000.0 + i)
+
+    hist = store.get_converse_history(u["id"], limit=20, now=1035.0, idle_ttl=900.0)
+    assert len(hist) == 20
+    assert hist[0] == {"role": "user", "content": "user-20"}
+    assert hist[-1] == {"role": "assistant", "content": "assistant-29"}
+
+    # After 15+ minutes of silence, history auto-expires cleanly for a fresh chat.
+    assert store.get_converse_history(u["id"], limit=20, now=2000.0, idle_ttl=900.0) == []
+
+    # Explicit clear wipes immediately.
+    store.append_converse_turn(u["id"], "hello", "hi", now=2010.0)
+    store.clear_converse_history(u["id"])
+    assert store.get_converse_history(u["id"], now=2011.0) == []
+
+
+
 
 

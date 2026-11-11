@@ -470,10 +470,17 @@ function geminiCard(d) {
     <div class="row" style="margin-top:8px"><span class="sub">Voice</span><select id="gemvoice" style="flex:1">${voiceOpts}</select></div>
     <button onclick="connectGemini()">Connect Gemini Live</button> <span id="gemerr"></span>`;
   }
+  const convUrl = d.command_url.replace(/\\/command$/, '/converse/audio');
   return `<p class="sub"><span class="ok">connected</span> — ${esc(g.model || 'gemini-live')} · voice <b>${esc(g.voice || 'Puck')}</b></p>
-  <p><a class="btn" href="/live">Open Live Conversation</a></p>
-  <p class="sub"><b>iPhone Shortcut (Action Button):</b> create a 1-step Shortcut with <b>Open URLs</b> set to the address below. First launch stores your token locally and clears it from the address bar.</p>
-  <div class="kv"><span class="k">Shortcut URL</span><span class="v">${esc(g.live_url)}</span><button class="sec" id="gemcopy">Copy</button></div>
+  <p class="sub"><b>Screen-free iPhone Shortcut (no browser window, uncapped turns):</b></p>
+  <ol>
+    <li><b>Dictate Text</b> — Stop Listening: <i>After Pause</i></li>
+    <li><b>If</b> <i>Dictated Text</i> has any value:</li>
+    <li><b>Get Contents of URL</b> — POST <code>${esc(convUrl)}</code>, headers <code>Content-Type: application/json</code> and <code>Authorization: Bearer ${esc(d.token)}</code>, JSON body <code>{"text": "&lt;Dictated Text&gt;"}</code></li>
+    <li><b>If</b> <i>Contents of URL</i> has any value → <b>Play Sound</b> (<i>Contents of URL</i>) → <b>Run Shortcut</b> (select this same Shortcut)</li>
+  </ol>
+  <div class="kv"><span class="k">Audio URL</span><span class="v">${esc(convUrl)}</span><button class="sec" id="gemconvcopy">Copy</button></div>
+  <p class="sub">Say “stop” or “thanks, bye” (or stay silent) to end the session. Or open the full-duplex web view: <a href="/live" style="color:var(--accent)">/live</a> · <button class="sec" id="gemcopy">Copy /live URL</button></p>
   <div class="row" style="margin-top:10px"><span class="sub">Voice</span><select id="gemvoice" onchange="changeGeminiVoice()" style="flex:1">${voiceOpts}</select></div>
   <button class="sec" id="gemdisc" style="margin-top:10px">Disconnect</button> <span id="gemerr"></span>`;
 }
