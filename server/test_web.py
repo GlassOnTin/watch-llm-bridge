@@ -2022,3 +2022,51 @@ def test_dev_send_offline_worker_and_new_thread_reset(client):
     assert reset == {"ok": True, "status": "new_thread"}
     assert store.get_dev_state(owner["id"])["conversation_id"] == ""
 
+
+def test_dev_projects_start_list_and_switch_over_watch_bridge(client):
+    owner = store.get_user_by_name(app.OWNER_USERNAME)
+    # Initially no projects have been started over the watch bridge.
+    empty = app.execute_tool("dev_list_projects", {"watch_only": True}, dev_user=owner)
+    assert empty == {
+        "ok": True,
+        "active_project": "watch-llm-bridge",
+        "watch_only": True,
+        "projects": [],
+    }
+
+    # Start two projects via voice tool (offline worker queues repo init cleanly).
+    s1 = app.execute_tool(
+        "dev_start_project",
+        {"name": "Solar Logger", "summary": "Victron MQTT logger"},
+        dev_user=owner,
+    )
+    assert s1["ok"] is True
+    assert s1["project"] == "solar-logger"
+    assert s1["active_project"] == "solar-logger"
+
+    s2 = app.execute_tool(
+        "dev_start_project",
+        {"name": "Bangle Timer", "summary": "Interval timer app"},
+        dev_user=owner,
+    )
+    assert s2["ok"] is True
+    assert s2["project"] == "bangle-timer"
+
+    # Ask to list projects started over the watch bridge!
+    listed = app.execute_tool("dev_list_projects", {"watch_only": True}, dev_user=owner)
+    assert listed["ok"] is True
+    assert listed["active_project"] == "bangle-timer"
+    assert [p["slug"] for p in listed["projects"]] == ["solar-logger", "bangle-timer"]
+    assert all(p["started_via_watch"] is True for p in listed["projects"])
+
+    # Switch back to solar-logger by spoken name, and test unknown project error.
+    sw = app.execute_tool("dev_switch_project", {"name": "solar logger"}, dev_user=owner)
+    assert sw["ok"] is True
+    assert sw["active_project"] == "solar-logger"
+
+    miss = app.execute_tool("dev_switch_project", {"name": "nonexistent"}, dev_user=owner)
+    assert miss["ok"] is False
+    assert miss["error"] == "no_project"
+    assert "Solar Logger" in miss["candidates"]
+
+

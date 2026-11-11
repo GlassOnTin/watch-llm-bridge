@@ -65,3 +65,19 @@ def test_run_agy_turn_passes_conversation_id_and_parses_json(tmp_path, monkeypat
     assert any(a.startswith("--print=") for a in seen["cmd"])
     assert seen["stdin"] == subprocess.DEVNULL
     assert seen["env"]["HOME"] == str(tmp_path / "agy_home")
+
+
+def test_ensure_project_dir_creates_git_repo_and_rejects_traversal(tmp_path):
+    projects_root = tmp_path / "Code"
+    projects_root.mkdir()
+
+    proj = agy_worker.ensure_project_dir(projects_root, "solar-logger", init_git=True)
+    assert proj == projects_root / "solar-logger"
+    assert (proj / ".git").is_dir()
+
+    import pytest
+    with pytest.raises(ValueError):
+        agy_worker.ensure_project_dir(projects_root, "../escape", init_git=True)
+    with pytest.raises(ValueError):
+        agy_worker.ensure_project_dir(projects_root, "bad/slash", init_git=True)
+

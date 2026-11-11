@@ -8,6 +8,7 @@ excludes *.db from its rsync so a deploy can never wipe it.
 import hashlib
 import hmac
 import os
+import re
 import secrets
 import sqlite3
 import threading
@@ -15,6 +16,8 @@ import time
 from datetime import datetime, timezone
 
 DB_PATH = os.environ.get("BRIDGE_DB", os.path.join(os.getcwd(), "bridge.db"))
+DEFAULT_DEV_PROJECT = "watch-llm-bridge"
+PROJECT_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -54,14 +57,30 @@ CREATE TABLE IF NOT EXISTS ha_instances (
 
 CREATE TABLE IF NOT EXISTS dev_state (
   user_id INTEGER PRIMARY KEY,
+  active_project TEXT NOT NULL DEFAULT 'watch-llm-bridge',
   conversation_id TEXT NOT NULL DEFAULT '',
   worker_seen_at REAL NOT NULL DEFAULT 0,
   worker_host TEXT NOT NULL DEFAULT ''
 );
 
+CREATE TABLE IF NOT EXISTS dev_projects (
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER NOT NULL,
+  slug TEXT NOT NULL,
+  name TEXT NOT NULL,
+  summary TEXT NOT NULL DEFAULT '',
+  conversation_id TEXT NOT NULL DEFAULT '',
+  started_via_watch INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(user_id, slug)
+);
+
 CREATE TABLE IF NOT EXISTS dev_turns (
   id INTEGER PRIMARY KEY,
   user_id INTEGER NOT NULL,
+  project_slug TEXT NOT NULL DEFAULT 'watch-llm-bridge',
+  init_project INTEGER NOT NULL DEFAULT 0,
   prompt TEXT NOT NULL,
   new_thread INTEGER NOT NULL DEFAULT 0,
   conversation_id TEXT NOT NULL DEFAULT '',
@@ -94,6 +113,26 @@ def connect(path: str | None = None) -> sqlite3.Connection:
         if gcols and "calendar_id" not in gcols:
             _conn.execute("ALTER TABLE google_accounts ADD COLUMN "
                           "calendar_id TEXT NOT NULL DEFAULT 'primary'")
+        dcols = {row[1] for row in _conn.execute("PRAGMA table_info(dev_state)")}
+        if dcols and "active_project" not in dcols:
+            _conn.execute("ALTER TABLE dev_state ADD COLUMN "
+                          "active_project TEXT NOT NULL DEFAULT 'watch-llm-bridge'")
+            now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            for srow in _conn.execute("SELECT user_id, conversation_id FROM dev_state").fetchall():
+                _conn.execute(
+                    "INSERT INTO dev_projects (user_id, slug, name, summary, conversation_id, "
+                    "started_via_watch, created_at, updated_at) VALUES (?, ?, ?, '', ?, 0, ?, ?) "
+                    "ON CONFLICT(user_id, slug) DO UPDATE SET conversation_id=excluded.conversation_id",
+                    (srow["user_id"], DEFAULT_DEV_PROJECT, "Watch LLM Bridge",
+                     srow["conversation_id"], now, now),
+                )
+        tcols = {row[1] for row in _conn.execute("PRAGMA table_info(dev_turns)")}
+        if tcols and "project_slug" not in tcols:
+            _conn.execute("ALTER TABLE dev_turns ADD COLUMN "
+                          "project_slug TEXT NOT NULL DEFAULT 'watch-llm-bridge'")
+        if tcols and "init_project" not in tcols:
+            _conn.execute("ALTER TABLE dev_turns ADD COLUMN "
+                          "init_project INTEGER NOT NULL DEFAULT 0")
         _conn.commit()
     return _conn
 
@@ -339,36 +378,159 @@ def delete_ha_instance(user_id: int) -> bool:
 
 # --- Workstation dev worker queue (AGY / Carbon multi-turn conversation) -----
 
+def slugify_project(name: str) -> str:
+    slug = re.sub(r"[^a-z0-9_-]+", "-", name.strip().lower())
+    slug = re.sub(r"-{2,}", "-", slug).strip("-_")
+    if not PROJECT_SLUG_RE.match(slug):
+        raise ValueError(f"invalid project name '{name}'")
+    return slug
+
+
+def _ensure_default_project(db: sqlite3.Connection, user_id: int) -> None:
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    db.execute(
+        "INSERT INTO dev_projects (user_id, slug, name, summary, conversation_id, "
+        "started_via_watch, created_at, updated_at) "
+        "VALUES (?, ?, 'Watch LLM Bridge', 'Watch voice bridge codebase', '', 0, ?, ?) "
+        "ON CONFLICT(user_id, slug) DO NOTHING",
+        (user_id, DEFAULT_DEV_PROJECT, now, now),
+    )
+
+
+def list_dev_projects(user_id: int, watch_only: bool = False) -> list[dict]:
+    with _dev_lock, connect() as db:
+        _ensure_default_project(db, user_id)
+        if watch_only:
+            rows = db.execute(
+                "SELECT * FROM dev_projects WHERE user_id = ? AND started_via_watch = 1 "
+                "ORDER BY id ASC",
+                (user_id,),
+            ).fetchall()
+        else:
+            rows = db.execute(
+                "SELECT * FROM dev_projects WHERE user_id = ? ORDER BY id ASC",
+                (user_id,),
+            ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def create_dev_project(user_id: int, name: str, summary: str = "",
+                       started_via_watch: bool = True) -> dict:
+    slug = slugify_project(name)
+    display = name.strip() or slug
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with _dev_lock, connect() as db:
+        _ensure_default_project(db, user_id)
+        db.execute(
+            "INSERT INTO dev_projects (user_id, slug, name, summary, conversation_id, "
+            "started_via_watch, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, '', ?, ?, ?) "
+            "ON CONFLICT(user_id, slug) DO UPDATE SET "
+            "summary = CASE WHEN excluded.summary != '' THEN excluded.summary ELSE dev_projects.summary END, "
+            "updated_at = excluded.updated_at",
+            (user_id, slug, display, summary.strip(), 1 if started_via_watch else 0, now, now),
+        )
+        row = db.execute(
+            "SELECT * FROM dev_projects WHERE user_id = ? AND slug = ?",
+            (user_id, slug),
+        ).fetchone()
+    return dict(row)
+
+
+def find_dev_project(user_id: int, query: str) -> dict:
+    q = query.strip().lower()
+    want_slug = re.sub(r"[^a-z0-9_-]+", "-", q).strip("-_")
+    projects = list_dev_projects(user_id, watch_only=False)
+    exact = [
+        p for p in projects
+        if p["slug"] == want_slug or p["name"].lower() == q
+    ]
+    hits = exact or [
+        p for p in projects
+        if (want_slug and want_slug in p["slug"]) or (q and q in p["name"].lower())
+    ]
+    if len(hits) != 1:
+        known = ", ".join(p["name"] for p in projects)
+        raise KeyError(f"project '{query}' matches {len(hits) or 'nothing'} (known: {known})")
+    return hits[0]
+
+
+def set_active_dev_project(user_id: int, slug: str) -> dict:
+    with _dev_lock, connect() as db:
+        _ensure_default_project(db, user_id)
+        prow = db.execute(
+            "SELECT * FROM dev_projects WHERE user_id = ? AND slug = ?",
+            (user_id, slug),
+        ).fetchone()
+        if not prow:
+            raise KeyError(f"project '{slug}' matches nothing")
+        db.execute(
+            "INSERT INTO dev_state (user_id, active_project, conversation_id, worker_seen_at, worker_host) "
+            "VALUES (?, ?, ?, 0, '') "
+            "ON CONFLICT(user_id) DO UPDATE SET active_project=excluded.active_project, "
+            "conversation_id=excluded.conversation_id",
+            (user_id, slug, prow["conversation_id"]),
+        )
+    return dict(prow)
+
+
 def get_dev_state(user_id: int) -> dict:
-    with _dev_lock:
-        row = connect().execute(
-            "SELECT conversation_id, worker_seen_at, worker_host "
+    with _dev_lock, connect() as db:
+        _ensure_default_project(db, user_id)
+        row = db.execute(
+            "SELECT active_project, conversation_id, worker_seen_at, worker_host "
             "FROM dev_state WHERE user_id = ?", (user_id,)
         ).fetchone()
-    if not row:
-        return {"conversation_id": "", "worker_seen_at": 0.0, "worker_host": ""}
-    return dict(row)
+        if not row:
+            return {
+                "active_project": DEFAULT_DEV_PROJECT,
+                "conversation_id": "",
+                "worker_seen_at": 0.0,
+                "worker_host": "",
+            }
+        active = row["active_project"] or DEFAULT_DEV_PROJECT
+        prow = db.execute(
+            "SELECT conversation_id FROM dev_projects WHERE user_id = ? AND slug = ?",
+            (user_id, active),
+        ).fetchone()
+        conv = prow["conversation_id"] if prow else row["conversation_id"]
+    return {
+        "active_project": active,
+        "conversation_id": conv,
+        "worker_seen_at": row["worker_seen_at"],
+        "worker_host": row["worker_host"],
+    }
 
 
 def touch_dev_worker(user_id: int, host: str = "", now: float | None = None) -> None:
     seen = time.time() if now is None else now
     with _dev_lock, connect() as db:
+        _ensure_default_project(db, user_id)
         db.execute(
-            "INSERT INTO dev_state (user_id, conversation_id, worker_seen_at, worker_host) "
-            "VALUES (?, '', ?, ?) "
+            "INSERT INTO dev_state (user_id, active_project, conversation_id, worker_seen_at, worker_host) "
+            "VALUES (?, ?, '', ?, ?) "
             "ON CONFLICT(user_id) DO UPDATE SET worker_seen_at=excluded.worker_seen_at, "
             "worker_host=excluded.worker_host",
-            (user_id, seen, host),
+            (user_id, DEFAULT_DEV_PROJECT, seen, host),
         )
 
 
-def reset_dev_thread(user_id: int) -> None:
+def reset_dev_thread(user_id: int, project_slug: str = "") -> None:
     with _dev_lock, connect() as db:
+        _ensure_default_project(db, user_id)
+        srow = db.execute(
+            "SELECT active_project FROM dev_state WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        slug = project_slug or (srow["active_project"] if srow else DEFAULT_DEV_PROJECT)
         db.execute(
-            "INSERT INTO dev_state (user_id, conversation_id, worker_seen_at, worker_host) "
-            "VALUES (?, '', 0, '') "
+            "UPDATE dev_projects SET conversation_id = '' WHERE user_id = ? AND slug = ?",
+            (user_id, slug),
+        )
+        db.execute(
+            "INSERT INTO dev_state (user_id, active_project, conversation_id, worker_seen_at, worker_host) "
+            "VALUES (?, ?, '', 0, '') "
             "ON CONFLICT(user_id) DO UPDATE SET conversation_id=''",
-            (user_id,),
+            (user_id, slug),
         )
 
 
@@ -389,20 +551,30 @@ def latest_dev_turn(user_id: int) -> dict | None:
     return dict(row) if row else None
 
 
-def enqueue_dev_turn(user_id: int, prompt: str, new_thread: bool = False) -> dict:
+def enqueue_dev_turn(user_id: int, prompt: str, new_thread: bool = False,
+                     project_slug: str = "", init_project: bool = False) -> dict:
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     with _dev_lock, connect() as db:
+        _ensure_default_project(db, user_id)
+        srow = db.execute(
+            "SELECT active_project FROM dev_state WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        slug = project_slug or (srow["active_project"] if srow else DEFAULT_DEV_PROJECT)
         if new_thread:
             db.execute(
-                "INSERT INTO dev_state (user_id, conversation_id, worker_seen_at, worker_host) "
-                "VALUES (?, '', 0, '') "
+                "UPDATE dev_projects SET conversation_id = '' WHERE user_id = ? AND slug = ?",
+                (user_id, slug),
+            )
+            db.execute(
+                "INSERT INTO dev_state (user_id, active_project, conversation_id, worker_seen_at, worker_host) "
+                "VALUES (?, ?, '', 0, '') "
                 "ON CONFLICT(user_id) DO UPDATE SET conversation_id=''",
-                (user_id,),
+                (user_id, slug),
             )
         cur = db.execute(
-            "INSERT INTO dev_turns (user_id, prompt, new_thread, status, created_at) "
-            "VALUES (?, ?, ?, 'queued', ?)",
-            (user_id, prompt, 1 if new_thread else 0, now),
+            "INSERT INTO dev_turns (user_id, project_slug, init_project, prompt, new_thread, status, created_at) "
+            "VALUES (?, ?, ?, ?, ?, 'queued', ?)",
+            (user_id, slug, 1 if init_project else 0, prompt, 1 if new_thread else 0, now),
         )
         row = db.execute("SELECT * FROM dev_turns WHERE id = ?", (cur.lastrowid,)).fetchone()
     return dict(row)
@@ -411,12 +583,13 @@ def enqueue_dev_turn(user_id: int, prompt: str, new_thread: bool = False) -> dic
 def claim_next_dev_turn(user_id: int, host: str = "", now: float | None = None) -> dict | None:
     seen = time.time() if now is None else now
     with _dev_lock, connect() as db:
+        _ensure_default_project(db, user_id)
         db.execute(
-            "INSERT INTO dev_state (user_id, conversation_id, worker_seen_at, worker_host) "
-            "VALUES (?, '', ?, ?) "
+            "INSERT INTO dev_state (user_id, active_project, conversation_id, worker_seen_at, worker_host) "
+            "VALUES (?, ?, '', ?, ?) "
             "ON CONFLICT(user_id) DO UPDATE SET worker_seen_at=excluded.worker_seen_at, "
             "worker_host=excluded.worker_host",
-            (user_id, seen, host),
+            (user_id, DEFAULT_DEV_PROJECT, seen, host),
         )
         row = db.execute(
             "SELECT * FROM dev_turns WHERE user_id = ? AND status = 'queued' "
@@ -425,12 +598,14 @@ def claim_next_dev_turn(user_id: int, host: str = "", now: float | None = None) 
         ).fetchone()
         if not row:
             return None
+        slug = row["project_slug"] or DEFAULT_DEV_PROJECT
         conv_id = ""
         if not row["new_thread"]:
-            srow = db.execute(
-                "SELECT conversation_id FROM dev_state WHERE user_id = ?", (user_id,)
+            prow = db.execute(
+                "SELECT conversation_id FROM dev_projects WHERE user_id = ? AND slug = ?",
+                (user_id, slug),
             ).fetchone()
-            conv_id = srow["conversation_id"] if srow else ""
+            conv_id = prow["conversation_id"] if prow else ""
         db.execute(
             "UPDATE dev_turns SET status = 'running', conversation_id = ? WHERE id = ?",
             (conv_id, row["id"]),
@@ -458,6 +633,9 @@ def complete_dev_turn(turn_id: int, reply: str, conversation_id: str = "",
         existing = db.execute("SELECT * FROM dev_turns WHERE id = ?", (turn_id,)).fetchone()
         if not existing:
             return None
+        uid = existing["user_id"]
+        slug = existing["project_slug"] or DEFAULT_DEV_PROJECT
+        _ensure_default_project(db, uid)
         conv = conversation_id or existing["conversation_id"]
         db.execute(
             "UPDATE dev_turns SET status = ?, reply = ?, conversation_id = ?, "
@@ -466,10 +644,20 @@ def complete_dev_turn(turn_id: int, reply: str, conversation_id: str = "",
         )
         if not error and conv:
             db.execute(
-                "INSERT INTO dev_state (user_id, conversation_id, worker_seen_at, worker_host) "
-                "VALUES (?, ?, 0, '') "
-                "ON CONFLICT(user_id) DO UPDATE SET conversation_id=excluded.conversation_id",
-                (existing["user_id"], conv),
+                "UPDATE dev_projects SET conversation_id = ?, updated_at = ? "
+                "WHERE user_id = ? AND slug = ?",
+                (conv, now, uid, slug),
             )
+            srow = db.execute(
+                "SELECT active_project FROM dev_state WHERE user_id = ?", (uid,)
+            ).fetchone()
+            active = srow["active_project"] if srow else DEFAULT_DEV_PROJECT
+            if active == slug:
+                db.execute(
+                    "INSERT INTO dev_state (user_id, active_project, conversation_id, worker_seen_at, worker_host) "
+                    "VALUES (?, ?, ?, 0, '') "
+                    "ON CONFLICT(user_id) DO UPDATE SET conversation_id=excluded.conversation_id",
+                    (uid, slug, conv),
+                )
         row = db.execute("SELECT * FROM dev_turns WHERE id = ?", (turn_id,)).fetchone()
     return dict(row)

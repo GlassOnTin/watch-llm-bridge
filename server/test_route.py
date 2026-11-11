@@ -647,17 +647,23 @@ def test_ha_prompt_section_appears_only_when_connected(stocked_trello):
 
 def test_dev_tools_and_prompt_appear_only_for_dev_user(stocked_trello):
     normal_names = {t["function"]["name"] for t in app.tools_for()}
-    assert not (normal_names & {"dev_send", "dev_status", "dev_new_thread"})
+    assert not (normal_names & {"dev_send", "dev_status", "dev_new_thread",
+                                "dev_list_projects", "dev_start_project", "dev_switch_project"})
     dev_names = {t["function"]["name"] for t in app.tools_for(dev=True)}
-    assert {"dev_send", "dev_status", "dev_new_thread"} <= dev_names
+    assert {"dev_send", "dev_status", "dev_new_thread",
+            "dev_list_projects", "dev_start_project", "dev_switch_project"} <= dev_names
 
     no_dev = app.build_system_prompt(t=app.Trello("k", "t"))
     assert "dev_send" not in no_dev
     with_dev = app.build_system_prompt(t=app.Trello("k", "t"), dev=True)
-    for tool in ("dev_send", "dev_status", "dev_new_thread"):
+    for tool in ("dev_send", "dev_status", "dev_new_thread",
+                 "dev_list_projects", "dev_start_project", "dev_switch_project"):
         assert tool in with_dev
 
     assert app.execute_tool("dev_send", {"message": "hi"}) == {
+        "ok": False, "error": "dev_forbidden"
+    }
+    assert app.execute_tool("dev_list_projects", {}) == {
         "ok": False, "error": "dev_forbidden"
     }
 

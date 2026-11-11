@@ -1228,23 +1228,50 @@ DEV_TOOLS = [
     {"type": "function", "function": {
         "name": "dev_send",
         "description": "Send a development message, feature request, bug report, "
-                       "or codebase question to Carbon, the AI coding agent "
-                       "maintaining this Watch Bridge codebase. Continues the "
-                       "current conversation unless new_thread is true.",
+                       "or codebase question to Carbon, the AI coding agent on "
+                       "the operator's workstation. Targets the active project "
+                       "(default watch-llm-bridge) unless project is named.",
         "parameters": {"type": "object", "properties": {
             "message": {"type": "string",
                         "description": "What to ask or instruct Carbon to do"},
+            "project": {"type": "string",
+                        "description": "Optional project name/slug when targeting a specific project"},
             "new_thread": {"type": "boolean",
                            "description": "true only when starting a fresh conversation"}},
             "required": ["message"]}}},
     {"type": "function", "function": {
         "name": "dev_status",
-        "description": "Check whether Carbon is still working or read its latest reply.",
+        "description": "Check whether Carbon is still working, which project is active, or read its latest reply.",
         "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {
         "name": "dev_new_thread",
-        "description": "Reset and start a fresh conversation thread with Carbon.",
+        "description": "Reset and start a fresh conversation thread with Carbon on the active project.",
         "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "dev_list_projects",
+        "description": "List coding projects started over the Watch Bridge (or all Carbon projects when watch_only is false).",
+        "parameters": {"type": "object", "properties": {
+            "watch_only": {"type": "boolean",
+                           "description": "true (default) for projects started via the watch bridge; false to include existing repos"}}}}},
+    {"type": "function", "function": {
+        "name": "dev_start_project",
+        "description": "Create and switch to a brand-new coding project under ~/Code on the workstation, recorded as started via the Watch Bridge.",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string",
+                     "description": "Project name, e.g. 'solar-logger' or 'Solar Logger'"},
+            "summary": {"type": "string",
+                        "description": "Short one-line purpose of the project"},
+            "initial_task": {"type": "string",
+                             "description": "Optional first coding/scaffolding instruction for Carbon"}},
+            "required": ["name"]}}},
+    {"type": "function", "function": {
+        "name": "dev_switch_project",
+        "description": "Switch Carbon's active project (resuming that project's conversation thread). Set attach_existing=true only when attaching an existing repo in ~/Code.",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string", "description": "Project name or slug"},
+            "attach_existing": {"type": "boolean",
+                                "description": "true only when attaching a pre-existing repo in ~/Code"}},
+            "required": ["name"]}}},
 ]
 
 
@@ -1332,18 +1359,26 @@ def build_system_prompt(t: Trello | None = None,
         ]
     if dev:
         tool_lines += [
-            "- dev_send(message, new_thread) — talk to Carbon, the coding agent developing this Watch Bridge",
-            "- dev_status() — check whether Carbon is still working or read its latest reply",
-            "- dev_new_thread() — start a fresh conversation thread with Carbon",
+            "- dev_send(message, project, new_thread) — talk to Carbon, the coding agent on the workstation",
+            "- dev_status() — check whether Carbon is still working, active project, or read its latest reply",
+            "- dev_new_thread() — start a fresh conversation thread on the active project",
+            "- dev_list_projects(watch_only) — list projects started over the watch bridge (or all Carbon projects)",
+            "- dev_start_project(name, summary, initial_task) — start a new project repo on the workstation",
+            "- dev_switch_project(name, attach_existing) — switch Carbon between projects",
         ]
     dev_rule = (
-        """\n11. Dev agent (Carbon): when the user mentions Carbon, the dev agent, or asks
-    to inspect, debug, test, change, or deploy the watch bridge itself, call
-    dev_send (pass their full request in message; set new_thread=true only when
-    they ask for a fresh conversation), dev_status (when they ask if Carbon
-    finished or what Carbon said), or dev_new_thread. When dev_send or
-    dev_status returns status "done", read Carbon's reply aloud concisely. When
-    status is "running" or "queued_offline", say so in one short sentence."""
+        """\n11. Dev agent (Carbon): when the user mentions Carbon, coding projects, or asks
+    to inspect, debug, test, change, or deploy the watch bridge or another
+    project, use the dev_* tools:
+    - dev_list_projects(watch_only=true) when asked what projects they started
+      over the watch bridge (pass watch_only=false only when asked for all
+      projects including existing repos).
+    - dev_start_project(name, summary, initial_task) when asked to create/start
+      a brand-new project; dev_switch_project(name) to switch projects.
+    - dev_send(message, project, new_thread) to talk to Carbon; dev_status() to
+      check progress or read Carbon's latest reply; dev_new_thread() to reset.
+    When status is "done", read Carbon's reply aloud concisely. When status is
+    "running" or "queued_offline", say so in one short sentence."""
         if dev else ""
     )
     calendar_rule = (
@@ -1826,29 +1861,11 @@ def execute_tool(name: str, args: dict, t: Trello | None = None,
         if dev_user is None or not is_dev_user(dev_user):
             return {"ok": False, "error": "dev_forbidden"}
         uid = dev_user["id"]
-        if name == "dev_new_thread":
-            store.reset_dev_thread(uid)
-            return {"ok": True, "status": "new_thread"}
-        if name == "dev_status":
+
+        def _dispatch_turn(turn: dict) -> dict:
             state = store.get_dev_state(uid)
             online = (state["worker_seen_at"] > 0
                       and (time.time() - state["worker_seen_at"]) <= DEV_WORKER_TTL)
-            latest = store.latest_dev_turn(uid)
-            if latest is None:
-                return {"ok": True, "status": "idle", "worker_online": online,
-                        "conversation_id": state["conversation_id"]}
-            return {"ok": True, "status": latest["status"], "turn_id": latest["id"],
-                    "reply": latest["reply"],
-                    "conversation_id": latest["conversation_id"] or state["conversation_id"],
-                    "worker_online": online}
-        if name == "dev_send":
-            msg = (args.get("message") or "").strip()
-            if not msg:
-                return {"ok": False, "error": "empty_message"}
-            state = store.get_dev_state(uid)
-            online = (state["worker_seen_at"] > 0
-                      and (time.time() - state["worker_seen_at"]) <= DEV_WORKER_TTL)
-            turn = store.enqueue_dev_turn(uid, msg, new_thread=bool(args.get("new_thread")))
             with _dev_cond:
                 _dev_cond.notify_all()
             if not online:
@@ -1872,6 +1889,100 @@ def execute_tool(name: str, args: dict, t: Trello | None = None,
                         "turn_id": cur["id"], "reply": cur["reply"],
                         "conversation_id": cur["conversation_id"]}
             return {"ok": True, "status": "running", "turn_id": turn["id"]}
+
+        if name == "dev_new_thread":
+            store.reset_dev_thread(uid)
+            return {"ok": True, "status": "new_thread"}
+        if name == "dev_list_projects":
+            watch_only = args.get("watch_only")
+            if watch_only is None:
+                watch_only = True
+            state = store.get_dev_state(uid)
+            rows = store.list_dev_projects(uid, watch_only=bool(watch_only))
+            return {
+                "ok": True,
+                "active_project": state["active_project"],
+                "watch_only": bool(watch_only),
+                "projects": [
+                    {
+                        "name": p["name"],
+                        "slug": p["slug"],
+                        "summary": p["summary"],
+                        "started_via_watch": bool(p["started_via_watch"]),
+                        "active": p["slug"] == state["active_project"],
+                    }
+                    for p in rows
+                ],
+            }
+        if name == "dev_start_project":
+            raw_name = (args.get("name") or "").strip()
+            if not raw_name:
+                return {"ok": False, "error": "empty_project_name"}
+            try:
+                proj = store.create_dev_project(
+                    uid,
+                    raw_name,
+                    summary=(args.get("summary") or "").strip(),
+                    started_via_watch=True,
+                )
+            except ValueError as e:
+                return {"ok": False, "error": "bad_project_name", "detail": str(e)}
+            store.set_active_dev_project(uid, proj["slug"])
+            task = (args.get("initial_task") or "").strip()
+            turn = store.enqueue_dev_turn(
+                uid, task, project_slug=proj["slug"], init_project=True
+            )
+            res = _dispatch_turn(turn)
+            return {**res, "project": proj["slug"], "name": proj["name"],
+                    "active_project": proj["slug"]}
+        if name == "dev_switch_project":
+            raw_name = (args.get("name") or "").strip()
+            if not raw_name:
+                return {"ok": False, "error": "empty_project_name"}
+            if args.get("attach_existing"):
+                try:
+                    hit = store.create_dev_project(uid, raw_name, started_via_watch=False)
+                except ValueError as e:
+                    return {"ok": False, "error": "bad_project_name", "detail": str(e)}
+            else:
+                try:
+                    hit = store.find_dev_project(uid, raw_name)
+                except KeyError as e:
+                    return _match_error(e, "no_project", "ambiguous_project")
+            store.set_active_dev_project(uid, hit["slug"])
+            return {"ok": True, "active_project": hit["slug"], "name": hit["name"],
+                    "has_thread": bool(hit["conversation_id"])}
+        if name == "dev_status":
+            state = store.get_dev_state(uid)
+            online = (state["worker_seen_at"] > 0
+                      and (time.time() - state["worker_seen_at"]) <= DEV_WORKER_TTL)
+            latest = store.latest_dev_turn(uid)
+            if latest is None:
+                return {"ok": True, "status": "idle", "worker_online": online,
+                        "active_project": state["active_project"],
+                        "conversation_id": state["conversation_id"]}
+            return {"ok": True, "status": latest["status"], "turn_id": latest["id"],
+                    "project": latest.get("project_slug") or state["active_project"],
+                    "active_project": state["active_project"],
+                    "reply": latest["reply"],
+                    "conversation_id": latest["conversation_id"] or state["conversation_id"],
+                    "worker_online": online}
+        if name == "dev_send":
+            msg = (args.get("message") or "").strip()
+            if not msg:
+                return {"ok": False, "error": "empty_message"}
+            proj_slug = ""
+            if args.get("project"):
+                try:
+                    hit = store.find_dev_project(uid, args["project"])
+                except KeyError as e:
+                    return _match_error(e, "no_project", "ambiguous_project")
+                store.set_active_dev_project(uid, hit["slug"])
+                proj_slug = hit["slug"]
+            turn = store.enqueue_dev_turn(
+                uid, msg, new_thread=bool(args.get("new_thread")), project_slug=proj_slug
+            )
+            return _dispatch_turn(turn)
     raise NotImplementedError(f"unknown tool '{name}'")
 
 
@@ -2432,7 +2543,11 @@ def dev_complete(turn_id: int, body: DevCompleteIn,
 def dev_status_endpoint(authorization: str = Header(default="")) -> dict:
     user = require_dev_user(authorization)
     state = store.get_dev_state(user["id"])
-    return {"state": state, "latest_turn": store.latest_dev_turn(user["id"])}
+    return {
+        "state": state,
+        "projects": store.list_dev_projects(user["id"], watch_only=False),
+        "latest_turn": store.latest_dev_turn(user["id"]),
+    }
 
 
 # --- multi-user web front end: signup, login, dashboard, Trello onboarding ---

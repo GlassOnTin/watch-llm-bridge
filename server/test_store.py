@@ -178,6 +178,7 @@ def test_legacy_google_row_migrates_to_a_primary_calendar_id(tmp_path):
 def test_dev_turn_lifecycle_and_conversation_continuity():
     u = create_user("ian", "hunter2hunter", is_admin=True)
     assert store.get_dev_state(u["id"]) == {
+        "active_project": "watch-llm-bridge",
         "conversation_id": "",
         "worker_seen_at": 0.0,
         "worker_host": "",
@@ -228,3 +229,73 @@ def test_dev_turn_timeout_flag_is_atomic():
     after = store.mark_dev_turn_timed_out(t2["id"])
     assert after["status"] == "done"
     assert after["timed_out"] == 0
+
+
+def test_dev_projects_track_watch_started_and_preserve_per_project_threads():
+    u = create_user("ian", "hunter2hunter", is_admin=True)
+    # Default watch-llm-bridge is NOT marked started_via_watch.
+    assert store.list_dev_projects(u["id"], watch_only=True) == []
+    all_initial = store.list_dev_projects(u["id"], watch_only=False)
+    assert [p["slug"] for p in all_initial] == ["watch-llm-bridge"]
+
+    # Record a conversation on watch-llm-bridge.
+    t_bridge = store.enqueue_dev_turn(u["id"], "inspect bridge")
+    store.claim_next_dev_turn(u["id"], host="ws", now=100.0)
+    store.complete_dev_turn(t_bridge["id"], "Bridge ok.", conversation_id="conv-bridge")
+
+    # Start two new projects over the watch bridge.
+    p1 = store.create_dev_project(u["id"], "Solar Logger", summary="Victron MQTT logger",
+                                  started_via_watch=True)
+    assert p1["slug"] == "solar-logger"
+    assert p1["started_via_watch"] == 1
+    store.set_active_dev_project(u["id"], "solar-logger")
+    assert store.get_dev_state(u["id"])["active_project"] == "solar-logger"
+    assert store.get_dev_state(u["id"])["conversation_id"] == ""
+
+    t_solar = store.enqueue_dev_turn(u["id"], "scaffold cli")
+    claimed_solar = store.claim_next_dev_turn(u["id"], host="ws", now=110.0)
+    assert claimed_solar["project_slug"] == "solar-logger"
+    assert claimed_solar["conversation_id"] == ""
+    store.complete_dev_turn(t_solar["id"], "Scaffolded.", conversation_id="conv-solar")
+
+    p2 = store.create_dev_project(u["id"], "Pebble Sync", summary="Health sync",
+                                  started_via_watch=True)
+    assert p2["slug"] == "pebble-sync"
+
+    # Attach an existing repo (started_via_watch=False) -> excluded from watch_only=True.
+    store.create_dev_project(u["id"], "fieldsmith", started_via_watch=False)
+
+    watch_started = store.list_dev_projects(u["id"], watch_only=True)
+    assert [p["slug"] for p in watch_started] == ["solar-logger", "pebble-sync"]
+
+    # Switching back to watch-llm-bridge restores conv-bridge; switching to solar-logger restores conv-solar!
+    store.set_active_dev_project(u["id"], "watch-llm-bridge")
+    assert store.get_dev_state(u["id"])["conversation_id"] == "conv-bridge"
+    store.set_active_dev_project(u["id"], "solar-logger")
+    assert store.get_dev_state(u["id"])["conversation_id"] == "conv-solar"
+
+
+def test_legacy_dev_tables_migrate_project_columns(tmp_path):
+    import sqlite3
+    dbfile = tmp_path / "legacy_dev.db"
+    legacy = sqlite3.connect(dbfile)
+    legacy.executescript(
+        "CREATE TABLE dev_state (user_id INTEGER PRIMARY KEY,"
+        " conversation_id TEXT NOT NULL DEFAULT '',"
+        " worker_seen_at REAL NOT NULL DEFAULT 0,"
+        " worker_host TEXT NOT NULL DEFAULT '');"
+        "INSERT INTO dev_state VALUES (1, 'conv-existing', 999.0, 'msi-z790');"
+        "CREATE TABLE dev_turns (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL,"
+        " prompt TEXT NOT NULL, new_thread INTEGER NOT NULL DEFAULT 0,"
+        " conversation_id TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,"
+        " reply TEXT NOT NULL DEFAULT '', timed_out INTEGER NOT NULL DEFAULT 0,"
+        " created_at TEXT NOT NULL, completed_at TEXT NOT NULL DEFAULT '');"
+    )
+    legacy.commit()
+    legacy.close()
+    store._conn = None
+    store.connect(str(dbfile))
+    st = store.get_dev_state(1)
+    assert st["active_project"] == "watch-llm-bridge"
+    assert st["conversation_id"] == "conv-existing"
+

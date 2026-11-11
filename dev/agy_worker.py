@@ -24,6 +24,9 @@ import requests
 from dotenv import dotenv_values
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+PROJECTS_ROOT = Path(os.environ.get("PROJECTS_ROOT") or REPO_ROOT.parent)
+DEFAULT_PROJECT_SLUG = "watch-llm-bridge"
+SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
 DEFAULT_MODEL = "gemini-4-carbon-medium"
 
 FIRST_TURN_PREAMBLE = """[Watch Bridge Voice Dev Session]
@@ -34,6 +37,16 @@ Guidelines:
 2. Before claiming any code change works, run pytest in a clean env from /tmp:
    cd /tmp && env -i PATH="$PATH" HOME=/tmp BRIDGE_DB=/tmp/btest.db BRIDGE_TOKEN=t TRELLO_KEY=k TRELLO_TOKEN=t {repo_root}/.venv/bin/pytest -q {repo_root}/server/
 3. Do NOT deploy to production unless Ian explicitly asks to deploy. When asked to deploy, ALWAYS run `{repo_root}/dev/canary_deploy.sh` (runs clean tests, snapshots /opt/bridge.prev, deploys, checks /health, and auto-rolls back on failure). Never add AI attribution to git commits.
+
+Spoken request:
+{prompt}"""
+
+PROJECT_TURN_PREAMBLE = """[Watch Bridge Voice Dev Session — Project: {project_slug}]
+The operator (Ian) is speaking to you from his Apple Watch via https://bridge.upperpeas.com.
+Workspace: {repo_root}
+Guidelines:
+1. Your final response is read aloud on an Apple Watch or iPhone notification: keep your final output to 1-3 short, plain-spoken sentences. Do not include markdown links, code blocks, file URIs, or UUIDs in your final answer.
+2. Verify code changes empirically with real tests before claiming they work. Never add AI attribution to git commits.
 
 Spoken request:
 {prompt}"""
@@ -90,9 +103,34 @@ def prepare_agy_home(real_home: Path, agy_home: Path) -> None:
     mcp_path.write_text('{"mcpServers": {}}\n')
 
 
-def format_prompt(prompt: str, conversation_id: str, repo_root: Path) -> str:
+def ensure_project_dir(projects_root: Path, slug: str, init_git: bool = False) -> Path:
+    """Resolve `projects_root / slug` safely (no traversal) and optionally `git init`."""
+    if not SLUG_RE.match(slug):
+        raise ValueError(f"invalid project slug {slug!r}")
+    root_resolved = projects_root.resolve()
+    target = (root_resolved / slug).resolve()
+    if target.parent != root_resolved:
+        raise ValueError(f"project slug {slug!r} escapes {root_resolved}")
+    if init_git or not target.exists():
+        target.mkdir(parents=True, exist_ok=True)
+        if not (target / ".git").exists():
+            subprocess.run(
+                ["git", "init", "-q"],
+                cwd=str(target),
+                stdin=subprocess.DEVNULL,
+                check=True,
+            )
+    return target
+
+
+def format_prompt(prompt: str, conversation_id: str, repo_root: Path,
+                  project_slug: str = DEFAULT_PROJECT_SLUG) -> str:
     if conversation_id:
         return FOLLOWUP_PREAMBLE.format(prompt=prompt.strip())
+    if project_slug and project_slug != DEFAULT_PROJECT_SLUG:
+        return PROJECT_TURN_PREAMBLE.format(
+            project_slug=project_slug, repo_root=repo_root, prompt=prompt.strip()
+        )
     return FIRST_TURN_PREAMBLE.format(repo_root=repo_root, prompt=prompt.strip())
 
 
@@ -104,9 +142,10 @@ def run_agy_turn(
     agy_bin: str,
     model: str = DEFAULT_MODEL,
     timeout: int = 600,
+    project_slug: str = DEFAULT_PROJECT_SLUG,
 ) -> tuple[str, str, bool]:
     """Run one turn of `agy` and return (spoken_reply, conversation_id, is_error)."""
-    framed = format_prompt(prompt, conversation_id, repo_root)
+    framed = format_prompt(prompt, conversation_id, repo_root, project_slug=project_slug)
     cmd = [
         agy_bin,
         "--model",
@@ -244,17 +283,44 @@ def main() -> int:
 
         turn_id = turn["id"]
         conv_id = turn.get("conversation_id") or ""
-        logging.info("claimed turn id=%s conv=%s prompt=%r",
-                     turn_id, conv_id or "(new)", turn["prompt"][:120])
+        proj_slug = turn.get("project_slug") or DEFAULT_PROJECT_SLUG
+        init_proj = bool(turn.get("init_project"))
+        logging.info("claimed turn id=%s project=%s init=%s conv=%s prompt=%r",
+                     turn_id, proj_slug, init_proj, conv_id or "(new)", turn["prompt"][:120])
+        try:
+            proj_dir = (
+                REPO_ROOT
+                if proj_slug == DEFAULT_PROJECT_SLUG
+                else ensure_project_dir(PROJECTS_ROOT, proj_slug, init_git=init_proj)
+            )
+        except Exception as e:
+            post_complete_with_retry(
+                session, base_url, headers, turn_id,
+                f"Could not prepare project folder {proj_slug}: {e}", conv_id, True
+            )
+            if args.once:
+                return 0
+            continue
+
+        if init_proj and not (turn.get("prompt") or "").strip():
+            reply = f"Created git repository {proj_slug} and switched Carbon to it."
+            post_complete_with_retry(
+                session, base_url, headers, turn_id, reply, conv_id, False
+            )
+            if args.once:
+                return 0
+            continue
+
         prepare_agy_home(real_home, agy_home)
         t0 = time.monotonic()
         reply, new_conv, is_err = run_agy_turn(
             prompt=turn["prompt"],
             conversation_id=conv_id,
-            repo_root=REPO_ROOT,
+            repo_root=proj_dir,
             agy_home=agy_home,
             agy_bin=agy_bin,
             model=model,
+            project_slug=proj_slug,
         )
         elapsed = time.monotonic() - t0
         logging.info("finished turn id=%s in %.1fs err=%s conv=%s reply=%r",
