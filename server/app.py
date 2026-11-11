@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import secrets
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote, urlencode
@@ -68,6 +69,21 @@ TRELLO_API = "https://api.trello.com/1"
 # controllable domains the voice tools act on; every entity stays readable
 # through ha_get_state / ha_list_entities.
 HA_CONTROLLABLE = {"light", "switch", "fan", "scene", "media_player"}
+
+# Workstation Carbon dev-agent queue (admin/owner only).
+DEV_SYNC_WAIT = float(os.environ.get("DEV_SYNC_WAIT", "10.0"))
+DEV_WORKER_TTL = float(os.environ.get("DEV_WORKER_TTL", "45.0"))
+DEV_NOTIFY_TARGET = os.environ.get("DEV_NOTIFY_TARGET", "mobile_app_ian_sphone")
+_dev_cond = threading.Condition()
+
+
+def dev_users() -> set[str]:
+    raw = os.environ.get("DEV_USERS", OWNER_USERNAME)
+    return {u.strip() for u in raw.split(",") if u.strip()}
+
+
+def is_dev_user(user: dict | None) -> bool:
+    return bool(user and user.get("is_admin") and user.get("username") in dev_users())
 
 
 class Command(BaseModel):
@@ -827,14 +843,15 @@ def command(cmd: Command, authorization: str = Header(default="")) -> dict:
         logging.getLogger("uvicorn.error").warning(
             "Home Assistant for %s failed: %s", user["username"], e)
         h = None
-    if not clients and g is None and h is None:
+    dev_user = user if is_dev_user(user) else None
+    if not clients and g is None and h is None and dev_user is None:
         if trello_err is not None:
             status = getattr(getattr(trello_err, "response", None), "status_code", None)
             if status == 401:
                 return {"reply": "Your Trello token has expired. Open the bridge dashboard to reconnect it."}
             return {"reply": "Trello is unreachable right now."}
         return {"reply": "Your Trello isn't connected yet. Open the bridge dashboard to connect it."}
-    return {"reply": route(cmd.text, clients=clients, gcal=g, ha=h)}
+    return {"reply": route(cmd.text, clients=clients, gcal=g, ha=h, dev_user=dev_user)}
 
 
 def route(text: str) -> str:
@@ -1207,19 +1224,46 @@ HA_TOOLS = [
 ]
 
 
+DEV_TOOLS = [
+    {"type": "function", "function": {
+        "name": "dev_send",
+        "description": "Send a development message, feature request, bug report, "
+                       "or codebase question to Carbon, the AI coding agent "
+                       "maintaining this Watch Bridge codebase. Continues the "
+                       "current conversation unless new_thread is true.",
+        "parameters": {"type": "object", "properties": {
+            "message": {"type": "string",
+                        "description": "What to ask or instruct Carbon to do"},
+            "new_thread": {"type": "boolean",
+                           "description": "true only when starting a fresh conversation"}},
+            "required": ["message"]}}},
+    {"type": "function", "function": {
+        "name": "dev_status",
+        "description": "Check whether Carbon is still working or read its latest reply.",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "dev_new_thread",
+        "description": "Reset and start a fresh conversation thread with Carbon.",
+        "parameters": {"type": "object", "properties": {}}}},
+]
+
+
 def tools_for(gcal: Gcal | None = None,
-              ha: Ha | None = None) -> list[dict]:
+              ha: Ha | None = None,
+              dev: bool = False) -> list[dict]:
     """The tools this user's agent gets: calendar and home tools only once
-    the matching connection is live."""
+    the matching connection is live; dev tools only for the bridge operator."""
     return (TOOLS
             + (GCAL_TOOLS if gcal is not None and gcal.connected else [])
-            + (HA_TOOLS if ha is not None and ha.connected else []))
+            + (HA_TOOLS if ha is not None and ha.connected else [])
+            + (DEV_TOOLS if dev else []))
 
 
 def build_system_prompt(t: Trello | None = None,
                         clients: list[tuple[str, Trello]] | None = None,
                         gcal: Gcal | None = None,
-                        ha: Ha | None = None) -> str:
+                        ha: Ha | None = None,
+                        dev: bool = False) -> str:
     clients = clients if clients is not None else [(None, t or trello)]
     multi = len(clients) > 1
     lines = []
@@ -1286,6 +1330,22 @@ def build_system_prompt(t: Trello | None = None,
             "- ha_apply_scene(scene) — apply a scene",
             "- ha_media(entity, action, volume, source) — play, pause, volume 0-1, or input source on a media player",
         ]
+    if dev:
+        tool_lines += [
+            "- dev_send(message, new_thread) — talk to Carbon, the coding agent developing this Watch Bridge",
+            "- dev_status() — check whether Carbon is still working or read its latest reply",
+            "- dev_new_thread() — start a fresh conversation thread with Carbon",
+        ]
+    dev_rule = (
+        """\n11. Dev agent (Carbon): when the user mentions Carbon, the dev agent, or asks
+    to inspect, debug, test, change, or deploy the watch bridge itself, call
+    dev_send (pass their full request in message; set new_thread=true only when
+    they ask for a fresh conversation), dev_status (when they ask if Carbon
+    finished or what Carbon said), or dev_new_thread. When dev_send or
+    dev_status returns status "done", read Carbon's reply aloud concisely. When
+    status is "running" or "queued_offline", say so in one short sentence."""
+        if dev else ""
+    )
     calendar_rule = (
         """7. Calendar: the user's Google Calendar is connected. "day" is today,
    tomorrow, yesterday, or YYYY-MM-DD in the user's timezone. Convert spoken
@@ -1356,7 +1416,7 @@ Rules:
 {calendar_rule}
 {home_rule}
 9. If the request matches no tool, answer helpfully in a sentence or two.
-{account_rules}"""
+{account_rules}{dev_rule}"""
 
 
 def find_boards_with_list(list_name: str, t: Trello | None = None) -> list[str]:
@@ -1455,7 +1515,8 @@ def resolve_board(args: dict, list_name: str, t: Trello | None = None,
 
 def execute_tool(name: str, args: dict, t: Trello | None = None,
                  clients: list[tuple[str, Trello]] | None = None,
-                 gcal: Gcal | None = None, ha: Ha | None = None) -> dict:
+                 gcal: Gcal | None = None, ha: Ha | None = None,
+                 dev_user: dict | None = None) -> dict:
     """Dispatch one tool call. KeyError from resolve_target = mismatch."""
     clients = clients if clients is not None else [(None, t or trello)]
     if name.startswith("trello_") and not clients:
@@ -1761,6 +1822,56 @@ def execute_tool(name: str, args: dict, t: Trello | None = None,
                     "entities": [{"entity_id": e["entity_id"],
                                   "name": e["friendly_name"],
                                   "state": e["state"]} for e in ents]}
+    if name.startswith("dev_"):
+        if dev_user is None or not is_dev_user(dev_user):
+            return {"ok": False, "error": "dev_forbidden"}
+        uid = dev_user["id"]
+        if name == "dev_new_thread":
+            store.reset_dev_thread(uid)
+            return {"ok": True, "status": "new_thread"}
+        if name == "dev_status":
+            state = store.get_dev_state(uid)
+            online = (state["worker_seen_at"] > 0
+                      and (time.time() - state["worker_seen_at"]) <= DEV_WORKER_TTL)
+            latest = store.latest_dev_turn(uid)
+            if latest is None:
+                return {"ok": True, "status": "idle", "worker_online": online,
+                        "conversation_id": state["conversation_id"]}
+            return {"ok": True, "status": latest["status"], "turn_id": latest["id"],
+                    "reply": latest["reply"],
+                    "conversation_id": latest["conversation_id"] or state["conversation_id"],
+                    "worker_online": online}
+        if name == "dev_send":
+            msg = (args.get("message") or "").strip()
+            if not msg:
+                return {"ok": False, "error": "empty_message"}
+            state = store.get_dev_state(uid)
+            online = (state["worker_seen_at"] > 0
+                      and (time.time() - state["worker_seen_at"]) <= DEV_WORKER_TTL)
+            turn = store.enqueue_dev_turn(uid, msg, new_thread=bool(args.get("new_thread")))
+            with _dev_cond:
+                _dev_cond.notify_all()
+            if not online:
+                store.mark_dev_turn_timed_out(turn["id"])
+                return {"ok": True, "status": "queued_offline", "turn_id": turn["id"]}
+            deadline = time.monotonic() + DEV_SYNC_WAIT
+            with _dev_cond:
+                while True:
+                    cur = store.get_dev_turn(turn["id"])
+                    if cur and cur["status"] in ("done", "error"):
+                        return {"ok": cur["status"] == "done", "status": cur["status"],
+                                "turn_id": cur["id"], "reply": cur["reply"],
+                                "conversation_id": cur["conversation_id"]}
+                    rem = deadline - time.monotonic()
+                    if rem <= 0:
+                        break
+                    _dev_cond.wait(timeout=min(rem, 0.25))
+            cur = store.mark_dev_turn_timed_out(turn["id"])
+            if cur and cur["status"] in ("done", "error"):
+                return {"ok": cur["status"] == "done", "status": cur["status"],
+                        "turn_id": cur["id"], "reply": cur["reply"],
+                        "conversation_id": cur["conversation_id"]}
+            return {"ok": True, "status": "running", "turn_id": turn["id"]}
     raise NotImplementedError(f"unknown tool '{name}'")
 
 
@@ -1826,16 +1937,18 @@ def spoken_error(message: str, max_candidates: int = 5) -> str:
 def route(text: str, t: Trello | None = None,
           clients: list[tuple[str, Trello]] | None = None,
           gcal: Gcal | None = None,
-          ha: Ha | None = None) -> str:
+          ha: Ha | None = None,
+          dev_user: dict | None = None) -> str:
     """Send the sentence to the LLM; the LLM picks tools, the server keeps
     resolve_target as the fail-loud authority on where cards go. Echoes only
     while no LLM backend is configured (Phase 1 fallback)."""
     clients = clients if clients is not None else [(None, t or trello)]
     if not (LLM_BASE_URL and LLM_API_KEY and LLM_MODEL):
         return f"echo: {text}"
+    dev = is_dev_user(dev_user)
     messages = [
         {"role": "system",
-         "content": build_system_prompt(clients=clients, gcal=gcal, ha=ha)},
+         "content": build_system_prompt(clients=clients, gcal=gcal, ha=ha, dev=dev)},
         {"role": "user", "content": text},
     ]
     for _ in range(3):
@@ -1846,7 +1959,7 @@ def route(text: str, t: Trello | None = None,
                 json={
                     "model": LLM_MODEL,
                     "messages": messages,
-                    "tools": tools_for(gcal, ha),
+                    "tools": tools_for(gcal, ha, dev=dev),
                     "tool_choice": "auto",
                     "temperature": 0.1,
                     "max_tokens": 300,
@@ -1866,7 +1979,8 @@ def route(text: str, t: Trello | None = None,
             args = json.loads(call["function"]["arguments"] or "{}")
             try:
                 result = execute_tool(call["function"]["name"], args,
-                                      clients=clients, gcal=gcal, ha=ha)
+                                      clients=clients, gcal=gcal, ha=ha,
+                                      dev_user=dev_user)
             except KeyError as e:
                 return spoken_error(e.args[0])
             messages.append({
@@ -2243,6 +2357,82 @@ def ha_action(body: HaActionIn, authorization: str = Header(default="")) -> dict
         code = 400 if out.get("error") == "bad_media_action" else 404
         raise HTTPException(status_code=code, detail=out.get("error", "failed"))
     return out
+
+
+# --- Workstation Carbon dev-agent queue endpoints (operator bearer only) -----
+
+class DevPollIn(BaseModel):
+    host: str = ""
+    wait: float = 15.0
+
+
+class DevCompleteIn(BaseModel):
+    reply: str
+    conversation_id: str = ""
+    error: bool = False
+
+
+def require_dev_user(authorization: str) -> dict:
+    user = require_user(authorization)
+    if not is_dev_user(user):
+        raise HTTPException(status_code=403, detail="dev access required")
+    return user
+
+
+def _notify_dev_complete(user: dict, turn: dict) -> None:
+    if not DEV_NOTIFY_TARGET:
+        return
+    try:
+        h = ha_for(user)
+        if h is None or not h.connected:
+            return
+        title = "Carbon (Error)" if turn["status"] == "error" else "Carbon (Watch Bridge)"
+        msg = (turn["reply"] or "Completed.").strip()
+        if len(msg) > 240:
+            msg = msg[:237] + "..."
+        h.call_service("notify", DEV_NOTIFY_TARGET, {"title": title, "message": msg})
+    except Exception as e:
+        logging.getLogger("uvicorn.error").warning("dev HA notify failed: %s", e)
+
+
+@app.post("/dev/poll")
+def dev_poll(body: DevPollIn, authorization: str = Header(default="")) -> dict:
+    user = require_dev_user(authorization)
+    wait = max(0.0, min(body.wait, 25.0))
+    deadline = time.monotonic() + wait
+    with _dev_cond:
+        while True:
+            turn = store.claim_next_dev_turn(user["id"], host=body.host)
+            if turn is not None:
+                return {"turn": turn}
+            rem = deadline - time.monotonic()
+            if rem <= 0:
+                return {"turn": None}
+            _dev_cond.wait(timeout=min(rem, 1.0))
+
+
+@app.post("/dev/turns/{turn_id}/complete")
+def dev_complete(turn_id: int, body: DevCompleteIn,
+                 authorization: str = Header(default="")) -> dict:
+    user = require_dev_user(authorization)
+    existing = store.get_dev_turn(turn_id)
+    if not existing or existing["user_id"] != user["id"]:
+        raise HTTPException(status_code=404, detail="turn not found")
+    done = store.complete_dev_turn(
+        turn_id, body.reply, conversation_id=body.conversation_id, error=body.error
+    )
+    with _dev_cond:
+        _dev_cond.notify_all()
+    if done and done["timed_out"]:
+        _notify_dev_complete(user, done)
+    return {"ok": True, "turn": done}
+
+
+@app.get("/dev/status")
+def dev_status_endpoint(authorization: str = Header(default="")) -> dict:
+    user = require_dev_user(authorization)
+    state = store.get_dev_state(user["id"])
+    return {"state": state, "latest_turn": store.latest_dev_turn(user["id"])}
 
 
 # --- multi-user web front end: signup, login, dashboard, Trello onboarding ---

@@ -10,6 +10,8 @@ import hmac
 import os
 import secrets
 import sqlite3
+import threading
+import time
 from datetime import datetime, timezone
 
 DB_PATH = os.environ.get("BRIDGE_DB", os.path.join(os.getcwd(), "bridge.db"))
@@ -48,10 +50,31 @@ CREATE TABLE IF NOT EXISTS ha_instances (
   url TEXT NOT NULL,
   token TEXT NOT NULL,
   created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS dev_state (
+  user_id INTEGER PRIMARY KEY,
+  conversation_id TEXT NOT NULL DEFAULT '',
+  worker_seen_at REAL NOT NULL DEFAULT 0,
+  worker_host TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS dev_turns (
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER NOT NULL,
+  prompt TEXT NOT NULL,
+  new_thread INTEGER NOT NULL DEFAULT 0,
+  conversation_id TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL,
+  reply TEXT NOT NULL DEFAULT '',
+  timed_out INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  completed_at TEXT NOT NULL DEFAULT ''
 )
 """
 
 _conn: sqlite3.Connection | None = None
+_dev_lock = threading.Lock()
 
 
 def connect(path: str | None = None) -> sqlite3.Connection:
@@ -312,3 +335,141 @@ def delete_ha_instance(user_id: int) -> bool:
     with connect() as db:
         cur = db.execute("DELETE FROM ha_instances WHERE user_id = ?", (user_id,))
     return cur.rowcount > 0
+
+
+# --- Workstation dev worker queue (AGY / Carbon multi-turn conversation) -----
+
+def get_dev_state(user_id: int) -> dict:
+    with _dev_lock:
+        row = connect().execute(
+            "SELECT conversation_id, worker_seen_at, worker_host "
+            "FROM dev_state WHERE user_id = ?", (user_id,)
+        ).fetchone()
+    if not row:
+        return {"conversation_id": "", "worker_seen_at": 0.0, "worker_host": ""}
+    return dict(row)
+
+
+def touch_dev_worker(user_id: int, host: str = "", now: float | None = None) -> None:
+    seen = time.time() if now is None else now
+    with _dev_lock, connect() as db:
+        db.execute(
+            "INSERT INTO dev_state (user_id, conversation_id, worker_seen_at, worker_host) "
+            "VALUES (?, '', ?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET worker_seen_at=excluded.worker_seen_at, "
+            "worker_host=excluded.worker_host",
+            (user_id, seen, host),
+        )
+
+
+def reset_dev_thread(user_id: int) -> None:
+    with _dev_lock, connect() as db:
+        db.execute(
+            "INSERT INTO dev_state (user_id, conversation_id, worker_seen_at, worker_host) "
+            "VALUES (?, '', 0, '') "
+            "ON CONFLICT(user_id) DO UPDATE SET conversation_id=''",
+            (user_id,),
+        )
+
+
+def get_dev_turn(turn_id: int) -> dict | None:
+    with _dev_lock:
+        row = connect().execute(
+            "SELECT * FROM dev_turns WHERE id = ?", (turn_id,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def latest_dev_turn(user_id: int) -> dict | None:
+    with _dev_lock:
+        row = connect().execute(
+            "SELECT * FROM dev_turns WHERE user_id = ? ORDER BY id DESC LIMIT 1",
+            (user_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def enqueue_dev_turn(user_id: int, prompt: str, new_thread: bool = False) -> dict:
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with _dev_lock, connect() as db:
+        if new_thread:
+            db.execute(
+                "INSERT INTO dev_state (user_id, conversation_id, worker_seen_at, worker_host) "
+                "VALUES (?, '', 0, '') "
+                "ON CONFLICT(user_id) DO UPDATE SET conversation_id=''",
+                (user_id,),
+            )
+        cur = db.execute(
+            "INSERT INTO dev_turns (user_id, prompt, new_thread, status, created_at) "
+            "VALUES (?, ?, ?, 'queued', ?)",
+            (user_id, prompt, 1 if new_thread else 0, now),
+        )
+        row = db.execute("SELECT * FROM dev_turns WHERE id = ?", (cur.lastrowid,)).fetchone()
+    return dict(row)
+
+
+def claim_next_dev_turn(user_id: int, host: str = "", now: float | None = None) -> dict | None:
+    seen = time.time() if now is None else now
+    with _dev_lock, connect() as db:
+        db.execute(
+            "INSERT INTO dev_state (user_id, conversation_id, worker_seen_at, worker_host) "
+            "VALUES (?, '', ?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET worker_seen_at=excluded.worker_seen_at, "
+            "worker_host=excluded.worker_host",
+            (user_id, seen, host),
+        )
+        row = db.execute(
+            "SELECT * FROM dev_turns WHERE user_id = ? AND status = 'queued' "
+            "ORDER BY id ASC LIMIT 1",
+            (user_id,),
+        ).fetchone()
+        if not row:
+            return None
+        conv_id = ""
+        if not row["new_thread"]:
+            srow = db.execute(
+                "SELECT conversation_id FROM dev_state WHERE user_id = ?", (user_id,)
+            ).fetchone()
+            conv_id = srow["conversation_id"] if srow else ""
+        db.execute(
+            "UPDATE dev_turns SET status = 'running', conversation_id = ? WHERE id = ?",
+            (conv_id, row["id"]),
+        )
+        claimed = db.execute("SELECT * FROM dev_turns WHERE id = ?", (row["id"],)).fetchone()
+    return dict(claimed)
+
+
+def mark_dev_turn_timed_out(turn_id: int) -> dict | None:
+    with _dev_lock, connect() as db:
+        db.execute(
+            "UPDATE dev_turns SET timed_out = 1 "
+            "WHERE id = ? AND status IN ('queued', 'running')",
+            (turn_id,),
+        )
+        row = db.execute("SELECT * FROM dev_turns WHERE id = ?", (turn_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def complete_dev_turn(turn_id: int, reply: str, conversation_id: str = "",
+                      error: bool = False) -> dict | None:
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    status = "error" if error else "done"
+    with _dev_lock, connect() as db:
+        existing = db.execute("SELECT * FROM dev_turns WHERE id = ?", (turn_id,)).fetchone()
+        if not existing:
+            return None
+        conv = conversation_id or existing["conversation_id"]
+        db.execute(
+            "UPDATE dev_turns SET status = ?, reply = ?, conversation_id = ?, "
+            "completed_at = ? WHERE id = ?",
+            (status, reply, conv, now, turn_id),
+        )
+        if not error and conv:
+            db.execute(
+                "INSERT INTO dev_state (user_id, conversation_id, worker_seen_at, worker_host) "
+                "VALUES (?, ?, 0, '') "
+                "ON CONFLICT(user_id) DO UPDATE SET conversation_id=excluded.conversation_id",
+                (existing["user_id"], conv),
+            )
+        row = db.execute("SELECT * FROM dev_turns WHERE id = ?", (turn_id,)).fetchone()
+    return dict(row)

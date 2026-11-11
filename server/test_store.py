@@ -173,3 +173,58 @@ def test_legacy_google_row_migrates_to_a_primary_calendar_id(tmp_path):
     acc = store.get_google_account(1)
     assert acc["calendar_id"] == "primary"
     assert acc["refresh_token"] == "r"
+
+
+def test_dev_turn_lifecycle_and_conversation_continuity():
+    u = create_user("ian", "hunter2hunter", is_admin=True)
+    assert store.get_dev_state(u["id"]) == {
+        "conversation_id": "",
+        "worker_seen_at": 0.0,
+        "worker_host": "",
+    }
+    t1 = store.enqueue_dev_turn(u["id"], "inspect health endpoint")
+    assert t1["status"] == "queued"
+    assert t1["conversation_id"] == ""
+    claimed = store.claim_next_dev_turn(u["id"], host="workstation", now=1000.0)
+    assert claimed["id"] == t1["id"]
+    assert claimed["status"] == "running"
+    assert claimed["conversation_id"] == ""
+    assert store.claim_next_dev_turn(u["id"], host="workstation", now=1001.0) is None
+    state = store.get_dev_state(u["id"])
+    assert state["worker_seen_at"] == 1001.0
+    assert state["worker_host"] == "workstation"
+
+    done = store.complete_dev_turn(t1["id"], "Health returns ok.", conversation_id="conv-111")
+    assert done["status"] == "done"
+    assert done["reply"] == "Health returns ok."
+    assert done["conversation_id"] == "conv-111"
+    assert store.get_dev_state(u["id"])["conversation_id"] == "conv-111"
+
+    t2 = store.enqueue_dev_turn(u["id"], "now add uptime")
+    claimed2 = store.claim_next_dev_turn(u["id"], host="workstation", now=1010.0)
+    assert claimed2["id"] == t2["id"]
+    assert claimed2["conversation_id"] == "conv-111"
+    store.complete_dev_turn(t2["id"], "Added uptime.", conversation_id="conv-111")
+
+    t3 = store.enqueue_dev_turn(u["id"], "start fresh", new_thread=True)
+    claimed3 = store.claim_next_dev_turn(u["id"], host="workstation", now=1020.0)
+    assert claimed3["id"] == t3["id"]
+    assert claimed3["conversation_id"] == ""
+
+
+def test_dev_turn_timeout_flag_is_atomic():
+    u = create_user("ian", "hunter2hunter", is_admin=True)
+    t1 = store.enqueue_dev_turn(u["id"], "slow refactor")
+    store.claim_next_dev_turn(u["id"], host="ws", now=500.0)
+    flagged = store.mark_dev_turn_timed_out(t1["id"])
+    assert flagged["timed_out"] == 1
+    done = store.complete_dev_turn(t1["id"], "Refactor done.", conversation_id="conv-2")
+    assert done["timed_out"] == 1
+
+    # Once completed, a late timeout check must not flip timed_out to 1.
+    t2 = store.enqueue_dev_turn(u["id"], "fast query")
+    store.claim_next_dev_turn(u["id"], host="ws", now=510.0)
+    store.complete_dev_turn(t2["id"], "Fast answer.", conversation_id="conv-2")
+    after = store.mark_dev_turn_timed_out(t2["id"])
+    assert after["status"] == "done"
+    assert after["timed_out"] == 0

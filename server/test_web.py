@@ -1912,3 +1912,113 @@ def test_command_reports_expired_trello_token_when_alone(client, monkeypatch):
     assert r.status_code == 200
     assert "expired" in r.json()["reply"].lower()
     assert "dashboard" in r.json()["reply"].lower()
+
+
+def test_dev_endpoints_require_dev_user(client):
+    assert client.post("/dev/poll", json={"wait": 0}).status_code == 401
+    signup(client, "tester")
+    tester = store.get_user_by_name("tester")
+    assert client.post("/dev/poll", json={"wait": 0}, headers=bearer(tester)).status_code == 403
+
+    # Even another admin user is excluded unless listed in DEV_USERS / OWNER_USERNAME.
+    signup(client, "jenniwren")
+    jenni = store.get_user_by_name("jenniwren")
+    store.set_admin(jenni["id"], True)
+    jenni = store.get_user(jenni["id"])
+    assert app.is_dev_user(jenni) is False
+    assert client.post("/dev/poll", json={"wait": 0}, headers=bearer(jenni)).status_code == 403
+
+    owner_hdr = {"Authorization": f"Bearer {app.BRIDGE_TOKEN}"}
+    r = client.post("/dev/poll", json={"host": "workstation", "wait": 0}, headers=owner_hdr)
+    assert r.status_code == 200
+    assert r.json() == {"turn": None}
+    st = client.get("/dev/status", headers=owner_hdr)
+    assert st.status_code == 200
+    assert st.json()["state"]["worker_host"] == "workstation"
+
+
+def test_dev_send_sync_fast_path_returns_carbon_reply(client, monkeypatch):
+    import threading
+    monkeypatch.setattr(app, "DEV_SYNC_WAIT", 2.0)
+    owner = store.get_user_by_name(app.OWNER_USERNAME)
+    owner_hdr = {"Authorization": f"Bearer {app.BRIDGE_TOKEN}"}
+    h = WebFakeHa()
+    app._ha[owner["id"]] = h
+
+    # Mark worker online first.
+    assert client.post("/dev/poll", json={"host": "ws", "wait": 0}, headers=owner_hdr).status_code == 200
+
+    def worker():
+        r = client.post("/dev/poll", json={"host": "ws", "wait": 1.5}, headers=owner_hdr)
+        turn = r.json()["turn"]
+        assert turn is not None
+        client.post(
+            f"/dev/turns/{turn['id']}/complete",
+            json={"reply": "Health endpoint returns ok and cached boards.", "conversation_id": "conv-abc"},
+            headers=owner_hdr,
+        )
+
+    th = threading.Thread(target=worker)
+    th.start()
+    out = app.execute_tool("dev_send", {"message": "what does /health return?"}, dev_user=owner)
+    th.join(timeout=3)
+
+    assert out["ok"] is True
+    assert out["status"] == "done"
+    assert out["reply"] == "Health endpoint returns ok and cached boards."
+    assert h.calls == []  # fast sync reply already went to the watch; no duplicate push
+
+
+def test_dev_send_slow_turn_acks_watch_and_pushes_ha_on_complete(client, monkeypatch):
+    monkeypatch.setattr(app, "DEV_SYNC_WAIT", 0.15)
+    monkeypatch.setattr(app, "DEV_NOTIFY_TARGET", "mobile_app_ian_sphone")
+    owner = store.get_user_by_name(app.OWNER_USERNAME)
+    owner_hdr = {"Authorization": f"Bearer {app.BRIDGE_TOKEN}"}
+    h = WebFakeHa()
+    app._ha[owner["id"]] = h
+
+    # Worker is online, so dev_send waits DEV_SYNC_WAIT then falls back to async.
+    client.post("/dev/poll", json={"host": "ws", "wait": 0}, headers=owner_hdr)
+    out = app.execute_tool("dev_send", {"message": "build new endpoint"}, dev_user=owner)
+    assert out["ok"] is True
+    assert out["status"] == "running"
+    turn_id = out["turn_id"]
+
+    # While still queued/running, dev_status reports progress.
+    polled = client.post("/dev/poll", json={"host": "ws", "wait": 0}, headers=owner_hdr).json()["turn"]
+    assert polled["id"] == turn_id
+    mid = app.execute_tool("dev_status", {}, dev_user=owner)
+    assert mid["status"] == "running"
+
+    # Worker finishes asynchronously -> HA push notification fires and conversation_id persists.
+    comp = client.post(
+        f"/dev/turns/{turn_id}/complete",
+        json={"reply": "Endpoint built and all 168 tests pass.", "conversation_id": "conv-slow"},
+        headers=owner_hdr,
+    )
+    assert comp.status_code == 200
+    assert len(h.calls) == 1
+    domain, service, data = h.calls[0]
+    assert (domain, service) == ("notify", "mobile_app_ian_sphone")
+    assert "168 tests pass" in data["message"]
+
+    final = app.execute_tool("dev_status", {}, dev_user=owner)
+    assert final["status"] == "done"
+    assert final["reply"] == "Endpoint built and all 168 tests pass."
+    assert final["conversation_id"] == "conv-slow"
+
+
+def test_dev_send_offline_worker_and_new_thread_reset(client):
+    owner = store.get_user_by_name(app.OWNER_USERNAME)
+    out = app.execute_tool("dev_send", {"message": "check logs"}, dev_user=owner)
+    assert out["ok"] is True
+    assert out["status"] == "queued_offline"
+
+    # Populate a conversation_id, then reset via dev_new_thread.
+    t = store.claim_next_dev_turn(owner["id"], host="ws", now=time.time())
+    store.complete_dev_turn(t["id"], "Checked.", conversation_id="conv-old")
+    assert store.get_dev_state(owner["id"])["conversation_id"] == "conv-old"
+    reset = app.execute_tool("dev_new_thread", {}, dev_user=owner)
+    assert reset == {"ok": True, "status": "new_thread"}
+    assert store.get_dev_state(owner["id"])["conversation_id"] == ""
+
