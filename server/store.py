@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 
 DB_PATH = os.environ.get("BRIDGE_DB", os.path.join(os.getcwd(), "bridge.db"))
 DEFAULT_DEV_PROJECT = "watch-llm-bridge"
+DEFAULT_GEMINI_LIVE_MODEL = "models/gemini-3.8-live"
 PROJECT_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
 
 SCHEMA = """
@@ -52,6 +53,14 @@ CREATE TABLE IF NOT EXISTS ha_instances (
   user_id INTEGER PRIMARY KEY,
   url TEXT NOT NULL,
   token TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS gemini_keys (
+  user_id INTEGER PRIMARY KEY,
+  api_key TEXT NOT NULL,
+  model TEXT NOT NULL DEFAULT 'models/gemini-3.8-live',
+  voice TEXT NOT NULL DEFAULT 'Puck',
   created_at TEXT NOT NULL
 );
 
@@ -386,6 +395,36 @@ def get_ha_instance(user_id: int) -> dict | None:
 def delete_ha_instance(user_id: int) -> bool:
     with connect() as db:
         cur = db.execute("DELETE FROM ha_instances WHERE user_id = ?", (user_id,))
+    return cur.rowcount > 0
+
+
+# --- Gemini Live API key, one per user ---------------------------------------
+
+def save_gemini_key(user_id: int, api_key: str,
+                    model: str = DEFAULT_GEMINI_LIVE_MODEL,
+                    voice: str = "Puck") -> None:
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with connect() as db:
+        db.execute(
+            "INSERT INTO gemini_keys (user_id, api_key, model, voice, created_at) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET api_key=excluded.api_key, "
+            "model=excluded.model, voice=excluded.voice, created_at=excluded.created_at",
+            (user_id, api_key.strip(), model.strip() or DEFAULT_GEMINI_LIVE_MODEL,
+             voice.strip() or "Puck", now),
+        )
+
+
+def get_gemini_key(user_id: int) -> dict | None:
+    row = connect().execute(
+        "SELECT * FROM gemini_keys WHERE user_id = ?", (user_id,)
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def delete_gemini_key(user_id: int) -> bool:
+    with connect() as db:
+        cur = db.execute("DELETE FROM gemini_keys WHERE user_id = ?", (user_id,))
     return cur.rowcount > 0
 
 

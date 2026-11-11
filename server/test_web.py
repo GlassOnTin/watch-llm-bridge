@@ -2161,5 +2161,136 @@ def test_dev_complete_summarizes_verbose_agy_output_for_watch_and_keeps_raw(clie
     assert "1.609344" in detailed["raw_reply"]
 
 
+def test_connect_and_disconnect_gemini_live_key_verifies_handshake(client, monkeypatch):
+    import json
+    signup(client)
+    user = store.get_user_by_name("tester")
+    assert client.post("/app/gemini", json={"api_key": "   "}).status_code == 400
+
+    # Depleted credits error surfaces 402 without storing key
+    async def depleted_probe(api_key: str, model: str):
+        raise HTTPException_or_probe("Your prepayment credits are depleted.")
+
+    def HTTPException_or_probe(msg):
+        return RuntimeError(msg)
+
+    monkeypatch.setattr(app, "probe_gemini_live_key", depleted_probe)
+    r_dep = client.post("/app/gemini", json={"api_key": "AIza-depleted"})
+    assert r_dep.status_code == 402
+    assert "credits" in r_dep.json()["detail"].lower()
+    assert store.get_gemini_key(user["id"]) is None
+
+    # Bad key surfaces 401
+    async def bad_probe(api_key: str, model: str):
+        raise ValueError("API key not valid")
+
+    monkeypatch.setattr(app, "probe_gemini_live_key", bad_probe)
+    r_bad = client.post("/app/gemini", json={"api_key": "AIza-bad"})
+    assert r_bad.status_code == 401
+    assert store.get_gemini_key(user["id"]) is None
+
+    # Valid key saves and returns live_url without exposing api_key in /app/state
+    async def ok_probe(api_key: str, model: str):
+        return None
+
+    monkeypatch.setattr(app, "probe_gemini_live_key", ok_probe)
+    r_ok = client.post("/app/gemini", json={"api_key": "  AIza-good  ", "voice": "Aoede"})
+    assert r_ok.status_code == 200
+    gl = r_ok.json()["gemini_live"]
+    assert gl["connected"] is True
+    assert gl["voice"] == "Aoede"
+    assert f"/live#token={user['api_token']}" in gl["live_url"]
+    assert "AIza-good" not in json.dumps(r_ok.json())
+    assert store.get_gemini_key(user["id"])["api_key"] == "AIza-good"
+
+    r_disc = client.post("/app/gemini/disconnect")
+    assert r_disc.status_code == 200
+    assert r_disc.json()["gemini_live"]["connected"] is False
+    assert store.get_gemini_key(user["id"]) is None
+
+
+def test_live_page_and_websocket_audio_and_tool_round_trip(client, monkeypatch):
+    import asyncio
+    import json
+
+    owner = store.get_user_by_name(app.OWNER_USERNAME)
+    store.save_gemini_key(owner["id"], "AIza-live-test", voice="Puck")
+
+    page = client.get("/live")
+    assert page.status_code == 200
+    assert "AudioWorklet" in page.text
+    assert "bridge_live_token" in page.text
+
+    sent_to_gemini = []
+
+    class FakeGeminiWS:
+        def __init__(self):
+            self._q = asyncio.Queue()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def send(self, raw: str):
+            msg = json.loads(raw)
+            sent_to_gemini.append(msg)
+            if "setup" in msg:
+                await self._q.put(json.dumps({"setupComplete": {}}))
+            elif "realtimeInput" in msg:
+                await self._q.put(json.dumps({
+                    "toolCall": {
+                        "functionCalls": [{"id": "fc-1", "name": "trello_list_boards", "args": {}}]
+                    }
+                }))
+            elif "toolResponse" in msg:
+                await self._q.put(json.dumps({
+                    "serverContent": {
+                        "outputTranscription": {"text": "You have Home and Work boards."},
+                        "modelTurn": {"parts": [{"inlineData": {"mimeType": "audio/pcm;rate=24000", "data": "BBBB"}}]},
+                        "turnComplete": True,
+                    }
+                }))
+
+        async def recv(self) -> str:
+            return await self._q.get()
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(app, "_open_gemini_ws", lambda api_key: FakeGeminiWS())
+
+    with client.websocket_connect("/live/ws") as ws:
+        ws.send_json({"type": "start", "token": app.BRIDGE_TOKEN})
+        ready = ws.receive_json()
+        assert ready["type"] == "ready"
+        assert ready["username"] == app.OWNER_USERNAME
+
+        setup = sent_to_gemini[0]["setup"]
+        assert setup["generationConfig"]["responseModalities"] == ["AUDIO"]
+        assert "slidingWindow" in setup["contextWindowCompression"]
+        decl_names = {d["name"] for d in setup["tools"][0]["functionDeclarations"]}
+        assert {"trello_create_card", "dev_send", "dev_propose_project"} <= decl_names
+
+        ws.send_json({"type": "audio", "data": "AAAA"})
+        events = []
+        for _ in range(6):
+            ev = ws.receive_json()
+            events.append(ev)
+            if ev["type"] == "turn_complete":
+                break
+
+        types = [e["type"] for e in events]
+        assert "tool_call" in types
+        assert "tool_result" in types
+        assert "model_transcript" in types
+        assert "audio" in types
+        assert "turn_complete" in types
+        assert any("toolResponse" in m for m in sent_to_gemini)
+        ws.send_json({"type": "stop"})
+
+
+
 
 

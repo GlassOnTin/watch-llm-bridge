@@ -747,4 +747,18 @@ def test_summarize_for_watch_short_passthrough_and_llm_rewrite(monkeypatch):
     assert len(fallback) <= 220
 
 
+def test_tools_to_gemini_declarations_converts_all_bridge_tools():
+    decls = app.tools_to_gemini_declarations(app.tools_for(ha=FakeHa(), dev=True))
+    by_name = {d["name"]: d for d in decls}
+    assert "trello_create_card" in by_name
+    assert "ha_turn_on" in by_name
+    assert "dev_send" in by_name
+    assert "trello_list_boards" in by_name
+    # Empty-parameter tools omit 'parameters' cleanly for Gemini Live schema compatibility.
+    assert "parameters" not in by_name["trello_list_boards"]
+    assert "parameters" not in by_name["dev_new_thread"]
+    assert by_name["trello_create_card"]["parameters"]["required"] == ["list", "name"]
+
+
+
 

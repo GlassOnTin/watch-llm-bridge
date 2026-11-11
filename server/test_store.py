@@ -345,4 +345,24 @@ def test_complete_dev_turn_stores_spoken_reply_and_raw_reply():
     assert done2["raw_reply"] == "Pong."
 
 
+def test_gemini_key_save_get_overwrite_and_delete():
+    u = create_user("ian", "hunter2hunter", is_admin=True)
+    assert store.get_gemini_key(u["id"]) is None
+    store.save_gemini_key(u["id"], "AIza-first", model="models/gemini-3.8-live", voice="Puck")
+    row = store.get_gemini_key(u["id"])
+    assert row["api_key"] == "AIza-first"
+    assert row["model"] == "models/gemini-3.8-live"
+    assert row["voice"] == "Puck"
+
+    store.save_gemini_key(u["id"], "AIza-second", model="models/gemini-3.8-live", voice="Aoede")
+    row2 = store.get_gemini_key(u["id"])
+    assert row2["api_key"] == "AIza-second"
+    assert row2["voice"] == "Aoede"
+
+    assert store.delete_gemini_key(u["id"]) is True
+    assert store.get_gemini_key(u["id"]) is None
+    assert store.delete_gemini_key(u["id"]) is False
+
+
+
 

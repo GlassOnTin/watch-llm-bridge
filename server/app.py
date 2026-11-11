@@ -10,6 +10,7 @@ Run:
     set -a; source ../.env; set +a     # or export the vars directly
     uvicorn app:app --host 0.0.0.0 --port 8000
 """
+import asyncio
 import hashlib
 import hmac
 import json
@@ -25,12 +26,14 @@ from zoneinfo import ZoneInfo
 
 import pyotp
 import requests
+import websockets
 from dotenv import load_dotenv
-from fastapi import FastAPI, Header, HTTPException, Request, Response
+from fastapi import FastAPI, Header, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 
+import live
 import store
 
 load_dotenv()  # reads .env from the CWD if present; real env vars win
@@ -76,6 +79,19 @@ DEV_WORKER_TTL = float(os.environ.get("DEV_WORKER_TTL", "45.0"))
 DEV_PROPOSAL_TTL = float(os.environ.get("DEV_PROPOSAL_TTL", "900.0"))
 DEV_NOTIFY_TARGET = os.environ.get("DEV_NOTIFY_TARGET", "mobile_app_ian_sphone")
 _dev_cond = threading.Condition()
+
+# Gemini Live API (full-duplex WebSocket audio + bridge tool calling).
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+GEMINI_LIVE_MODEL = os.environ.get("GEMINI_LIVE_MODEL", store.DEFAULT_GEMINI_LIVE_MODEL)
+GEMINI_LIVE_VOICES = ("Puck", "Aoede", "Charon", "Fenrir", "Kore")
+GEMINI_WS_ENDPOINT = (
+    "wss://generativelanguage.googleapis.com/ws/"
+    "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
+)
+LIVE_IDLE_SECONDS = float(os.environ.get("LIVE_IDLE_SECONDS", "120.0"))
+LIVE_MAX_SECONDS = float(os.environ.get("LIVE_MAX_SECONDS", "900.0"))
+_live_lock = threading.Lock()
+_live_queues: dict[int, list[tuple[asyncio.AbstractEventLoop, asyncio.Queue]]] = {}
 
 
 def dev_users() -> set[str]:
@@ -1308,6 +1324,27 @@ def tools_for(gcal: Gcal | None = None,
             + (GCAL_TOOLS if gcal is not None and gcal.connected else [])
             + (HA_TOOLS if ha is not None and ha.connected else [])
             + (DEV_TOOLS if dev else []))
+
+
+def tools_to_gemini_declarations(tools: list[dict]) -> list[dict]:
+    """Convert OpenAI function tool schemas into Gemini BidiGenerateContent
+    functionDeclarations, omitting empty parameter blocks."""
+    decls = []
+    for item in tools:
+        fn = item.get("function", {})
+        decl: dict = {
+            "name": fn["name"],
+            "description": fn.get("description", ""),
+        }
+        params = fn.get("parameters") or {}
+        props = params.get("properties") or {}
+        if props:
+            p_out: dict = {"type": "object", "properties": props}
+            if params.get("required"):
+                p_out["required"] = list(params["required"])
+            decl["parameters"] = p_out
+        decls.append(decl)
+    return decls
 
 
 def build_system_prompt(t: Trello | None = None,
@@ -2651,6 +2688,21 @@ def require_dev_user(authorization: str) -> dict:
     return user
 
 
+def _push_live_carbon_event(user_id: int, summary: str) -> bool:
+    """If the user has an open Gemini Live call, inject Carbon's spoken completion
+    directly into the live session and return True."""
+    with _live_lock:
+        targets = list(_live_queues.get(user_id, ()))
+    if not targets:
+        return False
+    for loop, q in targets:
+        try:
+            loop.call_soon_threadsafe(q.put_nowait, summary)
+        except RuntimeError:
+            pass
+    return True
+
+
 def _notify_dev_complete(user: dict, turn: dict) -> None:
     if not DEV_NOTIFY_TARGET:
         return
@@ -2702,7 +2754,9 @@ def dev_complete(turn_id: int, body: DevCompleteIn,
     with _dev_cond:
         _dev_cond.notify_all()
     if done and done["timed_out"]:
-        _notify_dev_complete(user, done)
+        pushed_live = _push_live_carbon_event(user["id"], done["reply"])
+        if not pushed_live:
+            _notify_dev_complete(user, done)
     return {"ok": True, "turn": done}
 
 
@@ -2821,6 +2875,15 @@ def app_state(user: dict) -> dict:
     except (HaDisconnected, requests.RequestException):
         state["home_assistant"] = {"connected": False, "url": "",
                                    "location_name": ""}
+    gkey = gemini_key_for(user)
+    base_origin = COMMAND_URL.removesuffix("/command").rstrip("/")
+    state["gemini_live"] = {
+        "connected": bool(gkey),
+        "model": gkey["model"] if gkey else GEMINI_LIVE_MODEL,
+        "voice": gkey["voice"] if gkey else "Puck",
+        "voices": list(GEMINI_LIVE_VOICES),
+        "live_url": f"{base_origin}/live#token={user['api_token']}",
+    }
     if is_admin:
         state["users"] = [
             {"username": u["username"], "is_admin": bool(u["is_admin"]),
@@ -3125,6 +3188,83 @@ def disconnect_ha(request: Request) -> dict:
     return app_state(store.get_user(user["id"]))
 
 
+class GeminiKeyIn(BaseModel):
+    api_key: str = ""
+    voice: str = "Puck"
+    model: str = ""
+
+
+def gemini_key_for(user: dict) -> dict | None:
+    row = store.get_gemini_key(user["id"])
+    if row:
+        return row
+    if user["username"] == OWNER_USERNAME and GEMINI_API_KEY:
+        return {"api_key": GEMINI_API_KEY, "model": GEMINI_LIVE_MODEL, "voice": "Puck"}
+    return None
+
+
+def _open_gemini_ws(api_key: str):
+    return websockets.connect(
+        f"{GEMINI_WS_ENDPOINT}?key={quote(api_key, safe='')}",
+        close_timeout=5,
+        max_size=4 * 1024 * 1024,
+    )
+
+
+async def probe_gemini_live_key(api_key: str, model: str) -> None:
+    """Open a real BidiGenerateContent handshake to verify both key validity
+    and active billing/credits (GET /v1beta/models returns 200 even when
+    prepayment credits are depleted)."""
+    async with _open_gemini_ws(api_key) as ws:
+        await ws.send(json.dumps({
+            "setup": {
+                "model": model,
+                "generationConfig": {"responseModalities": ["AUDIO"]},
+            }
+        }))
+        raw = await asyncio.wait_for(ws.recv(), timeout=10)
+        ack = json.loads(raw)
+        if "setupComplete" not in ack:
+            raise RuntimeError(f"unexpected setup response: {list(ack.keys())}")
+
+
+@app.post("/app/gemini")
+async def connect_gemini(request: Request, body: GeminiKeyIn) -> dict:
+    user = require_session(request)
+    existing = store.get_gemini_key(user["id"])
+    key = body.api_key.strip() or (existing["api_key"] if existing else "")
+    if not key:
+        raise HTTPException(status_code=400, detail="paste your Gemini API key first")
+    voice = body.voice.strip() if body.voice.strip() in GEMINI_LIVE_VOICES else "Puck"
+    model = body.model.strip() or (existing["model"] if existing else GEMINI_LIVE_MODEL)
+    try:
+        await probe_gemini_live_key(key, model)
+    except Exception as e:
+        msg = str(e)
+        low = msg.lower()
+        if "credits are depleted" in low or "billing" in low or "quota" in low:
+            raise HTTPException(
+                status_code=402,
+                detail="Google AI Studio reports prepayment credits are depleted — "
+                       "top up or enable billing at ai.studio/projects",
+            )
+        if "api key" in low or "400" in low or "401" in low or "403" in low or "permission" in low:
+            raise HTTPException(
+                status_code=401,
+                detail="Google rejected that Gemini API key — create one at aistudio.google.com/apikey",
+            )
+        raise HTTPException(status_code=502, detail=f"Gemini Live handshake failed: {msg[:160]}")
+    store.save_gemini_key(user["id"], key, model=model, voice=voice)
+    return app_state(store.get_user(user["id"]))
+
+
+@app.post("/app/gemini/disconnect")
+def disconnect_gemini(request: Request) -> dict:
+    user = require_session(request)
+    store.delete_gemini_key(user["id"])
+    return app_state(store.get_user(user["id"]))
+
+
 # --- default-calendar picker --------------------------------------------------
 # Voice commands act on one calendar per user. Until they pick one it is
 # "primary"; the choice is stored with the grant and survives reconnects.
@@ -3319,6 +3459,7 @@ DASHBOARD_HTML = STYLE + """<div class="top"><h1>Watch Bridge</h1><span><span id
 <details id="trello" class="dcard"><summary id="trellos"></summary><div class="inner" id="trellobody"></div></details>
 <details id="cald" class="dcard"><summary id="cals"></summary><div class="inner" id="calbody"></div></details>
 <details id="had" class="dcard"><summary id="has"></summary><div class="inner" id="habody"></div></details>
+<details id="gemd" class="dcard"><summary id="gems"></summary><div class="inner" id="gembody"></div></details>
 <details id="watchd" class="dcard"><summary>⌚ Your watch shortcut</summary><div class="inner" id="watch"></div></details>
 <details id="talkd" class="dcard"><summary>☾ How to talk to it</summary><div class="inner">
  <p class="sub">Speak one sentence. It goes to the LLM agent together with the exact inventory
@@ -3588,6 +3729,15 @@ function render(d){
  document.getElementById('had').open=!ha.connected;
  const hd=document.getElementById('hadisc');
  if(hd)hd.onclick=disconnectHa;
+ const gm=d.gemini_live||{};
+ document.getElementById('gems').textContent=gm.connected
+  ?`🎙 Gemini Live — ${gm.voice||'Puck'} voice ready`
+  :'🎙 Gemini Live — paste an AI Studio key for live voice';
+ document.getElementById('gembody').innerHTML=geminiCard(d);
+ const gd=document.getElementById('gemdisc');
+ if(gd)gd.onclick=disconnectGemini;
+ const gc=document.getElementById('gemcopy');
+ if(gc)gc.onclick=e=>copy(e.target,gm.live_url);
  document.getElementById('watch').innerHTML=recipe(d);
  document.getElementById('invite').innerHTML=inviteCard(d);
  document.getElementById('invited').style.display=d.invite_code?'':'none';
@@ -3606,7 +3756,7 @@ document.getElementById('admin').addEventListener('click',e=>{
 document.getElementById('gearbtn').onclick=()=>{
  const s=document.getElementById('settings'); s.open=true; s.scrollIntoView({behavior:'smooth'})};
 document.addEventListener('keydown',e=>{if(e.key==='Enter'&&e.target.id==='pwcur')pw()});
-</script>""" + FOOTER + """</main></body></html>"""
+""" + live.DASHBOARD_GEMINI_JS + """</script>""" + FOOTER + """</main></body></html>"""
 
 
 # --- provisioning page: TOTP-gated reveal of the shortcut recipe + token ---
@@ -3710,3 +3860,277 @@ async function go(){
 }
 document.getElementById('code').addEventListener('keydown',e=>{if(e.key==='Enter')go()});
 </script>""" + FOOTER + """</main></body></html>"""
+
+
+# --- Gemini Live full-duplex voice page + WebSocket tool bridge --------------
+
+@app.get("/live", response_class=HTMLResponse)
+def live_page() -> HTMLResponse:
+    return HTMLResponse(live.LIVE_PAGE_HTML)
+
+
+def _user_integrations_safe(user: dict) -> tuple[list, Gcal | None, Ha | None]:
+    try:
+        clients = clients_for(user)
+    except requests.RequestException:
+        clients = []
+    g = None
+    if google_configured():
+        try:
+            g = gcal_for(user)
+            if not g.connected:
+                g = None
+        except (GcalDisconnected, requests.RequestException):
+            g = None
+    h = None
+    try:
+        h = ha_for(user)
+    except (HaDisconnected, requests.RequestException):
+        h = None
+    return clients, g, h
+
+
+def _live_ws_user(websocket: WebSocket, token: str) -> dict | None:
+    tok = (token or "").strip()
+    if tok:
+        u = store.get_user_by_token(tok)
+        if u:
+            return u
+        if hmac.compare_digest(tok, BRIDGE_TOKEN):
+            return store.get_user_by_name(OWNER_USERNAME)
+    cookie = websocket.cookies.get(SESSION_COOKIE, "")
+    uid = verify_session(cookie) if cookie else None
+    return store.get_user(uid) if uid else None
+
+
+@app.websocket("/live/ws")
+async def live_ws(websocket: WebSocket):
+    await websocket.accept()
+    try:
+        first = await asyncio.wait_for(websocket.receive_json(), timeout=10.0)
+    except Exception:
+        await websocket.close(code=1008)
+        return
+    if not isinstance(first, dict) or first.get("type") != "start":
+        await websocket.send_json({"type": "error", "detail": "expected start frame"})
+        await websocket.close(code=1008)
+        return
+
+    user = _live_ws_user(websocket, first.get("token", ""))
+    if not user:
+        await websocket.send_json({
+            "type": "error",
+            "detail": "Sign in on /app or open /live from your Dashboard Shortcut URL.",
+        })
+        await websocket.close(code=1008)
+        return
+
+    gkey = gemini_key_for(user)
+    if not gkey:
+        await websocket.send_json({
+            "type": "error",
+            "detail": "No Gemini API key connected yet — paste one in the Dashboard first.",
+        })
+        await websocket.close(code=1008)
+        return
+
+    clients, gcal, ha = await asyncio.to_thread(_user_integrations_safe, user)
+    dev = is_dev_user(user)
+    dev_u = user if dev else None
+    base_prompt = await asyncio.to_thread(
+        build_system_prompt, clients=clients, gcal=gcal, ha=ha, dev=dev, dev_user=dev_u
+    )
+    sys_prompt = (
+        base_prompt
+        + "\n\n[Live Voice Session]\nYou are speaking in a real-time full-duplex "
+          "Gemini Live audio call on the user's iPhone. Keep spoken replies "
+          "conversational, warm, and concise (1-2 short sentences unless asked "
+          "for more detail)."
+    )
+    decls = tools_to_gemini_declarations(tools_for(gcal=gcal, ha=ha, dev=dev))
+    model = gkey["model"] or GEMINI_LIVE_MODEL
+    voice = gkey["voice"] or "Puck"
+
+    loop = asyncio.get_running_loop()
+    carbon_q: asyncio.Queue[str] = asyncio.Queue()
+    entry = (loop, carbon_q)
+    with _live_lock:
+        _live_queues.setdefault(user["id"], []).append(entry)
+
+    try:
+        async with _open_gemini_ws(gkey["api_key"]) as gws:
+            setup_msg = {
+                "setup": {
+                    "model": model,
+                    "generationConfig": {
+                        "responseModalities": ["AUDIO"],
+                        "speechConfig": {
+                            "voiceConfig": {
+                                "prebuiltVoiceConfig": {"voiceName": voice}
+                            }
+                        },
+                    },
+                    "contextWindowCompression": {"slidingWindow": {}},
+                    "inputAudioTranscription": {},
+                    "outputAudioTranscription": {},
+                    "systemInstruction": {"parts": [{"text": sys_prompt}]},
+                    "tools": [{"functionDeclarations": decls}],
+                }
+            }
+            await gws.send(json.dumps(setup_msg))
+            ack = json.loads(await asyncio.wait_for(gws.recv(), timeout=12.0))
+            if "setupComplete" not in ack:
+                await websocket.send_json({
+                    "type": "error",
+                    "detail": "Gemini Live did not complete session setup.",
+                })
+                return
+
+            await websocket.send_json({
+                "type": "ready",
+                "username": user["username"],
+                "model": model,
+                "voice": voice,
+            })
+
+            session_deadline = time.monotonic() + LIVE_MAX_SECONDS
+
+            async def browser_to_gemini():
+                while time.monotonic() < session_deadline:
+                    msg = await asyncio.wait_for(
+                        websocket.receive_json(), timeout=LIVE_IDLE_SECONDS
+                    )
+                    mtype = msg.get("type")
+                    if mtype == "audio" and msg.get("data"):
+                        await gws.send(json.dumps({
+                            "realtimeInput": {
+                                "audio": {
+                                    "mimeType": "audio/pcm;rate=16000",
+                                    "data": msg["data"],
+                                }
+                            }
+                        }))
+                    elif mtype == "text" and msg.get("text"):
+                        await gws.send(json.dumps({
+                            "clientContent": {
+                                "turns": [{"role": "user", "parts": [{"text": msg["text"]}]}],
+                                "turnComplete": True,
+                            }
+                        }))
+                    elif mtype == "stop":
+                        return
+
+            async def gemini_to_browser():
+                while time.monotonic() < session_deadline:
+                    raw = await gws.recv()
+                    data = json.loads(raw)
+                    sc = data.get("serverContent")
+                    if sc:
+                        if sc.get("interrupted"):
+                            await websocket.send_json({"type": "interrupted"})
+                        in_tr = (sc.get("inputTranscription") or {}).get("text")
+                        if in_tr:
+                            await websocket.send_json({"type": "user_transcript", "text": in_tr})
+                        out_tr = (sc.get("outputTranscription") or {}).get("text")
+                        if out_tr:
+                            await websocket.send_json({"type": "model_transcript", "text": out_tr})
+                        mt = sc.get("modelTurn") or {}
+                        for part in mt.get("parts") or []:
+                            inl = part.get("inlineData")
+                            if inl and inl.get("data"):
+                                await websocket.send_json({
+                                    "type": "audio",
+                                    "data": inl["data"],
+                                    "mimeType": inl.get("mimeType", "audio/pcm;rate=24000"),
+                                })
+                        if sc.get("turnComplete"):
+                            await websocket.send_json({"type": "turn_complete"})
+
+                    tc = data.get("toolCall")
+                    if tc and tc.get("functionCalls"):
+                        f_resps = []
+                        for fc in tc["functionCalls"]:
+                            fname = fc["name"]
+                            fargs = fc.get("args") or {}
+                            await websocket.send_json({
+                                "type": "tool_call", "name": fname, "args": fargs
+                            })
+                            try:
+                                res = await asyncio.to_thread(
+                                    execute_tool,
+                                    fname,
+                                    fargs,
+                                    clients=clients,
+                                    gcal=gcal,
+                                    ha=ha,
+                                    dev_user=dev_u,
+                                )
+                            except Exception as exc:
+                                res = {"ok": False, "error": str(exc)}
+                            await websocket.send_json({
+                                "type": "tool_result",
+                                "name": fname,
+                                "ok": bool(res.get("ok", True)),
+                            })
+                            f_resps.append({
+                                "id": fc.get("id", ""),
+                                "name": fname,
+                                "response": {"result": res},
+                            })
+                        await gws.send(json.dumps({
+                            "toolResponse": {"functionResponses": f_resps}
+                        }))
+
+            async def carbon_to_gemini():
+                while time.monotonic() < session_deadline:
+                    summary = await carbon_q.get()
+                    await gws.send(json.dumps({
+                        "clientContent": {
+                            "turns": [{
+                                "role": "user",
+                                "parts": [{
+                                    "text": f"[Carbon finished the background task — let the user know briefly]: {summary}"
+                                }],
+                            }],
+                            "turnComplete": True,
+                        }
+                    }))
+
+            tasks = [
+                asyncio.create_task(browser_to_gemini()),
+                asyncio.create_task(gemini_to_browser()),
+                asyncio.create_task(carbon_to_gemini()),
+            ]
+            done_tasks, pending_tasks = await asyncio.wait(
+                tasks, return_when=asyncio.FIRST_COMPLETED
+            )
+            for p in pending_tasks:
+                p.cancel()
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
+            for d in done_tasks:
+                exc = d.exception()
+                if exc and not isinstance(exc, (WebSocketDisconnect, asyncio.TimeoutError)):
+                    await websocket.send_json({
+                        "type": "error",
+                        "detail": f"Live stream closed: {str(exc)[:140]}",
+                    })
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        try:
+            await websocket.send_json({
+                "type": "error",
+                "detail": f"Gemini Live connection failed: {str(e)[:160]}",
+            })
+        except Exception:
+            pass
+    finally:
+        with _live_lock:
+            lst = _live_queues.get(user["id"], [])
+            if entry in lst:
+                lst.remove(entry)
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
