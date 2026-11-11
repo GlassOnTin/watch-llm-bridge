@@ -2388,6 +2388,91 @@ def test_converse_uncapped_multi_turn_warm_gemini_session_and_audio_endpoint(cli
         app._close_all_converse_sessions()
 
 
+def test_projects_page_and_api_list_search_activate_and_delete(client):
+    # Unauthenticated /projects redirects to /login
+    r_unauth = client.get("/projects", follow_redirects=False)
+    assert r_unauth.status_code == 303
+    assert r_unauth.headers["location"] == "/login"
+
+    # Non-dev user is forbidden from /projects and /app/projects*
+    signup(client)
+    assert client.get("/app/state").json()["is_dev"] is False
+    assert client.get("/projects").status_code == 403
+    assert client.get("/app/projects").status_code == 403
+    assert client.post("/app/projects/watch-llm-bridge/activate").status_code == 403
+    assert client.delete("/app/projects/solar-logger").status_code == 403
+
+    # Sign in as operator (ian)
+    owner = store.get_user_by_name(app.OWNER_USERNAME)
+    client.cookies.set(app.SESSION_COOKIE, app.make_session(owner["id"]))
+
+    st = client.get("/app/state").json()
+    assert st["is_dev"] is True
+    assert st["dev_projects"]["active_project"] == "watch-llm-bridge"
+
+    page = client.get("/projects")
+    assert page.status_code == 200
+    assert "Carbon Projects" in page.text
+
+    store.create_dev_project(
+        owner["id"],
+        "Solar Logger",
+        summary="Modbus solar inverter logger",
+        started_via_watch=True,
+    )
+    store.create_dev_project(
+        owner["id"],
+        "Octo Poller",
+        summary="Existing OctoPrint helper",
+        started_via_watch=False,
+    )
+
+    all_res = client.get("/app/projects")
+    assert all_res.status_code == 200
+    slugs = [p["slug"] for p in all_res.json()["projects"]]
+    assert {"watch-llm-bridge", "solar-logger", "octo-poller"} == set(slugs)
+
+    # Search by summary keyword & filter by watch_only
+    q_res = client.get("/app/projects", params={"q": "inverter"})
+    assert [p["slug"] for p in q_res.json()["projects"]] == ["solar-logger"]
+
+    w_res = client.get("/app/projects", params={"watch_only": "true"})
+    assert [p["slug"] for p in w_res.json()["projects"]] == ["solar-logger"]
+
+    # Activate solar-logger
+    act = client.post("/app/projects/solar-logger/activate")
+    assert act.status_code == 200
+    assert act.json()["state"]["active_project"] == "solar-logger"
+
+    # Default watch-llm-bridge cannot be deleted
+    bad_del = client.delete("/app/projects/watch-llm-bridge")
+    assert bad_del.status_code == 400
+
+    # Pre-existing repo refuses delete_files=true, succeeds with delete_files=false
+    bad_files = client.delete("/app/projects/octo-poller", params={"delete_files": "true"})
+    assert bad_files.status_code == 400
+    ok_unlist = client.delete("/app/projects/octo-poller")
+    assert ok_unlist.status_code == 200
+
+    # Delete active watch-started project + queue workstation folder cleanup
+    ok_del = client.delete("/app/projects/solar-logger", params={"delete_files": "true"})
+    assert ok_del.status_code == 200
+    body = ok_del.json()
+    assert body["deleted"] == "solar-logger"
+    assert body["files_deletion_queued"] is True
+    assert body["state"]["active_project"] == "watch-llm-bridge"
+    assert [p["slug"] for p in body["projects"]] == ["watch-llm-bridge"]
+
+    # Workstation poll receives the delete_project=1 turn
+    owner_hdr = {"Authorization": f"Bearer {app.BRIDGE_TOKEN}"}
+    polled = client.post("/dev/poll", json={"host": "msi-z790", "wait": 0}, headers=owner_hdr)
+    assert polled.status_code == 200
+    turn = polled.json()["turn"]
+    assert turn["project_slug"] == "solar-logger"
+    assert turn["delete_project"] == 1
+
+
+
 
 
 

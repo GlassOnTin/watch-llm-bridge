@@ -386,6 +386,91 @@ def test_converse_history_sliding_window_idle_reset_and_clear():
     assert store.get_converse_history(u["id"], now=2011.0) == []
 
 
+def test_list_dev_projects_detailed_search_and_delete_dev_project():
+    import pytest
+
+    u = create_user("ian", "hunter2hunter", is_admin=True)
+    uid = u["id"]
+
+    # Seed a completed turn on default watch-llm-bridge so it has a conversation_id
+    t0 = store.enqueue_dev_turn(uid, "check status")
+    store.claim_next_dev_turn(uid, host="msi-z790", now=100.0)
+    store.complete_dev_turn(t0["id"], "All good.", conversation_id="conv-bridge")
+
+    store.create_dev_project(
+        uid,
+        "Solar Logger",
+        summary="Reads Modbus inverter registers into SQLite",
+        started_via_watch=True,
+    )
+    store.create_dev_project(
+        uid,
+        "Legacy Repo",
+        summary="Existing local repository",
+        started_via_watch=False,
+    )
+    store.set_active_dev_project(uid, "solar-logger")
+    t1 = store.enqueue_dev_turn(uid, "scaffold cli", project_slug="solar-logger", init_project=True)
+    store.claim_next_dev_turn(uid, host="msi-z790", now=110.0)
+    store.complete_dev_turn(t1["id"], "Created CLI.", conversation_id="conv-solar")
+
+    all_items = store.list_dev_projects_detailed(uid)
+    by_slug = {p["slug"]: p for p in all_items}
+    assert set(by_slug) == {"watch-llm-bridge", "solar-logger", "legacy-repo"}
+    assert by_slug["solar-logger"]["active"] is True
+    assert by_slug["solar-logger"]["turn_count"] == 1
+    assert by_slug["solar-logger"]["latest_reply"] == "Created CLI."
+    assert by_slug["solar-logger"]["can_delete"] is True
+    assert by_slug["solar-logger"]["can_delete_files"] is True
+    assert by_slug["watch-llm-bridge"]["can_delete"] is False
+    assert by_slug["legacy-repo"]["can_delete_files"] is False
+
+    # Search matches name, slug, and summary
+    hits = store.list_dev_projects_detailed(uid, query="modbus")
+    assert [p["slug"] for p in hits] == ["solar-logger"]
+    watch_hits = store.list_dev_projects_detailed(uid, watch_only=True)
+    assert [p["slug"] for p in watch_hits] == ["solar-logger"]
+
+    # Default bridge project cannot be deleted
+    with pytest.raises(ValueError, match="watch-llm-bridge"):
+        store.delete_dev_project(uid, "watch-llm-bridge")
+
+    # Non-existent project returns None
+    assert store.delete_dev_project(uid, "does-not-exist") is None
+
+    # Pre-existing repo cannot have workstation files deleted, only unlisted
+    with pytest.raises(ValueError, match="started via Watch"):
+        store.delete_dev_project(uid, "legacy-repo", delete_files=True)
+    removed_legacy = store.delete_dev_project(uid, "legacy-repo", delete_files=False)
+    assert removed_legacy["slug"] == "legacy-repo"
+    assert removed_legacy["files_deletion_queued"] is False
+
+    # Running turn blocks deletion so we never delete an active working tree
+    t_run = store.enqueue_dev_turn(uid, "run suite", project_slug="solar-logger")
+    store.claim_next_dev_turn(uid, host="msi-z790", now=120.0)
+    with pytest.raises(RuntimeError, match="running"):
+        store.delete_dev_project(uid, "solar-logger")
+    store.complete_dev_turn(t_run["id"], "Passed.", conversation_id="conv-solar")
+
+    # Deleting active watch-started project with delete_files=True resets active_project
+    # back to watch-llm-bridge (with its conversation_id) and queues a cleanup turn.
+    deleted = store.delete_dev_project(uid, "solar-logger", delete_files=True)
+    assert deleted["slug"] == "solar-logger"
+    assert deleted["files_deletion_queued"] is True
+
+    state = store.get_dev_state(uid)
+    assert state["active_project"] == "watch-llm-bridge"
+    assert state["conversation_id"] == "conv-bridge"
+    remaining = [p["slug"] for p in store.list_dev_projects_detailed(uid)]
+    assert remaining == ["watch-llm-bridge"]
+
+    cleanup_turn = store.claim_next_dev_turn(uid, host="msi-z790", now=130.0)
+    assert cleanup_turn is not None
+    assert cleanup_turn["project_slug"] == "solar-logger"
+    assert cleanup_turn["delete_project"] == 1
+
+
+
 
 
 

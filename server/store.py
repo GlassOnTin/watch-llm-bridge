@@ -107,6 +107,7 @@ CREATE TABLE IF NOT EXISTS dev_turns (
   user_id INTEGER NOT NULL,
   project_slug TEXT NOT NULL DEFAULT 'watch-llm-bridge',
   init_project INTEGER NOT NULL DEFAULT 0,
+  delete_project INTEGER NOT NULL DEFAULT 0,
   prompt TEXT NOT NULL,
   new_thread INTEGER NOT NULL DEFAULT 0,
   conversation_id TEXT NOT NULL DEFAULT '',
@@ -160,6 +161,9 @@ def connect(path: str | None = None) -> sqlite3.Connection:
         if tcols and "init_project" not in tcols:
             _conn.execute("ALTER TABLE dev_turns ADD COLUMN "
                           "init_project INTEGER NOT NULL DEFAULT 0")
+        if tcols and "delete_project" not in tcols:
+            _conn.execute("ALTER TABLE dev_turns ADD COLUMN "
+                          "delete_project INTEGER NOT NULL DEFAULT 0")
         if tcols and "raw_reply" not in tcols:
             _conn.execute("ALTER TABLE dev_turns ADD COLUMN "
                           "raw_reply TEXT NOT NULL DEFAULT ''")
@@ -530,6 +534,147 @@ def list_dev_projects(user_id: int, watch_only: bool = False) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def list_dev_projects_detailed(user_id: int, query: str = "",
+                               watch_only: bool = False) -> list[dict]:
+    q = query.strip().lower()
+    want_slug = re.sub(r"[^a-z0-9_-]+", "-", q).strip("-_") if q else ""
+    with _dev_lock, connect() as db:
+        _ensure_default_project(db, user_id)
+        srow = db.execute(
+            "SELECT active_project FROM dev_state WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        active = (srow["active_project"] if srow else "") or DEFAULT_DEV_PROJECT
+
+        sql = (
+            "SELECT * FROM dev_projects WHERE user_id = ?"
+            + (" AND started_via_watch = 1" if watch_only else "")
+            + " ORDER BY CASE WHEN slug = ? THEN 0 ELSE 1 END, updated_at DESC, id ASC"
+        )
+        prows = db.execute(sql, (user_id, active)).fetchall()
+
+        turn_counts = {
+            r["project_slug"]: r["cnt"]
+            for r in db.execute(
+                "SELECT project_slug, COUNT(*) AS cnt FROM dev_turns "
+                "WHERE user_id = ? AND delete_project = 0 GROUP BY project_slug",
+                (user_id,),
+            ).fetchall()
+        }
+        latest_by_slug: dict[str, sqlite3.Row] = {}
+        for trow in db.execute(
+            "SELECT project_slug, status, prompt, reply, completed_at, created_at "
+            "FROM dev_turns WHERE user_id = ? AND delete_project = 0 ORDER BY id DESC",
+            (user_id,),
+        ).fetchall():
+            ps = trow["project_slug"]
+            if ps not in latest_by_slug:
+                latest_by_slug[ps] = trow
+
+    out: list[dict] = []
+    for r in prows:
+        p = dict(r)
+        slug = p["slug"]
+        if q:
+            hay_name = p["name"].lower()
+            hay_summary = (p.get("summary") or "").lower()
+            matched = (
+                q in slug
+                or q in hay_name
+                or q in hay_summary
+                or (want_slug and want_slug in slug)
+            )
+            if not matched:
+                continue
+        lt = latest_by_slug.get(slug)
+        started_watch = bool(p["started_via_watch"])
+        is_default = slug == DEFAULT_DEV_PROJECT
+        p.update({
+            "started_via_watch": started_watch,
+            "active": slug == active,
+            "has_thread": bool(p["conversation_id"]),
+            "can_delete": not is_default,
+            "can_delete_files": (not is_default) and started_watch,
+            "workspace_path": f"~/Code/{slug}",
+            "turn_count": int(turn_counts.get(slug, 0)),
+            "latest_status": lt["status"] if lt else "",
+            "latest_prompt": lt["prompt"] if lt else "",
+            "latest_reply": lt["reply"] if lt else "",
+            "latest_at": (lt["completed_at"] or lt["created_at"]) if lt else p["updated_at"],
+        })
+        out.append(p)
+    return out
+
+
+def delete_dev_project(user_id: int, slug: str,
+                       delete_files: bool = False) -> dict | None:
+    clean_slug = slug.strip().lower()
+    if clean_slug == DEFAULT_DEV_PROJECT:
+        raise ValueError(f"cannot delete default project {DEFAULT_DEV_PROJECT}")
+    if not PROJECT_SLUG_RE.match(clean_slug):
+        return None
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with _dev_lock, connect() as db:
+        _ensure_default_project(db, user_id)
+        prow = db.execute(
+            "SELECT * FROM dev_projects WHERE user_id = ? AND slug = ?",
+            (user_id, clean_slug),
+        ).fetchone()
+        if not prow:
+            return None
+        if delete_files and not prow["started_via_watch"]:
+            raise ValueError(
+                "refusing to delete workstation files for a project not started via Watch Bridge"
+            )
+        running = db.execute(
+            "SELECT id FROM dev_turns WHERE user_id = ? AND project_slug = ? "
+            "AND status = 'running' LIMIT 1",
+            (user_id, clean_slug),
+        ).fetchone()
+        if running:
+            raise RuntimeError(
+                f"cannot delete '{clean_slug}' while a Carbon turn is running"
+            )
+
+        db.execute(
+            "DELETE FROM dev_turns WHERE user_id = ? AND project_slug = ?",
+            (user_id, clean_slug),
+        )
+        db.execute(
+            "DELETE FROM dev_proposals WHERE user_id = ? AND slug = ?",
+            (user_id, clean_slug),
+        )
+        db.execute(
+            "DELETE FROM dev_projects WHERE user_id = ? AND slug = ?",
+            (user_id, clean_slug),
+        )
+
+        srow = db.execute(
+            "SELECT active_project FROM dev_state WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        if srow and srow["active_project"] == clean_slug:
+            drow = db.execute(
+                "SELECT conversation_id FROM dev_projects WHERE user_id = ? AND slug = ?",
+                (user_id, DEFAULT_DEV_PROJECT),
+            ).fetchone()
+            default_conv = drow["conversation_id"] if drow else ""
+            db.execute(
+                "UPDATE dev_state SET active_project = ?, conversation_id = ? WHERE user_id = ?",
+                (DEFAULT_DEV_PROJECT, default_conv, user_id),
+            )
+
+        if delete_files:
+            db.execute(
+                "INSERT INTO dev_turns (user_id, project_slug, init_project, delete_project, "
+                "prompt, new_thread, status, created_at) "
+                "VALUES (?, ?, 0, 1, ?, 0, 'queued', ?)",
+                (user_id, clean_slug, f"[delete project folder {clean_slug}]", now),
+            )
+
+    result = dict(prow)
+    result["files_deletion_queued"] = bool(delete_files)
+    return result
+
+
 def create_dev_project(user_id: int, name: str, summary: str = "",
                        started_via_watch: bool = True) -> dict:
     slug = slugify_project(name)
@@ -801,7 +946,7 @@ def complete_dev_turn(turn_id: int, reply: str, conversation_id: str = "",
             "conversation_id = ?, completed_at = ? WHERE id = ?",
             (status, reply, full_raw, conv, now, turn_id),
         )
-        if not error and conv:
+        if not error and conv and not existing["delete_project"]:
             db.execute(
                 "UPDATE dev_projects SET conversation_id = ?, updated_at = ? "
                 "WHERE user_id = ? AND slug = ?",

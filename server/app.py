@@ -37,6 +37,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 
 import live
+import projects_ui
 import store
 
 load_dotenv()  # reads .env from the CWD if present; real env vars win
@@ -2889,6 +2890,15 @@ def app_state(user: dict) -> dict:
         "voices": list(GEMINI_LIVE_VOICES),
         "live_url": f"{base_origin}/live#token={user['api_token']}",
     }
+    dev = is_dev_user(user)
+    state["is_dev"] = dev
+    if dev:
+        dstate = store.get_dev_state(user["id"])
+        projs = store.list_dev_projects(user["id"], watch_only=False)
+        state["dev_projects"] = {
+            "active_project": dstate["active_project"],
+            "count": len(projs),
+        }
     if is_admin:
         state["users"] = [
             {"username": u["username"], "is_admin": bool(u["is_admin"]),
@@ -3005,6 +3015,72 @@ def dashboard_page(request: Request):
 @app.get("/app/state")
 def dashboard_state(request: Request) -> dict:
     return app_state(require_session(request))
+
+
+def require_dev_session(request: Request) -> dict:
+    user = require_session(request)
+    if not is_dev_user(user):
+        raise HTTPException(status_code=403, detail="dev access required")
+    return user
+
+
+def _projects_payload(user: dict, query: str = "", watch_only: bool = False) -> dict:
+    uid = user["id"]
+    state = store.get_dev_state(uid)
+    worker_online = (time.time() - state["worker_seen_at"]) <= DEV_WORKER_TTL
+    projects = store.list_dev_projects_detailed(uid, query=query, watch_only=watch_only)
+    return {
+        "username": user["username"],
+        "state": state,
+        "worker_online": worker_online,
+        "projects": projects,
+    }
+
+
+@app.get("/projects", response_class=HTMLResponse)
+def projects_page(request: Request):
+    user = session_user(request)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    if not is_dev_user(user):
+        raise HTTPException(status_code=403, detail="dev access required")
+    return HTMLResponse(projects_ui.PROJECTS_PAGE_HTML)
+
+
+@app.get("/app/projects")
+def app_list_projects(request: Request, q: str = "", watch_only: bool = False) -> dict:
+    user = require_dev_session(request)
+    return _projects_payload(user, query=q, watch_only=watch_only)
+
+
+@app.post("/app/projects/{slug}/activate")
+def app_activate_project(slug: str, request: Request) -> dict:
+    user = require_dev_session(request)
+    try:
+        store.set_active_dev_project(user["id"], slug.strip().lower())
+    except KeyError:
+        raise HTTPException(status_code=404, detail="project not found")
+    return _projects_payload(user)
+
+
+@app.delete("/app/projects/{slug}")
+def app_delete_project(slug: str, request: Request, delete_files: bool = False) -> dict:
+    user = require_dev_session(request)
+    try:
+        deleted = store.delete_dev_project(user["id"], slug, delete_files=delete_files)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    if deleted is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    if deleted.get("files_deletion_queued"):
+        with _dev_cond:
+            _dev_cond.notify_all()
+    out = _projects_payload(user)
+    out["deleted"] = deleted["slug"]
+    out["files_deletion_queued"] = bool(deleted.get("files_deletion_queued"))
+    return out
 
 
 @app.post("/app/trello")
@@ -3461,11 +3537,12 @@ async function go(){
 document.querySelectorAll('input').forEach(i=>i.addEventListener('keydown',e=>{if(e.key==='Enter')go()}));
 </script>""" + FOOTER + """</main></body></html>"""
 
-DASHBOARD_HTML = STYLE + """<div class="top"><h1>Watch Bridge</h1><span><span id="who" class="sub"></span> · <button class="gear" id="gearbtn" title="Settings">⚙</button> · <a href="/logout">log out</a></span></div>
+DASHBOARD_HTML = STYLE + """<div class="top"><h1>Watch Bridge</h1><span><span id="who" class="sub"></span> · <span id="projnav" style="display:none"><a href="/projects">projects</a> · </span><button class="gear" id="gearbtn" title="Settings">⚙</button> · <a href="/logout">log out</a></span></div>
 <details id="trello" class="dcard"><summary id="trellos"></summary><div class="inner" id="trellobody"></div></details>
 <details id="cald" class="dcard"><summary id="cals"></summary><div class="inner" id="calbody"></div></details>
 <details id="had" class="dcard"><summary id="has"></summary><div class="inner" id="habody"></div></details>
 <details id="gemd" class="dcard"><summary id="gems"></summary><div class="inner" id="gembody"></div></details>
+<details id="projd" class="dcard" style="display:none"><summary id="projs"></summary><div class="inner" id="projbody"></div></details>
 <details id="watchd" class="dcard"><summary>⌚ Your watch shortcut</summary><div class="inner" id="watch"></div></details>
 <details id="talkd" class="dcard"><summary>☾ How to talk to it</summary><div class="inner">
  <p class="sub">Speak one sentence. It goes to the LLM agent together with the exact inventory
@@ -3746,6 +3823,13 @@ function render(d){
  if(gc)gc.onclick=e=>copy(e.target,gm.live_url);
  const gcc=document.getElementById('gemconvcopy');
  if(gcc)gcc.onclick=e=>copy(e.target,d.command_url.replace(/\\/command$/,'/converse/audio'));
+ document.getElementById('projnav').style.display=d.is_dev?'':'none';
+ document.getElementById('projd').style.display=d.is_dev?'':'none';
+ if(d.is_dev){
+  const dp=d.dev_projects||{};
+  document.getElementById('projs').textContent=`🛠 Carbon Projects — ${dp.active_project||'watch-llm-bridge'} (${dp.count||1})`;
+  document.getElementById('projbody').innerHTML=projectsCard(d);
+ }
  document.getElementById('watch').innerHTML=recipe(d);
  document.getElementById('invite').innerHTML=inviteCard(d);
  document.getElementById('invited').style.display=d.invite_code?'':'none';
@@ -3764,7 +3848,7 @@ document.getElementById('admin').addEventListener('click',e=>{
 document.getElementById('gearbtn').onclick=()=>{
  const s=document.getElementById('settings'); s.open=true; s.scrollIntoView({behavior:'smooth'})};
 document.addEventListener('keydown',e=>{if(e.key==='Enter'&&e.target.id==='pwcur')pw()});
-""" + live.DASHBOARD_GEMINI_JS + """</script>""" + FOOTER + """</main></body></html>"""
+""" + live.DASHBOARD_GEMINI_JS + projects_ui.DASHBOARD_PROJECTS_JS + """</script>""" + FOOTER + """</main></body></html>"""
 
 
 # --- provisioning page: TOTP-gated reveal of the shortcut recipe + token ---

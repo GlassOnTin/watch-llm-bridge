@@ -123,6 +123,25 @@ def ensure_project_dir(projects_root: Path, slug: str, init_git: bool = False) -
     return target
 
 
+def delete_project_dir(projects_root: Path, slug: str) -> bool:
+    """Safely delete `projects_root / slug` if it is a real subdirectory and not watch-llm-bridge."""
+    if not SLUG_RE.match(slug):
+        raise ValueError(f"invalid project slug {slug!r}")
+    if slug == DEFAULT_PROJECT_SLUG:
+        raise ValueError(f"refusing to delete protected project {DEFAULT_PROJECT_SLUG!r}")
+    root_resolved = projects_root.resolve()
+    candidate = projects_root / slug
+    if candidate.is_symlink():
+        raise ValueError(f"refusing to delete symlink project path {candidate}")
+    target = candidate.resolve()
+    if target.parent != root_resolved or target == root_resolved:
+        raise ValueError(f"project slug {slug!r} escapes {root_resolved}")
+    if not target.exists():
+        return False
+    shutil.rmtree(target)
+    return True
+
+
 def format_prompt(prompt: str, conversation_id: str, repo_root: Path,
                   project_slug: str = DEFAULT_PROJECT_SLUG) -> str:
     if conversation_id:
@@ -295,8 +314,26 @@ def main() -> int:
         conv_id = turn.get("conversation_id") or ""
         proj_slug = turn.get("project_slug") or DEFAULT_PROJECT_SLUG
         init_proj = bool(turn.get("init_project"))
-        logging.info("claimed turn id=%s project=%s init=%s conv=%s prompt=%r",
-                     turn_id, proj_slug, init_proj, conv_id or "(new)", turn["prompt"][:120])
+        del_proj = bool(turn.get("delete_project"))
+        logging.info("claimed turn id=%s project=%s init=%s del=%s conv=%s prompt=%r",
+                     turn_id, proj_slug, init_proj, del_proj, conv_id or "(new)", turn["prompt"][:120])
+        if del_proj:
+            try:
+                removed = delete_project_dir(PROJECTS_ROOT, proj_slug)
+                msg = (
+                    f"Deleted workstation folder {proj_slug}."
+                    if removed else f"Workstation folder {proj_slug} was already absent."
+                )
+                post_complete_with_retry(session, base_url, headers, turn_id, msg, "", False)
+            except Exception as e:
+                post_complete_with_retry(
+                    session, base_url, headers, turn_id,
+                    f"Could not delete project folder {proj_slug}: {e}", "", True
+                )
+            if args.once:
+                return 0
+            continue
+
         try:
             proj_dir = (
                 REPO_ROOT

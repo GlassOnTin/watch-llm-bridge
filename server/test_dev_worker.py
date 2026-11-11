@@ -95,3 +95,39 @@ def test_ensure_project_dir_creates_git_repo_and_rejects_traversal(tmp_path):
     with pytest.raises(ValueError):
         agy_worker.ensure_project_dir(projects_root, "bad/slash", init_git=True)
 
+
+def test_delete_project_dir_removes_folder_and_enforces_containment(tmp_path):
+    import pytest
+
+    projects_root = tmp_path / "Code"
+    projects_root.mkdir()
+
+    # Default bridge directory is strictly protected
+    bridge_dir = projects_root / "watch-llm-bridge"
+    bridge_dir.mkdir()
+    (bridge_dir / "keep.txt").write_text("important")
+    with pytest.raises(ValueError, match="watch-llm-bridge"):
+        agy_worker.delete_project_dir(projects_root, "watch-llm-bridge")
+    assert (bridge_dir / "keep.txt").exists()
+
+    # Valid watch-started project folder is removed cleanly
+    solar = agy_worker.ensure_project_dir(projects_root, "solar-logger", init_git=True)
+    (solar / "main.py").write_text("print('hi')\n")
+    assert agy_worker.delete_project_dir(projects_root, "solar-logger") is True
+    assert not solar.exists()
+    assert agy_worker.delete_project_dir(projects_root, "solar-logger") is False
+
+    # Symlinks and path traversal are rejected without touching targets
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("secret")
+    sym = projects_root / "linked-proj"
+    sym.symlink_to(outside)
+    with pytest.raises(ValueError, match="symlink"):
+        agy_worker.delete_project_dir(projects_root, "linked-proj")
+    assert (outside / "secret.txt").exists()
+
+    with pytest.raises(ValueError):
+        agy_worker.delete_project_dir(projects_root, "../outside")
+
+
