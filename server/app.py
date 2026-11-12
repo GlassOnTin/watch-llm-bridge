@@ -3545,9 +3545,10 @@ DASHBOARD_HTML = STYLE + """<div class="top"><h1>Watch Bridge</h1><span><span id
 <details id="projd" class="dcard" style="display:none"><summary id="projs"></summary><div class="inner" id="projbody"></div></details>
 <details id="watchd" class="dcard"><summary>⌚ Your watch shortcut</summary><div class="inner" id="watch"></div></details>
 <details id="talkd" class="dcard"><summary>☾ How to talk to it</summary><div class="inner">
- <p class="sub">Speak one sentence. It goes to the LLM agent together with the exact inventory
- of your boards and lists — the same names shown in the Trello section above. The agent picks
- an action, the server carries it out on Trello, and the reply is read aloud in a sentence or two.</p>
+ <p class="sub">Speak a single command from your Apple Watch shortcut or Home Assistant Assist,
+ or start a back-and-forth Gemini Live voice conversation. Your words go to the agent along with
+ the live inventory of your connected Trello boards, Google Calendar, and Home Assistant devices;
+ the server runs the tool call and speaks back a short reply.</p>
  <p><b>Things you can say</b></p>
  <ul>
   <li>“add bin day to chores” — creates a card in the list named Chores</li>
@@ -3558,21 +3559,22 @@ DASHBOARD_HTML = STYLE + """<div class="top"><h1>Watch Bridge</h1><span><span id
   <li>“put a due date on bin day tomorrow” — or “...tomorrow at 4”</li>
   <li>“rename the chores list to jobs” · “what's on my home board”</li>
   <li>With more than one account connected: “add milk to shopping on my work trello”</li>
-  <li>Once your calendar is connected: “what's on my calendar today” and “put
-      dentists appointment in the calendar tomorrow at 3”</li>
+  <li>Once your calendar is connected: “what's on my calendar today”, “put
+      dentist appointment in the calendar tomorrow at 3”, or “move the dentist thing to Friday at 10”</li>
   <li>Once Home Assistant is connected: “turn on the dining light”, “toggle the
       kettle”, “living room lights full”, “pause the living room speaker”</li>
   <li>Also from Home Assistant: “what's the front door battery”, “is the front
       door open”, “what will the weather be”</li>
+  <li>During a multi-turn Gemini Live Shortcut call: say “stop”, “thanks, bye”, or “that's all” to hang up</li>
  </ul>
  <p><b>One exchange, up close</b></p>
  <pre>you:    add bin day to chores on my work trello
 agent:  trello_create_card(list "Chores", name "Bin day", account "work")
 trello: POST /1/cards  → card created
 spoken: “Bin day is on the Chores list of Work Stuff.”</pre>
- <p class="sub">Two rules keep it honest. It never invents board or list names: if your words
- don't match the inventory it offers the closest options and asks you to try again. And if a
- list name exists on more than one board or account it asks which one instead of guessing —
+ <p class="sub">Two rules keep it honest. It never invents board, list, event, or device names:
+ if your words don't match the inventory it offers the closest options and asks you to try again.
+ And if a name matches more than one board, account, or device it asks which one instead of guessing:
  “Food is on work / Home and personal / Plans — which one?”</p>
  <p><b>What Trello supports today</b></p>
  <ul>
@@ -3601,7 +3603,23 @@ spoken: “Bin day is on the Chores list of Work Stuff.”</pre>
   <li>Media players: play, pause, set volume, switch source</li>
   <li>Read any entity's state — sensors, weather, binary sensors included</li>
   <li>List entities, optionally filtered by domain</li>
+  <li>Works both from your Watch shortcut and through Home Assistant Assist via the Bridge Agent integration</li>
  </ul>
+ <p><b>What Gemini Live adds</b></p>
+ <ul>
+  <li>Screen-free multi-turn Shortcut (<code>POST /converse/audio</code>): keeps a warm Gemini Live session open across turns and returns spoken audio straight to Shortcuts <b>Play Sound</b> with no browser window; say “thanks, bye” or “stop” (or stay silent) to end</li>
+  <li>Live browser call (<a href="/live"><code>/live</code></a>): real-time two-way audio on your phone where you can interrupt mid-sentence and see live transcripts</li>
+  <li>Calls the same Trello, Calendar, and Home Assistant tools during the conversation</li>
+ </ul>
+ <div id="talkdev" style="display:none">
+  <p><b>What Carbon supports</b></p>
+  <ul>
+   <li>Send coding tasks to your workstation agent: “ask Carbon to check why the tests failed” or “tell Carbon to add a filter toggle”</li>
+   <li>Start or switch projects in <code>~/Code</code>: asking for a new standalone tool proposes a project slug first and waits for “yes, create it” before creating <code>~/Code/&lt;slug&gt;</code>; say “what projects do I have” or “switch project to watch bridge”, or manage and delete projects on <a href="/projects"><code>/projects</code></a></li>
+   <li>Check progress or reset context: “what's Carbon's status” reads a short spoken summary, “give me the detailed output” reads exact commands and paths, and “start a fresh Carbon thread” starts a clean conversation on the active project</li>
+   <li>Background completion: waits up to 10 seconds for a quick spoken answer; longer runs finish in the background and speak into your open <code>/live</code> call or send a Home Assistant notification</li>
+  </ul>
+ </div>
  <p class="sub">Closing a card is an archive, so it can be brought back; a calendar event is
  deleted for real, which is why the agent asks before it deletes. The agent is only given
  the tools above, so it says it can't do the rest rather than improvising.</p>
@@ -3825,6 +3843,7 @@ function render(d){
  if(gcc)gcc.onclick=e=>copy(e.target,d.command_url.replace(/\\/command$/,'/converse/audio'));
  document.getElementById('projnav').style.display=d.is_dev?'':'none';
  document.getElementById('projd').style.display=d.is_dev?'':'none';
+ document.getElementById('talkdev').style.display=d.is_dev?'':'none';
  if(d.is_dev){
   const dp=d.dev_projects||{};
   document.getElementById('projs').textContent=`🛠 Carbon Projects — ${dp.active_project||'watch-llm-bridge'} (${dp.count||1})`;

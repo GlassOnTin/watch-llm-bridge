@@ -2472,6 +2472,30 @@ def test_projects_page_and_api_list_search_activate_and_delete(client):
     assert turn["delete_project"] == 1
 
 
+def test_dashboard_how_to_talk_to_it_covers_live_and_gates_carbon_for_dev(client):
+    signup(client)
+    res = client.get("/app")
+    assert res.status_code == 200
+    html = res.text
+
+    assert "☾ How to talk to it" in html
+    # Covers single-turn commands + Gemini Live (/converse/audio + /live)
+    assert "/converse/audio" in html
+    assert "/live" in html
+    assert "thanks, bye" in html
+    # Core integrations remain documented
+    assert "What Trello supports today" in html
+    assert "What Calendar supports today" in html
+    assert "What Home Assistant supports today" in html
+    assert "What Gemini Live adds" in html
+    # Carbon coding agent guide is present for dev users and hidden by default for non-dev users
+    assert 'id="talkdev" style="display:none"' in html
+    assert "What Carbon supports" in html
+    assert "/projects" in html
+    assert "document.getElementById('talkdev').style.display=d.is_dev?'':'none'" in html
+
+
+
 
 
 
